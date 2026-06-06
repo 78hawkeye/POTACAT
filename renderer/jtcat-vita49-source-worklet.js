@@ -20,14 +20,24 @@ class Vita49SourceProcessor extends AudioWorkletProcessor {
     this.targetRate = sampleRate;
     this.step = this.sourceRate / this.targetRate; // 0.5 for 24k→48k
 
-    // 500 ms of source-rate samples — enough to ride out a GC pause
-    // without running dry, but not so large that an IPC burst strands
-    // playback seconds behind real time.
-    this.bufSize = Math.ceil(this.sourceRate * 0.5);
+    this.bufferMs = Math.max(100, opts.bufferMs || 500);
+    this.startBufferMs = Math.max(0, Math.min(this.bufferMs, opts.startBufferMs || 0));
+    this.resumeBufferMs = Math.max(0, Math.min(this.bufferMs, opts.resumeBufferMs || this.startBufferMs || 0));
+    this.startBufferSamples = Math.ceil(this.sourceRate * this.startBufferMs / 1000);
+    this.resumeBufferSamples = Math.ceil(this.sourceRate * this.resumeBufferMs / 1000);
+
+    // Configurable source-rate jitter buffer. SmartSDR can run almost
+    // immediately, but Icom RS-BA1/WFVIEW-style UDP audio may arrive in
+    // 200-1000 ms bursts even when packet sequence is mostly intact. wfview
+    // hides that with an audio-output latency buffer; we do the same here
+    // before the synthetic MediaStream reaches JTCAT's normal audio chain.
+    this.bufSize = Math.ceil(this.sourceRate * this.bufferMs / 1000);
     this.buf = new Float32Array(this.bufSize);
     this.bufRead = 0;
     this.bufWrite = 0;
     this.bufAvailable = 0;
+    this.buffering = this.startBufferSamples > 0;
+    this.bufferTarget = this.startBufferSamples;
 
     // Sub-sample read cursor for linear interpolation.
     this.fracPos = 0;
@@ -43,16 +53,19 @@ class Vita49SourceProcessor extends AudioWorkletProcessor {
         this.bufWrite = 0;
         this.bufAvailable = 0;
         this.fracPos = 0;
+        this.buffering = this.startBufferSamples > 0;
+        this.bufferTarget = this.startBufferSamples;
         return;
       }
       const pcm = msg;
       if (!pcm || !pcm.length) return;
 
-      // If the incoming frame would overflow our 500 ms window, drop
-      // the oldest half of what's queued and append the new frame.
-      // Brief garble beats unbounded latency.
+      // If an IPC/radio burst overfills the jitter window, drop oldest
+      // audio down near the configured target. Brief catch-up beats drifting
+      // multiple seconds behind real time.
       if (this.bufAvailable + pcm.length > this.bufSize) {
-        const drop = (this.bufAvailable + pcm.length) - Math.floor(this.bufSize * 0.5);
+        const target = Math.max(this.startBufferSamples, this.resumeBufferSamples, Math.floor(this.bufSize * 0.5));
+        const drop = Math.min(this.bufAvailable, (this.bufAvailable + pcm.length) - target);
         this.bufRead = (this.bufRead + drop) % this.bufSize;
         this.bufAvailable -= drop;
         this.overflows++;
@@ -74,9 +87,24 @@ class Vita49SourceProcessor extends AudioWorkletProcessor {
     const step = this.step;
 
     for (let i = 0; i < len; i++) {
+      if (this.buffering) {
+        if (this.bufAvailable >= this.bufferTarget) {
+          this.buffering = false;
+        } else {
+          out[i] = 0;
+          continue;
+        }
+      }
       if (this.bufAvailable < 2) {
         out[i] = 0;
-        if (this.bufAvailable === 0) this.underruns++;
+        if (this.bufAvailable === 0) {
+          this.underruns++;
+          if (this.resumeBufferSamples > 0) {
+            this.buffering = true;
+            this.bufferTarget = this.resumeBufferSamples;
+            this.fracPos = 0;
+          }
+        }
         continue;
       }
       const a = buf[this.bufRead];

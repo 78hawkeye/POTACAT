@@ -302,22 +302,22 @@ test('rigctld setFrequency', () => {
   assert.strictEqual(writes[0], 'F 14074000\n');
 });
 
-test('rigctld setMode FT8 -> M PKTUSB 3000 (wide for digital)', () => {
+test('rigctld setMode FT8 -> M PKTUSB 0 when rig has no filter capability', () => {
   const { codec, writes } = captureWrites(RigctldCodec, RIGCTLD_MODEL);
   codec.setMode('FT8', 14074000);
-  assert.strictEqual(writes[0], 'M PKTUSB 3000\n');
+  assert.strictEqual(writes[0], 'M PKTUSB 0\n');
 });
 
-test('rigctld setMode CW -> M CW 500', () => {
+test('rigctld setMode CW -> M CW 0 when rig has no filter capability', () => {
   const { codec, writes } = captureWrites(RigctldCodec, RIGCTLD_MODEL);
   codec.setMode('CW', 14050000);
-  assert.strictEqual(writes[0], 'M CW 500\n');
+  assert.strictEqual(writes[0], 'M CW 0\n');
 });
 
-test('rigctld setMode SSB below 10 MHz -> M LSB 2400', () => {
+test('rigctld setMode SSB below 10 MHz -> M LSB 0 when rig has no filter capability', () => {
   const { codec, writes } = captureWrites(RigctldCodec, RIGCTLD_MODEL);
   codec.setMode('SSB', 7200000);
-  assert.strictEqual(writes[0], 'M LSB 2400\n');
+  assert.strictEqual(writes[0], 'M LSB 0\n');
 });
 
 test('rigctld setTransmit on -> T 1', () => {
@@ -529,6 +529,30 @@ test('CIV setTransmit off -> 1C 00 00', () => {
   assert.ok(hex.includes('1c0000'), `Expected PTT off, got: ${hex}`);
 });
 
+test('CIV getDataMod DATA1 MOD -> 1A 05 00 92', () => {
+  const { codec, writes } = captureWrites(CivCodec, IC7300_MODEL);
+  codec.getDataMod(0x0092);
+  assert.strictEqual(writes[0], 'fefe94e01a050092fd');
+});
+
+test('CIV setDataMod DATA1 MOD LAN -> 1A 05 00 92 05', () => {
+  const { codec, writes } = captureWrites(CivCodec, IC7300_MODEL);
+  codec.setDataMod(0x0092, 0x05);
+  assert.strictEqual(writes[0], 'fefe94e01a05009205fd');
+});
+
+test('CIV parse DATA1 MOD response emits data-mod', () => {
+  const { codec } = captureWrites(CivCodec, IC7300_MODEL);
+  let seen = null;
+  codec.on('data-mod', (data) => { seen = data; });
+  codec.onData(Buffer.from([0xFE, 0xFE, 0xE0, 0x94, 0x1A, 0x05, 0x00, 0x92, 0x05, 0xFD]));
+  assert.deepStrictEqual(seen, {
+    settingId: 0x0092,
+    value: 0x05,
+    meta: { toAddr: 0xE0, fromAddr: 0x94 },
+  });
+});
+
 test('CIV setNb on -> 16 22 01', () => {
   const { codec, writes } = captureWrites(CivCodec, IC7300_MODEL);
   codec.setNb(true);
@@ -544,6 +568,17 @@ test('CIV parse frequency response', () => {
   const frame = Buffer.from([0xFE, 0xFE, 0xE0, 0x94, 0x03, 0x00, 0x40, 0x07, 0x14, 0x00, 0xFD]);
   codec.onData(frame);
   assert.strictEqual(freq, 14074000);
+});
+
+test('CIV frequency response includes source address metadata', () => {
+  const { codec, writes } = captureWrites(CivCodec, IC7300_MODEL);
+  let meta = null;
+  codec.setRadioAddress(0x98);
+  codec.getFrequency();
+  assert.ok(writes[0].startsWith('fefe98e003fd'), `Expected probe to 0x98, got: ${writes[0]}`);
+  codec.on('frequency', (_hz, m) => { meta = m; });
+  codec.onData(Buffer.from([0xFE, 0xFE, 0xE0, 0x94, 0x03, 0x00, 0x40, 0x07, 0x14, 0x00, 0xFD]));
+  assert.deepStrictEqual(meta, { toAddr: 0xE0, fromAddr: 0x94 });
 });
 
 test('CIV parse mode response', () => {
@@ -564,13 +599,14 @@ test('CIV setFilterWidth is no-op (FIL presets not Hz-addressable)', () => {
   assert.strictEqual(writes.length, 0, 'Should not send any filter command for CI-V');
 });
 
-test('CIV setMode does not include filter byte', () => {
+test('CIV setMode includes filter byte for older Icom compatibility', () => {
   const { codec, writes } = captureWrites(CivCodec, IC7300_MODEL);
   codec.setMode('CW', 14000000);
   const hex = writes[0];
-  // cmd 0x06 with just mode byte 0x03 (CW), no filter byte
-  // Frame: FE FE 94 E0 06 03 FD — mode only, no 0x01/0x02/0x03 filter
-  assert.ok(hex.includes('0603fd'), `Expected mode-only (no filter byte), got: ${hex}`);
+  // cmd 0x06 with mode byte 0x03 (CW) and the last-known filter byte.
+  // Older Icoms silently drop the mode-only form; default filter is FIL1
+  // until a mode poll reports a user-selected FIL1/2/3 value.
+  assert.ok(hex.includes('060301fd'), `Expected mode + filter byte, got: ${hex}`);
 });
 
 // =========================================================================

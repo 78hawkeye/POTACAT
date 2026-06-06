@@ -1082,6 +1082,9 @@ const setSsbOverData = document.getElementById('set-ssb-over-data');
 const setRemoteCwEnabled = document.getElementById('set-remote-cw-enabled');
 const setRemoteStun = document.getElementById('set-remote-stun');
 const setAudioSource = document.getElementById('set-audio-source');
+const setSstvGalleryPath = document.getElementById('set-sstv-gallery-path');
+const sstvGalleryBrowseBtn = document.getElementById('sstv-gallery-browse-btn');
+const sstvGalleryResetBtn = document.getElementById('sstv-gallery-reset-btn');
 const setTxEqEnabled = document.getElementById('set-tx-eq-enabled');
 const setTxEqPreset = document.getElementById('set-tx-eq-preset');
 const setTxEqPresetRow = document.getElementById('set-tx-eq-preset-row');
@@ -1450,6 +1453,8 @@ async function loadPrefs() {
   applyTheme(settings.lightMode === true);
   applyColorblindMode(settings.colorblindMode === true);
   applyWcagMode(settings.wcagMode === true);
+  await _renderOperatorSelects(settings.myCallsign ? String(settings.myCallsign).toUpperCase() : '');
+  _wireOperatorSelect(document.getElementById('top-op-select'));
   grid = settings.grid || '';
   distUnit = settings.distUnit || 'mi';
   scanDwell = parseInt(settings.scanDwell, 10) || 7;
@@ -1764,6 +1769,7 @@ async function populateRadioSection(currentTarget) {
     document.getElementById('set-icom-network-civ-port').value = currentTarget.civPort || '';
     document.getElementById('set-icom-network-username').value = currentTarget.username || '';
     document.getElementById('set-icom-network-password').value = currentTarget.password || '';
+    setIcomNetworkTxGainPct(Math.round(((currentTarget.networkTxGain == null ? 0.72 : currentTarget.networkTxGain) || 0) * 100));
     const inModelSelect = document.getElementById('set-icom-network-model');
     if (inModelSelect && currentTarget.civAddress != null) {
       const hex = '0x' + currentTarget.civAddress.toString(16).toUpperCase();
@@ -1998,6 +2004,28 @@ function describeRigTarget(target) {
   if (target.type === 'icom') {
     return `${target.civModel || 'Icom'} CI-V on ${shortSerialPath(target.path)} @ ${target.baudRate || 115200}`;
   }
+  if (target.type === 'civ-tcp') {
+    const model = target.civModel || 'Icom CI-V';
+    const host = target.host || '127.0.0.1';
+    const port = target.port || 50001;
+    const addr = Number.isFinite(target.civAddress)
+      ? ` CI-V 0x${target.civAddress.toString(16).toUpperCase().padStart(2, '0')}`
+      : '';
+    return `${model} raw CI-V TCP ${host}:${port}${addr}`;
+  }
+  if (target.type === 'icom-network') {
+    const model = target.civModel || 'Icom Network';
+    const host = target.host || '?';
+    const controlPort = target.controlPort || target.port || 50001;
+    const dataPort = target.civPort ? `, CI-V UDP ${target.civPort}` : ', CI-V auto';
+    const addr = Number.isFinite(target.civAddress)
+      ? `, addr 0x${target.civAddress.toString(16).toUpperCase().padStart(2, '0')}`
+      : '';
+    return `${model} RS-BA1 UDP ${host}:${controlPort}${dataPort}${addr}`;
+  }
+  if (target.type === 'k4-network') {
+    return `Elecraft K4 network ${target.host || '127.0.0.1'}:${target.port || 9205}`;
+  }
   if (target.type === 'rigctld') {
     const comPort = target.serialPort || '?';
     const rPort = target.rigctldPort && target.rigctldPort !== 4532 ? ` (port ${target.rigctldPort})` : '';
@@ -2050,7 +2078,11 @@ function renderRigList(rigs, activeRigId) {
     nameEl.textContent = rig.name || 'Unnamed Rig';
     const descEl = document.createElement('div');
     descEl.className = 'rig-item-desc';
-    descEl.textContent = (rig.model ? rig.model + ' \u2014 ' : '') + describeRigTarget(rig.catTarget);
+    const targetDesc = describeRigTarget(rig.catTarget);
+    const modelPrefix = rig.model && !targetDesc.toLowerCase().startsWith(String(rig.model).toLowerCase())
+      ? rig.model + ' \u2014 '
+      : '';
+    descEl.textContent = modelPrefix + targetDesc;
     info.appendChild(nameEl);
     info.appendChild(descEl);
 
@@ -2146,6 +2178,7 @@ function buildCatTargetFromForm() {
       civPort: Number.isFinite(civPortVal) && civPortVal > 0 ? civPortVal : null,
       username: document.getElementById('set-icom-network-username').value || '',
       password: document.getElementById('set-icom-network-password').value || '',
+      networkTxGain: setIcomNetworkTxGainPct(document.getElementById('set-icom-network-tx-gain')?.value) / 100,
       civAddr: parseInt(inModelSelect.value, 16),
       civAddress: parseInt(inModelSelect.value, 16),
       civModel: inModelSelect.options[inModelSelect.selectedIndex].text,
@@ -2175,6 +2208,25 @@ function buildCatTargetFromForm() {
   }
   return null;
 }
+
+function clampIcomNetworkTxGainPct(value) {
+  value = Number(value);
+  if (!Number.isFinite(value)) value = 72;
+  return Math.max(0, Math.min(150, Math.round(value)));
+}
+
+function setIcomNetworkTxGainPct(value) {
+  const pct = clampIcomNetworkTxGainPct(value);
+  const slider = document.getElementById('set-icom-network-tx-gain');
+  const label = document.getElementById('set-icom-network-tx-gain-val');
+  if (slider) slider.value = pct;
+  if (label) label.textContent = pct + '%';
+  return pct;
+}
+
+document.getElementById('set-icom-network-tx-gain')?.addEventListener('input', (e) => {
+  setIcomNetworkTxGainPct(e.target.value);
+});
 
 async function openRigEditor(mode, rigId) {
   rigEditorMode = mode;
@@ -4679,30 +4731,47 @@ async function _renderSummaryOperator() {
     const s = await window.api.getSettings();
     const grid = (s && s.grid) ? String(s.grid) : '';
     const myCall = (s && s.myCallsign) ? String(s.myCallsign).toUpperCase() : '';
-    const sel = document.getElementById('summary-op-select');
     const gridEl = document.getElementById('summary-op-grid');
     if (gridEl) gridEl.textContent = grid ? grid : '';
-    if (!sel) return;
-    let activeCall = myCall;
-    let list = [];
-    try {
-      const r = await window.api.profilesList();
-      activeCall = (r && r.active) || myCall;
-      list = (r && Array.isArray(r.profiles)) ? r.profiles : [];
-    } catch {}
-    // If no profile exists yet (pre-migration), show the legacy
-    // single-operator label so the user sees their callsign at minimum.
-    if (list.length === 0) {
-      sel.innerHTML = '<option value="' + (activeCall || '') + '">' + (activeCall || '(not set)') + '</option>';
-      sel.disabled = true;
-      return;
-    }
-    sel.disabled = false;
-    sel.innerHTML = list.map(c => {
-      const sel = c === activeCall ? ' selected' : '';
-      return '<option value="' + c + '"' + sel + '>' + c + '</option>';
-    }).join('');
+    await _renderOperatorSelects(myCall);
   } catch {}
+}
+
+async function _renderOperatorSelects(fallbackCall) {
+  const selects = [
+    document.getElementById('summary-op-select'),
+    document.getElementById('top-op-select'),
+  ].filter(Boolean);
+  if (selects.length === 0) return;
+  let activeCall = fallbackCall || '';
+  let list = [];
+  try {
+    const r = await window.api.profilesList();
+    activeCall = (r && r.active) || activeCall;
+    list = (r && Array.isArray(r.profiles)) ? r.profiles : [];
+  } catch {}
+  const esc = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  for (const selEl of selects) {
+    if (list.length === 0) {
+      selEl.innerHTML = '<option value="' + esc(activeCall || '') + '">' + esc(activeCall || '(not set)') + '</option>';
+      selEl.disabled = true;
+      continue;
+    }
+    selEl.disabled = false;
+    selEl.innerHTML = list.map(c => {
+      const selected = c === activeCall ? ' selected' : '';
+      return '<option value="' + esc(c) + '"' + selected + '>' + esc(c) + '</option>';
+    }).join('');
+  }
+}
+
+async function _refreshOperatorSelects() {
+  try {
+    const s = await window.api.getSettings();
+    await _renderOperatorSelects(s && s.myCallsign ? String(s.myCallsign).toUpperCase() : '');
+  } catch {
+    await _renderOperatorSelects('');
+  }
 }
 
 // Document-level external-link delegation. Catches any anchor with a
@@ -5233,15 +5302,23 @@ async function _summaryOpSwitch(call) {
   if (!call) return;
   if (!confirm('Switch to operator ' + call + '? POTACAT will restart to apply.')) {
     // Revert the dropdown to the active value
+    await _refreshOperatorSelects();
     refreshSummaryCard();
     return;
   }
   const r = await window.api.profilesSwitch(call);
   if (!r || !r.ok) {
     alert('Could not switch operator: ' + (r && r.error ? r.error : 'unknown'));
+    await _refreshOperatorSelects();
     refreshSummaryCard();
   }
   // On success, app is about to relaunch.
+}
+
+function _wireOperatorSelect(sel) {
+  if (!sel || sel.dataset.operatorSwitchWired === '1') return;
+  sel.dataset.operatorSwitchWired = '1';
+  sel.addEventListener('change', (e) => _summaryOpSwitch(e.target.value));
 }
 
 async function _summaryOpOpenManage() {
@@ -5551,7 +5628,8 @@ function _wireSummaryCardActionsOnce() {
 
   // Operator dropdown — switch on change (with confirm).
   const opSel = document.getElementById('summary-op-select');
-  if (opSel) opSel.addEventListener('change', (e) => _summaryOpSwitch(e.target.value));
+  _wireOperatorSelect(opSel);
+  _wireOperatorSelect(document.getElementById('top-op-select'));
   const opAdd = document.getElementById('summary-op-add');
   if (opAdd) opAdd.addEventListener('click', _summaryOpAddPrompt);
   const opManage = document.getElementById('summary-op-manage');
@@ -6120,6 +6198,20 @@ adifLogBrowseBtn.addEventListener('click', async () => {
   }
 });
 
+if (sstvGalleryBrowseBtn && setSstvGalleryPath) {
+  sstvGalleryBrowseBtn.addEventListener('click', async () => {
+    const currentPath = setSstvGalleryPath.value || await window.api.getDefaultSstvGalleryPath();
+    const folderPath = await window.api.chooseSstvGalleryFolder(currentPath);
+    if (folderPath) setSstvGalleryPath.value = folderPath;
+  });
+}
+
+if (sstvGalleryResetBtn && setSstvGalleryPath) {
+  sstvGalleryResetBtn.addEventListener('click', async () => {
+    setSstvGalleryPath.value = await window.api.getDefaultSstvGalleryPath();
+  });
+}
+
 // ADIF import — shared by three entry points: Settings → Logging → Import
 // Log, Settings → Spots → Import existing logs (right next to Hide Worked
 // Parks, where the question "how do I get my parks in here?" naturally
@@ -6306,6 +6398,87 @@ document.getElementById('icom-test-btn').addEventListener('click', async () => {
   } catch (err) {
     resultEl.textContent = `Error: ${err.message}`;
     resultEl.className = 'hamlib-test-fail';
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// Raw CI-V TCP bridge test connection
+document.getElementById('civ-tcp-test-btn')?.addEventListener('click', async () => {
+  const host = (document.getElementById('set-civ-tcp-host').value || '').trim() || '127.0.0.1';
+  const port = parseInt(document.getElementById('set-civ-tcp-port').value, 10) || 50001;
+  const civAddress = parseInt(document.getElementById('set-civ-tcp-model').value, 16);
+  const resultEl = document.getElementById('civ-tcp-test-result');
+  const btn = document.getElementById('civ-tcp-test-btn');
+
+  btn.disabled = true;
+  resultEl.textContent = 'Testing...';
+  resultEl.className = '';
+  resultEl.title = '';
+
+  try {
+    const result = await window.api.testCivTcp({ host, port, civAddress });
+    if (result.success) {
+      resultEl.textContent = `Connected! Freq: ${result.frequency} MHz`;
+      resultEl.className = 'hamlib-test-success';
+    } else {
+      resultEl.textContent = `Failed: ${result.error}`;
+      resultEl.className = 'hamlib-test-fail';
+      resultEl.title = Array.isArray(result.logs) && result.logs.length ? result.logs.join('\n') : '';
+    }
+  } catch (err) {
+    resultEl.textContent = `Error: ${err.message}`;
+    resultEl.className = 'hamlib-test-fail';
+    resultEl.title = '';
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// Icom Network / RS-BA1 test connection
+document.getElementById('icom-network-test-btn')?.addEventListener('click', async () => {
+  const inModelSelect = document.getElementById('set-icom-network-model');
+  const civPortVal = parseInt(document.getElementById('set-icom-network-civ-port').value, 10);
+  const config = {
+    host: (document.getElementById('set-icom-network-host').value || '').trim(),
+    controlPort: parseInt(document.getElementById('set-icom-network-control-port').value, 10) || 50001,
+    civPort: Number.isFinite(civPortVal) && civPortVal > 0 ? civPortVal : null,
+    username: document.getElementById('set-icom-network-username').value || '',
+    password: document.getElementById('set-icom-network-password').value || '',
+    civAddress: parseInt(inModelSelect.value, 16),
+  };
+  const resultEl = document.getElementById('icom-network-test-result');
+  const btn = document.getElementById('icom-network-test-btn');
+
+  if (!config.host) {
+    resultEl.textContent = 'Enter the radio host/IP first';
+    resultEl.className = 'hamlib-test-fail';
+    return;
+  }
+
+  btn.disabled = true;
+  resultEl.textContent = 'Testing...';
+  resultEl.className = '';
+  resultEl.title = '';
+
+  try {
+    const result = await window.api.testIcomNetwork(config);
+    if (result.success) {
+      const responseAddr = Number.isFinite(result.civAddress) ? ` CI-V: 0x${result.civAddress.toString(16).toUpperCase().padStart(2, '0')}` : '';
+      const probeAddr = Number.isFinite(result.probedAddress) && result.probedAddress !== result.civAddress
+        ? ` (answered probe 0x${result.probedAddress.toString(16).toUpperCase().padStart(2, '0')})`
+        : '';
+      resultEl.textContent = `Connected! Freq: ${result.frequency} MHz${responseAddr}${probeAddr}`;
+      resultEl.className = 'hamlib-test-success';
+    } else {
+      resultEl.textContent = `Failed: ${result.error}`;
+      resultEl.className = 'hamlib-test-fail';
+      resultEl.title = Array.isArray(result.logs) && result.logs.length ? result.logs.join('\n') : '';
+    }
+  } catch (err) {
+    resultEl.textContent = `Error: ${err.message}`;
+    resultEl.className = 'hamlib-test-fail';
+    resultEl.title = '';
   } finally {
     btn.disabled = false;
   }
@@ -11482,6 +11655,9 @@ async function openSettingsDialog(tab) {
   document.getElementById('set-enable-auto-sstv').checked = s.enableAutoSstv === true;
   document.getElementById('set-auto-sstv-min').value = s.autoSstvInactivityMin || 90;
   document.getElementById('set-sstv-post-process').checked = s.sstvPostProcess !== false; // default on
+  if (setSstvGalleryPath) {
+    setSstvGalleryPath.value = s.sstvDecodedImagesPath || await window.api.getDefaultSstvGalleryPath();
+  }
   document.getElementById('set-enable-idle-pause').checked = s.enableIdlePause !== false;
   document.getElementById('set-idle-pause-min').value = s.idlePauseMin || 20;
   setSotaUpload.checked = s.sotaUpload === true;
@@ -11575,7 +11751,9 @@ async function openSettingsDialog(tab) {
   }
   setRemoteCwEnabled.checked = !!s.remoteCwEnabled;
   setRemoteStun.checked = !!s.remoteStun;
-  if (setAudioSource) setAudioSource.value = (s.audioSource === 'smartsdr') ? 'smartsdr' : 'dax';
+  if (setAudioSource) {
+    setAudioSource.value = ['smartsdr', 'icom-network'].includes(s.audioSource) ? s.audioSource : 'dax';
+  }
   // TX EQ — load saved state into the Settings dialog. Live updates go
   // through window.api.setTxEq() so toggling the checkbox / dropdown
   // doesn't require reopening Settings or clicking Save.
@@ -12137,6 +12315,7 @@ settingsSave.addEventListener('click', async () => {
     enableAutoSstv: document.getElementById('set-enable-auto-sstv').checked,
     autoSstvInactivityMin: parseInt(document.getElementById('set-auto-sstv-min').value) || 90,
     sstvPostProcess: document.getElementById('set-sstv-post-process').checked,
+    sstvDecodedImagesPath: setSstvGalleryPath ? setSstvGalleryPath.value.trim() : '',
     enableIdlePause: document.getElementById('set-enable-idle-pause').checked,
     idlePauseMin: parseInt(document.getElementById('set-idle-pause-min').value) || 20,
     sotaUpload: sotaUploadEnabled,
@@ -20148,6 +20327,7 @@ var jtcatSpectrumFrame = 0;    // frame counter for throttling spectrum IPC to ~
 var jtcatVita49Ctx = null;
 var jtcatVita49Dest = null;
 var jtcatVita49Node = null; // single AudioWorkletNode — replaces per-frame BufferSource churn
+var jtcatVita49FrameCount = 0;
 
 window.api.onJtcatVita49Audio(function (frame) {
   // Return false so the preload acks immediately when we're not the
@@ -20160,6 +20340,15 @@ window.api.onJtcatVita49Audio(function (frame) {
   // Audio node allocation. The IPC-deserialized typed array may not be
   // a Float32Array; coerce so the worklet sees uniform shape.
   var pcm = (frame.pcm instanceof Float32Array) ? frame.pcm : new Float32Array(frame.pcm);
+  jtcatVita49FrameCount++;
+  if (window.api.jtcatLog && (jtcatVita49FrameCount === 1 || jtcatVita49FrameCount % 200 === 0)) {
+    var peak = 0;
+    for (var i = 0; i < pcm.length; i++) {
+      var v = Math.abs(pcm[i]);
+      if (v > peak) peak = v;
+    }
+    window.api.jtcatLog(`[JTCAT] Synthetic IP audio frame #${jtcatVita49FrameCount}: ${pcm.length} samples, peak=${peak.toFixed(4)}`);
+  }
   jtcatVita49Node.port.postMessage(pcm);
   return true;
 });
@@ -20173,8 +20362,8 @@ async function startJtcatAudio() {
   try {
     var s = await window.api.getSettings();
 
-    if (s.audioSource === 'smartsdr') {
-      // SmartSDR Direct: JTCAT audio is the VITA-49 dax_rx stream that
+    if (s.audioSource === 'smartsdr' || s.audioSource === 'icom-network') {
+      // SmartSDR Direct / Icom Network: JTCAT audio is the PCM stream that
       // main forwards as 'jtcat-vita49-audio' frames — not a Windows
       // audio device. Build a synthetic MediaStream from those frames so
       // everything below this point (createMediaStreamSource, gain,
@@ -20198,16 +20387,25 @@ async function startJtcatAudio() {
         if (window.api.jtcatLog) window.api.jtcatLog('[JTCAT] VITA-49 source worklet load failed: ' + (e.message || e));
         throw e;
       }
+      const vita49SourceOptions = s.audioSource === 'icom-network'
+        ? { sourceRate: 24000, bufferMs: 350, startBufferMs: 120, resumeBufferMs: 80 }
+        : { sourceRate: 24000, bufferMs: 500, startBufferMs: 80, resumeBufferMs: 80 };
       jtcatVita49Node = new AudioWorkletNode(jtcatVita49Ctx, 'jtcat-vita49-source', {
         numberOfInputs: 0,
         numberOfOutputs: 1,
         outputChannelCount: [1],
-        processorOptions: { sourceRate: 24000 },
+        processorOptions: vita49SourceOptions,
       });
+      jtcatVita49FrameCount = 0;
       jtcatVita49Dest = jtcatVita49Ctx.createMediaStreamDestination();
       jtcatVita49Node.connect(jtcatVita49Dest);
       jtcatAudioStream = jtcatVita49Dest.stream;
-      if (window.api.jtcatLog) window.api.jtcatLog('[JTCAT] Audio source: SmartSDR Direct (VITA-49 dax_rx via AudioWorklet)');
+      if (window.api.setJtcatIpAudioReady) window.api.setJtcatIpAudioReady(true);
+      if (window.api.jtcatLog) {
+        const label = s.audioSource === 'icom-network' ? 'Icom Network audio (RS-BA1)' : 'SmartSDR Direct (VITA-49 dax_rx)';
+        const bufferText = s.audioSource === 'icom-network' ? ' with low-latency jitter buffer' : '';
+        window.api.jtcatLog(`[JTCAT] Audio source: ${label} via AudioWorklet${bufferText}`);
+      }
     } else {
       var audioConstraints = {
         channelCount: 1,
@@ -20427,12 +20625,37 @@ var jtcatTxGainLevel = 1.0;
 // and full range at the top. Slider 14% ≈ 0.02 gain, 20% ≈ 0.04 gain.
 function txPwrToGain(pct) { return (pct / 100) * (pct / 100); }
 function gainToTxPwr(gain) { return Math.round(Math.sqrt(gain) * 100); }
+function clampTxPwrPct(pct) {
+  pct = Number(pct);
+  if (!Number.isFinite(pct)) pct = 100;
+  return Math.max(0, Math.min(100, Math.round(pct)));
+}
+function syncJtcatTxGainToMain() {
+  if (window.api && typeof window.api.jtcatSetTxGain === 'function') {
+    window.api.jtcatSetTxGain(jtcatTxGainLevel);
+  }
+}
+function setJtcatTxGainPct(pct, persist) {
+  pct = clampTxPwrPct(pct);
+  jtcatTxGainLevel = txPwrToGain(pct);
+  if (jtcatTxGainSlider) jtcatTxGainSlider.value = pct;
+  if (jtcatTxGainVal) jtcatTxGainVal.textContent = pct + '%';
+  if (persist) {
+    localStorage.setItem('jtcat-tx-gain', pct);
+    localStorage.setItem('jtcat-tx-gain-user-set', '1');
+  }
+  syncJtcatTxGainToMain();
+}
 
 if (jtcatTxGainSlider) {
+  var savedJtcatTxPct = parseInt(localStorage.getItem('jtcat-tx-gain'), 10);
+  var hasUserSavedJtcatTxGain = localStorage.getItem('jtcat-tx-gain-user-set') === '1';
+  var initialJtcatTxPct = hasUserSavedJtcatTxGain && Number.isFinite(savedJtcatTxPct)
+    ? savedJtcatTxPct
+    : parseInt(jtcatTxGainSlider.value, 10);
+  setJtcatTxGainPct(initialJtcatTxPct, false);
   jtcatTxGainSlider.addEventListener('input', function() {
-    var pct = parseInt(jtcatTxGainSlider.value, 10);
-    jtcatTxGainVal.textContent = pct + '%';
-    jtcatTxGainLevel = txPwrToGain(pct);
+    setJtcatTxGainPct(jtcatTxGainSlider.value, true);
   });
 }
 // Accept RX gain from popout or ECHOCAT
@@ -20447,12 +20670,14 @@ window.api.onJtcatSetRxGain(function(level) {
 window.api.onJtcatSetTxGain(function(level) {
   jtcatTxGainLevel = level;
   if (jtcatTxGainSlider) {
-    jtcatTxGainSlider.value = gainToTxPwr(level);
-    jtcatTxGainVal.textContent = gainToTxPwr(level) + '%';
+    var pct = clampTxPwrPct(gainToTxPwr(level));
+    jtcatTxGainSlider.value = pct;
+    if (jtcatTxGainVal) jtcatTxGainVal.textContent = pct + '%';
   }
 });
 
 function stopJtcatAudio() {
+  if (window.api.setJtcatIpAudioReady) window.api.setJtcatIpAudioReady(false);
   if (jtcatMeterAnim) { cancelAnimationFrame(jtcatMeterAnim); jtcatMeterAnim = null; }
   if (waterfallAnimFrame) {
     cancelAnimationFrame(waterfallAnimFrame);
@@ -20484,6 +20709,7 @@ function stopJtcatAudio() {
     jtcatVita49Ctx = null;
   }
   jtcatVita49Dest = null;
+  jtcatVita49FrameCount = 0;
 }
 
 // Restart JTCAT audio after ECHOCAT releases the shared audio device

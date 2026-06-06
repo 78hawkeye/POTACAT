@@ -5,6 +5,7 @@
   // --- Window controls ---
   // macOS uses native traffic light buttons (hiddenInset) — hide custom controls
   if (window.api.platform === 'darwin') {
+    document.body.classList.add('platform-darwin');
     document.querySelector('.titlebar-controls').style.display = 'none';
   }
   document.getElementById('tb-min').addEventListener('click', () => window.api.minimize());
@@ -545,7 +546,7 @@
       var is73 = upper.indexOf('RR73') >= 0 || upper.indexOf(' 73') >= 0;
       var isWanted = d.newDxcc || d.newCall || d.newGrid;
 
-      if (cqFilter && !isCq && !is73 && !isDirected) return;
+      if (cqFilter && !isCq && !isDirected) return;
       if (wantedFilter && !isWanted && !isDirected && !is73) return;
       if (searchFilter && upper.indexOf(searchFilter) === -1) return;
 
@@ -1443,6 +1444,7 @@
   var popoutVita49Ctx = null;
   var popoutVita49Dest = null;
   var popoutVita49Node = null;
+  var popoutVita49FrameCount = 0;
 
   if (window.api.onJtcatVita49Audio) {
     window.api.onJtcatVita49Audio(function (frame) {
@@ -1451,6 +1453,15 @@
       if (!popoutVita49Node || !frame || !frame.pcm || !frame.pcm.length) return false;
       if (popoutVita49Ctx && popoutVita49Ctx.state === 'suspended') popoutVita49Ctx.resume().catch(function () {});
       var pcm = (frame.pcm instanceof Float32Array) ? frame.pcm : new Float32Array(frame.pcm);
+      popoutVita49FrameCount++;
+      if (window.api.jtcatLog && (popoutVita49FrameCount === 1 || popoutVita49FrameCount % 200 === 0)) {
+        var peak = 0;
+        for (var i = 0; i < pcm.length; i++) {
+          var v = Math.abs(pcm[i]);
+          if (v > peak) peak = v;
+        }
+        window.api.jtcatLog(`[JTCAT popout] Synthetic IP audio frame #${popoutVita49FrameCount}: ${pcm.length} samples, peak=${peak.toFixed(4)}`);
+      }
       popoutVita49Node.port.postMessage(pcm);
       return true;
     });
@@ -1480,23 +1491,34 @@
   var jpTxGainVal = document.getElementById('jp-tx-gain-val');
   // TX Pwr: square curve for fine low-end control (same as main window)
   function txPwrToGain(pct) { return (pct / 100) * (pct / 100); }
+  function clampTxPwrPct(pct) {
+    pct = Number(pct);
+    if (!Number.isFinite(pct)) pct = 100;
+    return Math.max(0, Math.min(100, Math.round(pct)));
+  }
   var savedTxPct = parseInt(localStorage.getItem('jtcat-tx-gain'), 10);
-  if (!isNaN(savedTxPct) && jpTxGain) {
-    jpTxGain.value = savedTxPct;
-    jpTxGainVal.textContent = savedTxPct + '%';
-    popoutTxGainLevel = txPwrToGain(savedTxPct);
+  if (jpTxGain) {
+    var hasUserSavedTxGain = localStorage.getItem('jtcat-tx-gain-user-set') === '1';
+    var initialTxPct = hasUserSavedTxGain && !isNaN(savedTxPct) ? savedTxPct : parseInt(jpTxGain.value, 10);
+    initialTxPct = clampTxPwrPct(initialTxPct);
+    jpTxGain.value = initialTxPct;
+    jpTxGainVal.textContent = initialTxPct + '%';
+    popoutTxGainLevel = txPwrToGain(initialTxPct);
+    window.api.jtcatSetTxGain(popoutTxGainLevel);
   }
   if (jpTxGain) {
     jpTxGain.addEventListener('input', function() {
-      var pct = parseInt(jpTxGain.value, 10);
+      var pct = clampTxPwrPct(jpTxGain.value);
       jpTxGainVal.textContent = pct + '%';
       popoutTxGainLevel = txPwrToGain(pct);
       window.api.jtcatSetTxGain(popoutTxGainLevel);
       localStorage.setItem('jtcat-tx-gain', pct);
+      localStorage.setItem('jtcat-tx-gain-user-set', '1');
     });
   }
 
   function stopPopoutAudio() {
+    if (window.api.setJtcatIpAudioReady) window.api.setJtcatIpAudioReady(false);
     if (popoutAudioProcessor) { popoutAudioProcessor.disconnect(); popoutAudioProcessor = null; }
     popoutAnalyser = null;
     popoutRxGainNode = null;
@@ -1510,6 +1532,7 @@
     }
     if (popoutVita49Ctx) { popoutVita49Ctx.close().catch(function() {}); popoutVita49Ctx = null; }
     popoutVita49Dest = null;
+    popoutVita49FrameCount = 0;
   }
 
   async function startPopoutAudio(deviceId, audioSource) {
@@ -1517,8 +1540,8 @@
     stopPopoutAudio();
     await new Promise(function(r) { setTimeout(r, 300); });
     try {
-      if (audioSource === 'smartsdr') {
-        // SmartSDR Direct: audio is the VITA-49 dax_rx stream that main
+      if (audioSource === 'smartsdr' || audioSource === 'icom-network') {
+        // SmartSDR Direct / Icom Network: audio is the PCM stream that main
         // forwards as 'jtcat-vita49-audio' frames. A single AudioWorkletNode
         // owns the ring buffer + linear-interp resampler and feeds a
         // MediaStreamDestination; downstream is identical to the
@@ -1534,16 +1557,21 @@
           console.error('[JTCAT popout] failed to load VITA-49 source worklet:', e);
           throw e;
         }
+        var vita49SourceOptions = audioSource === 'icom-network'
+          ? { sourceRate: 24000, bufferMs: 350, startBufferMs: 120, resumeBufferMs: 80 }
+          : { sourceRate: 24000, bufferMs: 500, startBufferMs: 80, resumeBufferMs: 80 };
         popoutVita49Node = new AudioWorkletNode(popoutVita49Ctx, 'jtcat-vita49-source', {
           numberOfInputs: 0,
           numberOfOutputs: 1,
           outputChannelCount: [1],
-          processorOptions: { sourceRate: 24000 },
+          processorOptions: vita49SourceOptions,
         });
+        popoutVita49FrameCount = 0;
         popoutVita49Dest = popoutVita49Ctx.createMediaStreamDestination();
         popoutVita49Node.connect(popoutVita49Dest);
         popoutAudioStream = popoutVita49Dest.stream;
-        console.log('[JTCAT popout] Audio source: SmartSDR Direct (VITA-49 dax_rx via AudioWorklet)');
+        if (window.api.setJtcatIpAudioReady) window.api.setJtcatIpAudioReady(true);
+        console.log(`[JTCAT popout] Audio source: ${audioSource === 'icom-network' ? 'Icom Network audio (RS-BA1)' : 'SmartSDR Direct (VITA-49 dax_rx)'} via AudioWorklet${audioSource === 'icom-network' ? ' with low-latency jitter buffer' : ''}`);
       } else {
         var constraints = {
           channelCount: 1,

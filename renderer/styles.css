@@ -244,6 +244,29 @@ header {
   display: flex;
   gap: 12px;
   align-items: center;
+  flex-wrap: wrap;
+}
+
+.top-operator-switch {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.top-operator-switch select {
+  min-width: 92px;
+  max-width: 150px;
+  padding: 4px 22px 4px 8px;
+  color: var(--accent-blue);
+  font-weight: 700;
+}
+
+.top-operator-switch select:disabled {
+  color: var(--text-tertiary);
+  opacity: 0.8;
 }
 
 /* Multi-select dropdowns */
@@ -3789,6 +3812,7 @@ tr.wl-group-2 td:last-child {
 
 .hamlib-test-fail {
   color: var(--accent-red);
+  white-space: pre-wrap;
 }
 
 /* Welcome dialog */
