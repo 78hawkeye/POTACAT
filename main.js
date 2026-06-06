@@ -8312,6 +8312,8 @@ function connectRemote() {
         if (_icomNetworkTransport && _icomNetworkTransport.txReady &&
             !_icomNetworkTransport.voiceTxActive) {
           try {
+            _rsba1TxChunkCount = 0;       // reset per-PTT so "chunk #1" fires on every key-down
+            _rsba1TxLastPeakReport = 0;
             _icomNetworkTransport.startVoiceTx();
             sendCatLog('[Icom-Network-Audio] Voice TX started (ECHOCAT phone PTT)');
           } catch (e) {

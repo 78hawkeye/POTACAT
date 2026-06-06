@@ -74,6 +74,9 @@ window.api.onStartAudio(async (config) => {
     audioEl.srcObject = null;
     tearDownSmartGraph();      // resets smartActive = false
     tearDownLocalMixGraph();   // resets mixActive = false
+    kiwiTxMuted = false;       // defensive reset — prevents voice TX tap from forwarding audio
+                               // immediately on session start if flag was left true by a prior
+                               // session that ended before the remote-tx-state=false IPC arrived.
 
     // Capture radio's USB audio output (RX audio to send to phone)
     const baseAudio = {
