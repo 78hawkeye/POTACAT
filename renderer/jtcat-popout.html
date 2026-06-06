@@ -31,6 +31,7 @@
     .jp-row .jp-db { min-width: 28px; text-align: right; color: var(--text-secondary); }
     .jp-row .jp-dt { min-width: 30px; text-align: right; color: var(--text-dim); font-size: 11px; }
     .jp-row .jp-df { min-width: 36px; text-align: right; color: var(--text-dim); }
+    .jp-row .jp-km { min-width: 38px; text-align: right; color: var(--text-dim); font-size: 11px; }
     .jp-row .jp-msg { flex: 1; }
     .jp-row.jp-cq { background: rgba(0, 120, 0, 0.25); }
     .jp-row.jp-cq .jp-msg { color: var(--accent-green, #4ecca3); font-weight: bold; }
@@ -205,7 +206,7 @@
   <div class="jp-main">
     <div class="jp-decode-pane">
       <div class="jp-decode-section">
-        <div class="jp-decode-header">Band Activity <div style="display:flex;gap:4px;align-items:center;"><input type="text" id="jp-search" placeholder="Filter..." style="width:70px;font-size:10px;padding:1px 4px;border:1px solid var(--border-primary);background:var(--bg-primary);color:var(--text-primary);border-radius:3px;" spellcheck="false"><button id="jp-cq-filter" class="jtcat-filter-btn" title="Show CQ calls only">CQ</button><button id="jp-73-filter" class="jtcat-filter-btn" title="Show 73 / RR73 sign-offs only">73</button><button id="jp-wanted-filter" class="jtcat-filter-btn" title="Show only needed DXCC/grid/call">Wanted</button><button id="jp-sort-signal" class="jtcat-filter-btn" title="Sort by signal strength (strongest first)">dB</button><button id="jp-clear" class="jtcat-filter-btn" title="Clear all decodes">Clear</button></div></div>
+        <div class="jp-decode-header">Band Activity <div style="display:flex;gap:4px;align-items:center;"><input type="text" id="jp-search" placeholder="Filter..." style="width:70px;font-size:10px;padding:1px 4px;border:1px solid var(--border-primary);background:var(--bg-primary);color:var(--text-primary);border-radius:3px;" spellcheck="false"><button id="jp-cq-filter" class="jtcat-filter-btn" title="Show CQ calls only">CQ</button><button id="jp-73-filter" class="jtcat-filter-btn" title="Show 73 / RR73 sign-offs only">73</button><button id="jp-wanted-filter" class="jtcat-filter-btn" title="Show only needed DXCC/grid/call">Wanted</button><button id="jp-sort-signal" class="jtcat-filter-btn" title="Sort by signal strength (strongest first)">dB</button><button id="jp-dist-sort" class="jtcat-filter-btn" title="Sort by distance from your grid (farthest first)">km</button><button id="jp-clear" class="jtcat-filter-btn" title="Clear all decodes">Clear</button></div></div>
         <div id="jp-band-activity" class="jp-decode-list">
           <div class="jp-empty">Waiting for decodes...</div>
         </div>

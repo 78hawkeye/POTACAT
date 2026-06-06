@@ -39,6 +39,7 @@ function _applyPopoutTheme(payload) {
   var seventyThreeFilter = false;
   var wantedFilter = false;
   var sortBySignal = false;
+  var sortByDist = false;
   var searchFilter = '';
   var txEnabled = false;
   var transmitting = false;
@@ -161,6 +162,21 @@ function _applyPopoutTheme(payload) {
     var lon = lonField * 20 + lonSquare * 2 - 180 + 1;
     var lat = latField * 10 + latSquare * 1 - 90 + 0.5;
     return { lat: lat, lon: lon };
+  }
+
+  // Haversine great-circle distance between two 4-char Maidenhead grids.
+  // Returns distance in km, or -1 if either grid is missing/invalid.
+  function gridDistanceKm(g1, g2) {
+    var p1 = gridToLatLon(g1);
+    var p2 = gridToLatLon(g2);
+    if (!p1 || !p2) return -1;
+    var R = 6371;
+    var dLat = (p2.lat - p1.lat) * Math.PI / 180;
+    var dLon = (p2.lon - p1.lon) * Math.PI / 180;
+    var sinLat = Math.sin(dLat / 2);
+    var sinLon = Math.sin(dLon / 2);
+    var a = sinLat * sinLat + Math.cos(p1.lat * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180) * sinLon * sinLon;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   }
 
   // Returns [[south, west], [north, east]] bounds for a 4-char grid
@@ -525,9 +541,18 @@ function _applyPopoutTheme(payload) {
 
     var myActivityHasSep = false; // only add separator to My Activity if there's a directed decode
 
-    // Sort by signal strength if enabled (strongest first)
+    // Sort: signal (strongest first) or distance (farthest first); mutually exclusive
     if (sortBySignal) {
       results = results.slice().sort(function(a, b) { return (b.db || 0) - (a.db || 0); });
+    } else if (sortByDist && myGrid) {
+      results = results.slice().sort(function(a, b) {
+        var da = gridDistanceKm(myGrid, a.grid || '');
+        var db = gridDistanceKm(myGrid, b.grid || '');
+        if (da < 0 && db < 0) return 0;
+        if (da < 0) return 1;   // no grid → sink to bottom
+        if (db < 0) return -1;
+        return db - da;          // farthest first
+      });
     }
 
     results.forEach(function(d) {
@@ -572,11 +597,13 @@ function _applyPopoutTheme(payload) {
         var bColor = BAND_COLORS[d.band] || '#888';
         bandBadge = '<span class="jp-badge jp-badge-band" style="background:' + bColor + ';color:#000;">' + d.band + '</span>';
       }
+      var distKm = (myGrid && d.grid) ? gridDistanceKm(myGrid, d.grid) : -1;
       row.innerHTML =
         (bandBadge ? bandBadge : '') +
         '<span class="jp-db">' + (d.db >= 0 ? '+' : '') + d.db + '</span>' +
         '<span class="jp-dt">' + dtStr + '</span>' +
         '<span class="jp-df">' + Math.round(d.df) + '</span>' +
+        '<span class="jp-km">' + (distKm > 0 ? Math.round(distKm) : '') + '</span>' +
         '<span class="jp-msg">' + esc(text) + '</span>' +
         (badges ? '<span class="jp-badges">' + badges + '</span>' : '') +
         entityStr;
@@ -1005,9 +1032,20 @@ function _applyPopoutTheme(payload) {
   });
 
   var sortSignalBtn = document.getElementById('jp-sort-signal');
+  var distSortBtn = document.getElementById('jp-dist-sort');
+
   sortSignalBtn.addEventListener('click', function() {
     sortBySignal = !sortBySignal;
     sortSignalBtn.classList.toggle('active', sortBySignal);
+    // distance sort and signal sort are mutually exclusive
+    if (sortBySignal) { sortByDist = false; distSortBtn.classList.remove('active'); }
+  });
+
+  distSortBtn.addEventListener('click', function() {
+    sortByDist = !sortByDist;
+    distSortBtn.classList.toggle('active', sortByDist);
+    // signal sort and distance sort are mutually exclusive
+    if (sortByDist) { sortBySignal = false; sortSignalBtn.classList.remove('active'); }
   });
 
   var searchInput = document.getElementById('jp-search');
