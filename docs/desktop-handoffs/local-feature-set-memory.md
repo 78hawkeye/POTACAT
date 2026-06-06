@@ -406,7 +406,11 @@ RS-BA1 tests cover:
 
 The working implementation was informed by:
 
-- wfview source, especially:
+- wfview source:
+  - upstream: `https://gitlab.com/eliggett/wfview.git`
+  - local reference path: `.codex-ref/wfview`
+  - studied commit: `cd18ea55fe479eb4526d1732b443cbfc3969c540`
+  - important files / behaviors:
   - `src/radio/icomudpaudio.cpp`
   - `src/radio/icomserver.cpp`
   - 20 ms audio period
@@ -416,9 +420,17 @@ The working implementation was informed by:
 - RS-BA1 UDP behavior observed from the IC-7610.
 - SDR Control behavior as a real-world benchmark, but not decompiled.
 - WSJT-X / FT8 best practices:
+  - upstream: `https://git.code.sf.net/p/wsjt/wsjtx`
+  - local reference path: `.codex-ref/wsjtx`
+  - studied commit: `b4f9a431bcf6449df8f37b56de79d48b665b044c`
+  - important files / behaviors:
   - 12 kHz FT8 baseband from JTCAT
   - slot start convention around +500 ms for FT8
   - clean low-ALC digital audio, not clipped samples
+
+Do not vendor or commit `.codex-ref/` into the POTACAT fork. These repositories are
+research references only; use the pinned upstream URLs and commits above to recreate
+the same context later.
 
 ## Future Re-Apply Strategy
 
