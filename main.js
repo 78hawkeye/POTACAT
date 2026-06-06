@@ -6051,6 +6051,7 @@ let _icomNetworkJtcatUiChunks = [];
 let _icomNetworkJtcatUiSampleCount = 0;
 let _icomNetworkJtcatUiSampleRate = 0;
 let _icomNetworkJtcatUiPeak = 0;
+let _icomNetworkJtcatReadyNudgeMs = 0;
 const ICOM_NETWORK_JTCAT_UI_FRAME_MS = 20;
 const ICOM_NETWORK_RX_PACER_FRAME_MS = 20;
 const ICOM_NETWORK_RX_PACER_START_MS = 2400;
@@ -6202,6 +6203,16 @@ function sendIcomNetworkJtcatUiAudio(pcm, sampleRate, peak, jtcatRunning) {
     audioSafeSend(win.webContents, 'jtcat-vita49-audio', jtcatFrame);
   } else if (_icomNetworkJtcatFrameCount === 0 || _icomNetworkJtcatFrameCount % 250 === 0) {
     appendDiagnosticLog('rsba1-rx-diagnostics.log', `JTCAT-IP-AUDIO-NO-READY main=${win && !win.isDestroyed() ? win.webContents.id : 0} popout=${jtcatPopoutWin && !jtcatPopoutWin.isDestroyed() ? jtcatPopoutWin.webContents.id : 0}`);
+  }
+  if (!popoutReady && !mainReady && jtcatRunning) {
+    const now = Date.now();
+    const targetWin = jtcatPopoutWin && !jtcatPopoutWin.isDestroyed() ? jtcatPopoutWin : win;
+    const eventName = targetWin === jtcatPopoutWin ? 'restart-popout-audio' : 'restart-jtcat-audio';
+    if (targetWin && !targetWin.isDestroyed() && now - _icomNetworkJtcatReadyNudgeMs >= 10_000) {
+      _icomNetworkJtcatReadyNudgeMs = now;
+      appendDiagnosticLog('rsba1-rx-diagnostics.log', `JTCAT-IP-AUDIO-NUDGE event=${eventName} wc=${targetWin.webContents.id}`);
+      targetWin.webContents.send(eventName);
+    }
   }
   _icomNetworkJtcatFrameCount++;
   if (_icomNetworkJtcatFrameCount === 1 || _icomNetworkJtcatFrameCount % 100 === 0) {
