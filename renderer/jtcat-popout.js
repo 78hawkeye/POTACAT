@@ -36,6 +36,7 @@ function _applyPopoutTheme(payload) {
   // --- State ---
   var decodeLog = [];
   var cqFilter = false;
+  var seventyThreeFilter = false;
   var wantedFilter = false;
   var sortBySignal = false;
   var searchFilter = '';
@@ -101,6 +102,7 @@ function _applyPopoutTheme(payload) {
   updateUtcClock();
   setInterval(updateUtcClock, 1000);
   var cqFilterBtn = document.getElementById('jp-cq-filter');
+  var seventyThreeFilterBtn = document.getElementById('jp-73-filter');
   var wantedFilterBtn = document.getElementById('jp-wanted-filter');
   var cqBtn = document.getElementById('jp-cq');
   var fullAutoCqBtn = document.getElementById('jp-full-auto-cq');
@@ -537,7 +539,13 @@ function _applyPopoutTheme(payload) {
       var is73 = upper.indexOf('RR73') >= 0 || upper.indexOf(' 73') >= 0;
       var isWanted = d.newDxcc || d.newCall || d.newGrid;
 
-      if (cqFilter && !isCq && !isDirected) return;
+      // CQ/73 filters: each button is independent; a row passes if it matches
+      // any active filter category, OR if it's directed at the operator
+      // (messages to you always show regardless of which filter is on).
+      if (cqFilter || seventyThreeFilter) {
+        var passesFilter = (cqFilter && isCq) || (seventyThreeFilter && is73) || isDirected;
+        if (!passesFilter) return;
+      }
       if (wantedFilter && !isWanted && !isDirected && !is73) return;
       if (searchFilter && upper.indexOf(searchFilter) === -1) return;
 
@@ -984,6 +992,11 @@ function _applyPopoutTheme(payload) {
   cqFilterBtn.addEventListener('click', function() {
     cqFilter = !cqFilter;
     cqFilterBtn.classList.toggle('active', cqFilter);
+  });
+
+  seventyThreeFilterBtn.addEventListener('click', function() {
+    seventyThreeFilter = !seventyThreeFilter;
+    seventyThreeFilterBtn.classList.toggle('active', seventyThreeFilter);
   });
 
   wantedFilterBtn.addEventListener('click', function() {
