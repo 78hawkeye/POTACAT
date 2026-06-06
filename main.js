@@ -350,6 +350,8 @@ const GLOBAL_KEYS = new Set([
   'echocatPort',       // ECHOCAT server port
   'echocatToken',      // ECHOCAT legacy single shared token (machine)
   'enableEchoCat',     // ECHOCAT server enable (machine-level)
+  'cloudDeviceId',     // stable machine UUID for cloud device registration
+                       // (must be global so both operators' phones find the same shack)
 ]);
 
 const CLOUD_TUNNEL_CONFIG_FILENAME = 'cloud-tunnel.json';
@@ -599,6 +601,31 @@ function archiveProfile(callsign) {
   } catch (err) {
     return { ok: false, error: err.message };
   }
+}
+
+// Load paired devices from ALL operator profiles into one merged list.
+// Called at remoteServer startup so every phone can authenticate regardless
+// of which profile is currently active. pairedDevices remains per-profile
+// on disk; this is an in-memory union for auth purposes only.
+// Devices that pre-date the profileCallsign field get it back-filled from
+// the profile directory they lived in, so existing pairings keep working.
+function loadAllProfilePairedDevices() {
+  const profiles = listProfiles();
+  const merged = [];
+  const seen = new Set();
+  for (const call of profiles) {
+    try {
+      const pSettings = _readJsonSafe(profileSettingsPath(call), {});
+      const devices = Array.isArray(pSettings.pairedDevices) ? pSettings.pairedDevices : [];
+      for (const dev of devices) {
+        if (!dev || !dev.id || seen.has(dev.id)) continue;
+        seen.add(dev.id);
+        // Back-fill profileCallsign for devices paired before this feature
+        merged.push(dev.profileCallsign ? dev : { ...dev, profileCallsign: call });
+      }
+    } catch { /* corrupt profile dir — skip */ }
+  }
+  return merged;
 }
 
 let settings = null;
@@ -8152,7 +8179,12 @@ function connectRemote() {
   } catch {}
   // Hydrate paired-devices list from settings.json. The list survives
   // across desktop restarts; revoking from settings UI removes a device.
-  try { remoteServer.setPairedDevices(settings.pairedDevices || []); } catch {}
+  // Load paired devices from ALL operator profiles so any phone can auth
+  // regardless of which profile is currently active on the desktop.
+  try { remoteServer.setPairedDevices(loadAllProfilePairedDevices()); } catch {}
+  // Tell the server which operator is active so new pairings get stamped
+  // with the right profileCallsign for auto-switch-on-connect.
+  try { remoteServer.setCurrentOperatorCallsign(settings.activeProfile || ''); } catch {}
   // Persistent share-link store. Operator-created links (Settings →
   // Remote Access → Share Access) outlive desktop restarts so a link
   // emailed Monday still works after a Tuesday reboot. setPendingPairLinks
@@ -8165,8 +8197,35 @@ function connectRemote() {
   // When the server adds or revokes a device, persist the new list.
   remoteServer.on('paired-devices-changed', () => {
     try {
-      settings.pairedDevices = remoteServer.exportPairedDevices();
+      const allDevices = remoteServer.exportPairedDevices();
+      const activeCall = String((settings && settings.activeProfile) || '').toUpperCase();
+
+      // Group by profileCallsign; unstamped legacy devices fall back to active profile
+      const byProfile = {};
+      for (const dev of allDevices) {
+        const p = String(dev.profileCallsign || activeCall || '').toUpperCase();
+        if (!byProfile[p]) byProfile[p] = [];
+        byProfile[p].push(dev);
+      }
+
+      // Save current profile's devices through the normal settings path
+      settings.pairedDevices = byProfile[activeCall] || [];
       saveSettings(settings);
+
+      // Save other profiles' devices directly to their profile settings files
+      for (const [call, devices] of Object.entries(byProfile)) {
+        if (call && call !== activeCall && fs.existsSync(profileDir(call))) {
+          try {
+            const pPath = profileSettingsPath(call);
+            const pSettings = _readJsonSafe(pPath, {});
+            pSettings.pairedDevices = devices;
+            _writeJsonAtomic(pPath, pSettings);
+          } catch (err) {
+            console.error('[multi-op] paired-devices save failed for', call, err.message);
+          }
+        }
+      }
+
       if (win && !win.isDestroyed()) {
         win.webContents.send('echocat-paired-devices', remoteServer.listPairedDevices());
       }
@@ -8249,7 +8308,7 @@ function connectRemote() {
     handleRemotePtt(state);
   });
 
-  remoteServer.on('client-connected', () => {
+  remoteServer.on('client-connected', ({ deviceId, profileCallsign } = {}) => {
     // Cancel any pending teardown — the phone came back inside the
     // grace window, so the engine kept running and we're whole.
     if (_clientDisconnectGraceTimer) {
@@ -8358,6 +8417,39 @@ function connectRemote() {
     if (win && !win.isDestroyed()) {
       win.webContents.send('remote-status', { connected: true });
     }
+
+    // ── Auto-switch profile on phone connect ─────────────────────────
+    // If the connecting phone's device record has a profileCallsign that
+    // differs from the currently-active profile, automatically switch to
+    // that operator's profile so they get their own callsign, grid,
+    // logbook and settings without touching the Mac.
+    //
+    // Guard: only switch if PTT is not active (don't interrupt a TX),
+    // the target profile exists on disk, and a switch isn't already
+    // in progress. The app restarts in ~2s; the phone sees a brief
+    // disconnect then reconnects automatically to the correct profile.
+    const targetProfile = profileCallsign ? String(profileCallsign).toUpperCase() : '';
+    const currentProfile = String((settings && settings.activeProfile) || '').toUpperCase();
+    if (targetProfile && targetProfile !== currentProfile && !_profileSwitchRelaunchPending) {
+      if (!fs.existsSync(profileDir(targetProfile))) {
+        sendCatLog(`[multi-op] Auto-switch requested for ${targetProfile} but no profile found on disk`);
+      } else if (remoteServer._pttActive) {
+        sendCatLog(`[multi-op] Auto-switch to ${targetProfile} deferred — PTT active on ${currentProfile || '?'}`);
+      } else {
+        sendCatLog(`[multi-op] ECHOCAT device connect: auto-switching ${currentProfile || '?'} → ${targetProfile} (deviceId=${deviceId || '?'})`);
+        const r = switchProfile(targetProfile);
+        if (r.ok && r.restartRequired) {
+          setImmediate(() => {
+            prepareProfileSwitchRelaunch(currentProfile, targetProfile)
+              .catch((err) => {
+                try { appendIcomNetworkDiagnostic(`[multi-op] auto-switch cleanup error: ${err.message || err}`); } catch {}
+              })
+              .finally(() => { app.relaunch(); app.exit(0); });
+          });
+        }
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────
   });
 
   remoteServer.on('client-disconnected', () => {
