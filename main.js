@@ -6143,6 +6143,7 @@ let _icomNetworkRxDiag = null;
 let _icomNetworkRxWatchdogTimer = null;
 let _icomNetworkRxLastRecoveryMs = 0;
 let _icomNetworkRxAudioRestartAttempts = 0;
+let _icomNetworkRxFullReconnectPending = false;
 let _icomNetworkRxPacer = null;
 let _icomNetworkEventLoopTimer = null;
 let _icomNetworkEventLoopExpectedMs = 0;
@@ -6162,6 +6163,7 @@ const ICOM_NETWORK_RX_PACER_MAX_MS = 5400;
 const ICOM_NETWORK_RX_STALL_MS = 1200;
 const ICOM_NETWORK_RX_RESTART_STALL_MS = 8000;
 const ICOM_NETWORK_RX_RECOVERY_COOLDOWN_MS = 2500;
+const ICOM_NETWORK_RX_FULL_RECONNECT_AFTER_AUDIO_RESTARTS = 3;
 const ICOM_NETWORK_RX_LOSSFILL_MAX_MS = 240;
 const ICOM_NETWORK_RX_LOSSFILL_MAX_ARRIVAL_GAP_MS = 120;
 const ICOM_NETWORK_EVENT_LOOP_PERIOD_MS = 100;
@@ -6238,12 +6240,14 @@ function stopIcomNetworkRxWatchdog() {
     _icomNetworkRxWatchdogTimer = null;
   }
   stopIcomNetworkEventLoopMonitor();
+  _icomNetworkRxFullReconnectPending = false;
 }
 
 function startIcomNetworkRxWatchdog() {
   stopIcomNetworkRxWatchdog();
   _icomNetworkRxLastRecoveryMs = 0;
   _icomNetworkRxAudioRestartAttempts = 0;
+  _icomNetworkRxFullReconnectPending = false;
   _icomNetworkRxWatchdogTimer = setInterval(() => {
     if (settings.audioSource !== 'icom-network' || !_icomNetworkTransport || !_icomNetworkRxDiag) return;
     const d = _icomNetworkRxDiag;
@@ -6263,6 +6267,21 @@ function startIcomNetworkRxWatchdog() {
     _icomNetworkRxLastRecoveryMs = now;
     _icomNetworkRxAudioRestartAttempts++;
     const reason = `RX stalled ${quietMs}ms (attempt ${_icomNetworkRxAudioRestartAttempts})`;
+    if (_icomNetworkRxAudioRestartAttempts >= ICOM_NETWORK_RX_FULL_RECONNECT_AFTER_AUDIO_RESTARTS) {
+      if (_icomNetworkRxFullReconnectPending) return;
+      _icomNetworkRxFullReconnectPending = true;
+      const msg = `RX-RECOVERY full CAT reconnect requested after ${_icomNetworkRxAudioRestartAttempts} stalled audio restart attempt(s): ${reason}`;
+      appendDiagnosticLog('rsba1-rx-diagnostics.log', msg);
+      sendCatLog(`[Icom-Network-Audio] ${msg}`);
+      connectCat()
+        .catch((err) => {
+          appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-RECOVERY full CAT reconnect failed: ${err.message || err}`);
+        })
+        .finally(() => {
+          _icomNetworkRxFullReconnectPending = false;
+        });
+      return;
+    }
     let restarted = false;
     try {
       restarted = !!(_icomNetworkTransport && _icomNetworkTransport.restartAudioStream && _icomNetworkTransport.restartAudioStream(reason));
