@@ -428,8 +428,9 @@ function loadSettings() {
   if (!global) {
     // Truly fresh install: return defaults, no profile yet. RBN + PSKReporter
     // Propagation default ON so the "where am I heard" view has data out of the
-    // box (both activate once myCallsign is set). K3SBP 2026-06-10.
-    return { grid: 'FN20jb', catTarget: null, enablePota: true, enableSota: false, enableRbn: true, enablePskrMap: true, firstRun: true, watchlist: 'K3SBP' };
+    // box (both activate once myCallsign is set). No dev-specific grid/watchlist
+    // defaults (profile-isolation cleanup). K3SBP 2026-06-10.
+    return { grid: '', catTarget: null, enablePota: true, enableSota: false, enableRbn: true, enablePskrMap: true, firstRun: true, watchlist: '' };
   }
   // Migration path: legacy settings.json (no activeProfile) gets migrated
   // when it has a myCallsign. We do this lazily on first save rather than
@@ -521,6 +522,10 @@ function switchProfile(callsign) {
   const call = String(callsign || '').toUpperCase().trim();
   if (!call) return { ok: false, error: 'No callsign specified.' };
   if (!fs.existsSync(profileDir(call))) return { ok: false, error: 'Operator ' + call + ' does not exist.' };
+  // No-op if already active — prevents accidental restart from a stale UI state
+  if (settings && call === String(settings.activeProfile || '').toUpperCase()) {
+    return { ok: true, callsign: call, previousCallsign: call, restartRequired: false, alreadyActive: true };
+  }
   // Save current operator's state (so any unsaved field changes persist),
   // flip the activeProfile pointer in the global file, then we relaunch.
   // Live-reload (re-init cluster/RBN/PSKR/POTA sync/Cloud auth/etc.
@@ -19585,7 +19590,7 @@ app.whenReady().then(() => {
   ipcMain.handle('profiles-add', (_e, callsign) => addProfile(callsign));
   ipcMain.handle('profiles-switch', (_e, callsign) => {
     const r = switchProfile(callsign);
-    if (r.ok) {
+    if (r.ok && r.restartRequired) {
       // Restart cleanly so every cached subsystem rebinds to the new
       // operator's settings. setImmediate gives the IPC response time
       // to land in the renderer before the window goes away.
