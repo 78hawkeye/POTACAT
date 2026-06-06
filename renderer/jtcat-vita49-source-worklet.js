@@ -64,7 +64,7 @@ class Vita49SourceProcessor extends AudioWorkletProcessor {
       // audio down near the configured target. Brief catch-up beats drifting
       // multiple seconds behind real time.
       if (this.bufAvailable + pcm.length > this.bufSize) {
-        const target = Math.max(this.startBufferSamples, this.resumeBufferSamples, Math.floor(this.bufSize * 0.5));
+        const target = Math.max(this.startBufferSamples, this.resumeBufferSamples, Math.floor(this.bufSize * 0.75));
         const drop = Math.min(this.bufAvailable, (this.bufAvailable + pcm.length) - target);
         this.bufRead = (this.bufRead + drop) % this.bufSize;
         this.bufAvailable -= drop;

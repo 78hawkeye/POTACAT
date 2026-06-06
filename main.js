@@ -769,7 +769,7 @@ const DEFAULT_JTCAT_TX_PWR_PCT = 100;
 const DEFAULT_JTCAT_TX_GAIN = (DEFAULT_JTCAT_TX_PWR_PCT / 100) * (DEFAULT_JTCAT_TX_PWR_PCT / 100);
 const DIRECT_TX_PEAK_LIMIT = 0.95;
 const ICOM_NETWORK_TX_SAMPLE_RATE = 48000;
-const ICOM_NETWORK_TX_BUFFER_MS = 150;
+const ICOM_NETWORK_TX_BUFFER_MS = 200; // 150→200ms: raises paceLeadMs 100→150ms, improves Wi-Fi TX resilience
 const ICOM_NETWORK_TUNE_START_DELAY_MS = 200;
 const ICOM_NETWORK_TUNE_PEAK = 0.45;
 const DEFAULT_ICOM_NETWORK_TX_GAIN = 0.72;
@@ -5328,6 +5328,14 @@ function startJtcat(mode) {
       const networkTxGain = getIcomNetworkTxGain();
       const txAudio = conditionDirectTxAudio(data.samples, _jtcatDirectTxGainLevel * networkTxGain, 1.0);
       sendCatLog(`[Icom-Network-Audio] JTCAT TX profile: WSJT-X timing, ${ICOM_NETWORK_TX_SAMPLE_RATE / 1000}k LPCM mono, ${ICOM_NETWORK_TX_BUFFER_MS}ms RS-BA1 buffer, startDelay=${startDelayMs}ms, networkTxGain=${Math.round(networkTxGain * 100)}%; ${formatDigitalTxEnvelopeStats(envelope)}; ${formatDirectTxAudioStats(txAudio)}. Use radio RF power for output and keep ALC low.`);
+      // Abort before PTT if the conditioned waveform is essentially silent —
+      // catches encoder bugs that would otherwise key the radio with a silent carrier.
+      if (txAudio.outputPeak < 0.01) {
+        logIcomNetworkAudio(`[Icom-Network-Audio] TX aborted: conditioned audio peak ${txAudio.outputPeak.toFixed(4)} is too low (encoder produced silent waveform?)`);
+        if (ft8Engine && ft8Engine._txActive) ft8Engine.txComplete();
+        else handleRemotePtt(false);
+        return;
+      }
       armJtcatIcomHardRelease(txAudio.samples, 12000, data.offsetMs || 0, startDelayMs);
       _icomNetworkTransport.sendTxAudio(txAudio.samples, {
         offsetMs: data.offsetMs || 0,
@@ -6155,6 +6163,9 @@ let _icomNetworkJtcatUiSampleCount = 0;
 let _icomNetworkJtcatUiSampleRate = 0;
 let _icomNetworkJtcatUiPeak = 0;
 let _icomNetworkJtcatReadyNudgeMs = 0;
+// PLC: last non-fill, non-silence frame; used to repeat audio during loss gaps
+// instead of injecting silence (especially important for SSTV tone continuity).
+let _lastGoodIcomNetworkPcm = null;
 const ICOM_NETWORK_JTCAT_UI_FRAME_MS = 20;
 const ICOM_NETWORK_RX_PACER_FRAME_MS = 20;
 const ICOM_NETWORK_RX_PACER_START_MS = 1000;
@@ -6364,6 +6375,13 @@ function handleIcomNetworkPacedRxFrame(pcm, sampleRate, meta = {}) {
   if (!pcm || !pcm.length) return;
   const peak = meta.silence ? 0 : peakFloat32(pcm);
 
+  // PLC: track last real (non-fill, non-silence) frame so loss-fill gaps can
+  // repeat it rather than injecting silence. Repeating the last frame preserves
+  // SSTV tone continuity and slightly improves FT8 SNR vs zero-filling.
+  if (!meta.silence && !meta.lossFill && peak > 0.001) {
+    _lastGoodIcomNetworkPcm = pcm;
+  }
+
   if (remoteAudioWin) {
     audioSafeSend(remoteAudioWin.webContents, 'smartsdr-audio-frame', { pcm, sampleRate });
   }
@@ -6515,8 +6533,19 @@ function handleIcomNetworkAudioFrame(frame) {
     const maxFillSamples = Math.round((sampleRate || 48000) * ICOM_NETWORK_RX_LOSSFILL_MAX_MS / 1000);
     const cappedSamples = Math.min(fillSamples, maxFillSamples);
     if (cappedSamples > 0) {
-      appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-LOSSFILL packets=${track.missingAdded} samples=${cappedSamples}${cappedSamples < fillSamples ? `/${fillSamples}` : ''} arrivalGap=${arrivalGapMs}ms beforeSeq=${frame.packetSeq ?? '-'}`);
-      handleIcomNetworkPacedRxFrame(new Float32Array(cappedSamples), sampleRate, { silence: true, lossFill: true });
+      // PLC: tile the last good frame instead of inserting silence. This preserves
+      // SSTV tone continuity across packet gaps. For FT8 the repeat is better than
+      // silence too (adds a small copy of real signal rather than a zero gap).
+      let fillPcm;
+      if (_lastGoodIcomNetworkPcm && _lastGoodIcomNetworkPcm.length > 0) {
+        fillPcm = new Float32Array(cappedSamples);
+        const src = _lastGoodIcomNetworkPcm;
+        for (let i = 0; i < cappedSamples; i++) fillPcm[i] = src[i % src.length];
+      } else {
+        fillPcm = new Float32Array(cappedSamples);
+      }
+      appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-LOSSFILL packets=${track.missingAdded} samples=${cappedSamples}${cappedSamples < fillSamples ? `/${fillSamples}` : ''} arrivalGap=${arrivalGapMs}ms beforeSeq=${frame.packetSeq ?? '-'} plc=${_lastGoodIcomNetworkPcm ? 'repeat' : 'silence'}`);
+      handleIcomNetworkPacedRxFrame(fillPcm, sampleRate, { silence: false, lossFill: true });
     }
   }
   handleIcomNetworkPacedRxFrame(pcm, sampleRate, { silence: false });
@@ -17093,15 +17122,24 @@ app.whenReady().then(() => {
         } else if (useIcomNetworkTx) {
           const sstvTxGain = clampNumber(settings.sstvTxGain, 0, 1, 0.5);
           const networkTxGain = getIcomNetworkTxGain();
-          const txAudio = conditionDirectTxAudio(outSamples, sstvTxGain * (networkTxGain / DEFAULT_ICOM_NETWORK_TX_GAIN));
+          // peakLimit=1.0: SSTV tones encode information in precise frequency ratios;
+          // hard clipping at 0.95 introduces harmonic distortion that corrupts the
+          // decoder at the receiving end. Apply gain only, no ceiling clipping.
+          const txAudio = conditionDirectTxAudio(outSamples, sstvTxGain * (networkTxGain / DEFAULT_ICOM_NETWORK_TX_GAIN), 1.0);
           sendCatLog(`[SSTV] TX via Icom Network RS-BA1 audio — ${outDurSec.toFixed(0)}s (${outSamples.length} samples @48k, networkTxGain=${Math.round(networkTxGain * 100)}%); ${formatDirectTxAudioStats(txAudio)}`);
+          // Abort before PTT if the encoder produced a silent waveform.
+          if (txAudio.outputPeak < 0.01) {
+            sendCatLog(`[SSTV] TX aborted: conditioned audio peak ${txAudio.outputPeak.toFixed(4)} is too low (encoder produced silent waveform?)`);
+            handleRemotePtt(false);
+            return;
+          }
           if (sstvPopoutWin && !sstvPopoutWin.isDestroyed()) {
             sstvPopoutWin.webContents.send('sstv-tx-audio', { samples: [], durationSec: outDurSec, daxTx: true, directTxLabel: 'Icom Network' });
           }
           _icomNetworkTransport.sendTxAudio(txAudio.samples, {
             offsetMs: 0,
             inputSampleRate: SSTV_SAMPLE_RATE,
-            startDelayMs: ICOM_NETWORK_TUNE_START_DELAY_MS,
+            startDelayMs: 100, // 200ms (tune delay) was longer than needed; 100ms is enough to prime the radio buffer before VIS header starts
             tailSilenceMs: 200,
           })
             .then(() => {
