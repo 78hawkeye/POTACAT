@@ -53,6 +53,10 @@ contextBridge.exposeInMainWorld('api', {
   // sends to the radio. Bypasses Windows DAX TX device entirely.
   // K3SBP 2026-05-15.
   daxTxChunk: (samples) => ipcRenderer.send('dax-tx-chunk', samples),
+  // RS-BA1 voice TX path — forward 48 kHz mono Float32 WebRTC mic chunks to
+  // main, which pushes them into the AudioStream ring buffer and paces them
+  // out as RS-BA1 LPCM16 UDP audio packets. K3SBP 2026-06-06.
+  rsba1VoiceTxChunk: (samples) => ipcRenderer.send('rsba1-voice-tx-chunk', samples),
   // TX EQ + compressor — main pushes live updates here when the user
   // toggles enable/preset in Settings without rebuilding WebRTC.
   onTxEqUpdate: (cb) => ipcRenderer.on('tx-eq-update', (_e, eqConfig) => cb(eqConfig)),

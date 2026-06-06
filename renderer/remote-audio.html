@@ -19,6 +19,49 @@ let kiwiActive = false;     // mobile path: true → peer plays Kiwi audio
 let freedvMuted = false; // persisted mute state for FreeDV
 const audioEl = document.getElementById('remote-playback');
 
+// RS-BA1 voice TX tap — forwards phone mic audio from WebRTC → IPC → main
+// → AudioStream ring buffer → RS-BA1 LPCM16 UDP packets. Uses a separate
+// AudioContext at 48 kHz (RS-BA1 TX sample rate) and its own EQ chain so
+// it doesn't interfere with the DAX TX path. K3SBP 2026-06-06.
+let _rsba1TxCtx = null;
+let _rsba1TxNode = null;
+let _rsba1TxSource = null;
+const _rsba1TxEqChain = TxEqChain.create(); // separate instance from _txEqChain
+let _rsba1TxEqState = { enabled: false, preset: 'ragchew' };
+
+async function startRsba1VoiceTxTap(stream, eqConfig) {
+  stopRsba1VoiceTxTap();
+  if (!stream || !window.api.rsba1VoiceTxChunk) {
+    window.api.sendAudioStatus({ error: 'RS-BA1 voice TX: api.rsba1VoiceTxChunk not available' });
+    return;
+  }
+  // 48 kHz matches ICOM_AUDIO_TX_SAMPLE_RATE — no resampling needed.
+  _rsba1TxCtx = new AudioContext({ sampleRate: 48000 });
+  await _rsba1TxCtx.audioWorklet.addModule('dax-tx-worklet.js');
+  _rsba1TxSource = _rsba1TxCtx.createMediaStreamSource(stream);
+  _rsba1TxNode = new AudioWorkletNode(_rsba1TxCtx, 'dax-tx-processor');
+  _rsba1TxNode.port.onmessage = (ev) => {
+    // kiwiTxMuted is true while the phone has PTT held — only forward then.
+    if (ev.data && kiwiTxMuted) window.api.rsba1VoiceTxChunk(ev.data);
+  };
+  _rsba1TxEqState = {
+    enabled: !!(eqConfig && eqConfig.enabled),
+    preset:  (eqConfig && eqConfig.preset) || 'ragchew',
+  };
+  TxEqChain.wire(_rsba1TxEqChain, _rsba1TxCtx, _rsba1TxSource, _rsba1TxNode, _rsba1TxEqState);
+  _rsba1TxNode.connect(_rsba1TxCtx.destination);
+  if (_rsba1TxCtx.state === 'suspended') { try { await _rsba1TxCtx.resume(); } catch {} }
+}
+
+function stopRsba1VoiceTxTap() {
+  if (_rsba1TxSource && _rsba1TxNode) {
+    try { TxEqChain.wire(_rsba1TxEqChain, _rsba1TxCtx, _rsba1TxSource, _rsba1TxNode, { enabled: false }); } catch {}
+  }
+  if (_rsba1TxNode)   { try { _rsba1TxNode.disconnect();   } catch {} _rsba1TxNode   = null; }
+  if (_rsba1TxSource) { try { _rsba1TxSource.disconnect(); } catch {} _rsba1TxSource = null; }
+  if (_rsba1TxCtx)    { _rsba1TxCtx.close().catch(() => {}); _rsba1TxCtx = null; }
+}
+
 window.api.onStartAudio(async (config) => {
   try {
     // Clean up any previous session.
@@ -119,9 +162,17 @@ window.api.onStartAudio(async (config) => {
       // also reach a Windows DAX device (which would double-feed the
       // slice and produce echo / distortion). K3SBP 2026-05-15.
       if (config.daxTxDirect) {
+        // SmartSDR / K4-network direct path: WorkLet → dax-tx-chunk IPC →
+        // VITA-49 packets. Bypasses the Mac audio output device entirely.
         audioEl.muted = true;
         try { await startDaxTxTap(event.streams[0], config.txEq); }
         catch (e) { window.api.sendAudioStatus({ error: 'DAX TX tap init failed: ' + e.message }); }
+      } else if (config.audioSource === 'icom-network') {
+        // RS-BA1 (Icom Network) path: WorkLet → rsba1-voice-tx-chunk IPC →
+        // AudioStream ring buffer → LPCM16 UDP packets to radio. K3SBP 2026-06-06.
+        audioEl.muted = true; // don't echo locally
+        try { await startRsba1VoiceTxTap(event.streams[0], config.txEq); }
+        catch (e) { window.api.sendAudioStatus({ error: 'RS-BA1 voice TX tap failed: ' + e.message }); }
       } else {
         audioEl.muted = false;
         // Route to specific output device (radio's USB audio input via DAX program)
@@ -276,6 +327,14 @@ window.api.onTxEqUpdate((eqConfig) => {
   };
   if (_daxTxCtx && _daxTxSource && _daxTxNode) {
     TxEqChain.wire(_txEqChain, _daxTxCtx, _daxTxSource, _daxTxNode, _txEqState);
+  }
+  // Apply the same EQ settings to the RS-BA1 voice TX tap if it's running.
+  _rsba1TxEqState = {
+    enabled: !!(eqConfig && eqConfig.enabled),
+    preset:  (eqConfig && eqConfig.preset) || 'ragchew',
+  };
+  if (_rsba1TxCtx && _rsba1TxSource && _rsba1TxNode) {
+    TxEqChain.wire(_rsba1TxEqChain, _rsba1TxCtx, _rsba1TxSource, _rsba1TxNode, _rsba1TxEqState);
   }
 });
 
@@ -435,6 +494,7 @@ window.api.onStopAudio(() => {
   tearDownSmartGraph();    // was missing — smartActive would stay true across stops
   tearDownLocalMixGraph();
   stopDaxTxTap();
+  stopRsba1VoiceTxTap();
   audioSender = null;
   audioEl.srcObject = null;
   stopTxMeter();

@@ -8305,6 +8305,26 @@ function connectRemote() {
   });
 
   remoteServer.on('ptt', ({ state }) => {
+    // RS-BA1 streaming voice TX: start/stop the ring-buffer pump when the phone
+    // keys/unkeys. Only when the active audio source is the Icom network rig.
+    if (settings.audioSource === 'icom-network') {
+      if (state) {
+        if (_icomNetworkTransport && _icomNetworkTransport.txReady &&
+            !_icomNetworkTransport.voiceTxActive) {
+          try {
+            _icomNetworkTransport.startVoiceTx();
+            sendCatLog('[Icom-Network-Audio] Voice TX started (ECHOCAT phone PTT)');
+          } catch (e) {
+            sendCatLog('[Icom-Network-Audio] Voice TX start failed: ' + e.message);
+          }
+        }
+      } else {
+        if (_icomNetworkTransport && _icomNetworkTransport.voiceTxActive) {
+          _icomNetworkTransport.stopVoiceTx();
+          sendCatLog('[Icom-Network-Audio] Voice TX stopped (ECHOCAT phone PTT release)');
+        }
+      }
+    }
     handleRemotePtt(state);
   });
 
@@ -21619,6 +21639,38 @@ app.whenReady().then(() => {
       _pushK4TxSamples(samples);
     }
   });
+
+  // RS-BA1 voice TX chunks from remote-audio.html (ECHOCAT phone mic → WebRTC
+  // → renderer tap → IPC chunk → here → AudioStream ring buffer → UDP to radio).
+  // Each chunk is a Float32Array of 128 mono samples at 48 kHz (one AudioWorklet
+  // quantum). The renderer only sends while kiwiTxMuted=true (PTT is held), but
+  // main-process also guards at the transport level: pushVoiceChunk() is a no-op
+  // when _voiceTxActive is false. Logging mirrors the DAX TX handler above.
+  let _rsba1TxChunkCount = 0;
+  let _rsba1TxLastPeakReport = 0;
+  ipcMain.on('rsba1-voice-tx-chunk', (_e, buf) => {
+    if (!_icomNetworkTransport || !_icomNetworkTransport.voiceTxActive) return;
+    let samples;
+    if (buf instanceof Float32Array) samples = buf;
+    else if (ArrayBuffer.isView(buf) || buf instanceof ArrayBuffer) samples = new Float32Array(buf);
+    else if (Array.isArray(buf)) samples = new Float32Array(buf);
+    else { try { samples = new Float32Array(Object.values(buf)); } catch { return; } }
+    _rsba1TxChunkCount++;
+    let peak = 0;
+    for (let i = 0; i < samples.length; i++) {
+      const v = Math.abs(samples[i]); if (v > peak) peak = v;
+    }
+    if (peak > _rsba1TxLastPeakReport) _rsba1TxLastPeakReport = peak;
+    // Heartbeat every ~1 s (chunks arrive at ~375/s at 48 kHz / 128 samples)
+    if (_rsba1TxChunkCount === 1 || _rsba1TxChunkCount % 375 === 0) {
+      sendCatLog(`[Icom-Network-Audio] RS-BA1 voice TX chunk #${_rsba1TxChunkCount}: max peak=${_rsba1TxLastPeakReport.toFixed(4)}`);
+      _rsba1TxLastPeakReport = 0;
+    }
+    try { _icomNetworkTransport.pushVoiceChunk(samples); } catch (e) {
+      console.warn('[Icom-Network-Audio] pushVoiceChunk error:', e.message);
+    }
+  });
+
   ipcMain.on('jtcat-log', (_e, msg) => {
     console.log(msg);
     // Also surface in the Verbose CAT log so users diagnosing JTCAT
