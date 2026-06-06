@@ -1,6 +1,6 @@
 # Local Feature Set Memory — multi-op, RS-BA1 audio, JTCAT/SSTV polish
 
-Status: shipped locally through `v1.8.3.39`
+Status: shipped locally through `v1.8.5.5`
 Created: 2026-06-05
 Repo: `/Users/csparrow/Documents/POTACAT`
 Purpose: durable patch memory for re-applying the local feature set to future upstream POTACAT releases without repeating the RS-BA1 / JTCAT trial-and-error loop.
@@ -488,3 +488,151 @@ Before calling a future merge successful:
 - SSTV received images save and show in Received Images pane.
 - JTCAT popout filter button says `CQ`, not `CQ/73`.
 - JTCAT popout title does not overlap macOS traffic-light buttons.
+
+## Post-Upstream Merge Notes - v1.8.5 Local Builds
+
+After merging upstream POTACAT `v1.8.5` into the local feature branch, the local build series continued from `v1.8.5.1` through `v1.8.5.5` on branch `codex/merge-upstream-v1.8.4`.
+
+Important commits from this merge cycle:
+
+- `ea603dc` - merged upstream POTACAT `1.8.5` into the local feature set branch.
+- `daef4e7` - handled mDNS bind errors without crashing.
+- `c0cb654` - hid the top operator switcher when only one profile exists.
+- `a39ed1f` - recovered the JTCAT IP waterfall after profile switch / stale UI sink.
+- `6ef024a` - cleanly released RS-BA1 on operator switch.
+
+### Operator Switch + RS-BA1 Release
+
+Problem seen after adding Andrea/WD4DRA profile: switching operators could throw off the IP radio connection, CAT, and RS-BA1 audio. The underlying issue was not profile storage; the profile data was correct. The problem was restart timing. `profiles-switch` updated `activeProfile` and immediately called `app.relaunch(); app.exit(0);`, which could kill the old process before RS-BA1 release packets and DATA MOD restore had time to leave the machine. The IC-7610 sometimes held the prior RS-BA1 session briefly, causing the next startup to receive a status rejection such as `error=0xfdffffff` or to connect only after a retry / radio power cycle.
+
+Working fix:
+
+- `switchProfile()` now returns the previous callsign as `previousCallsign`.
+- The profile-switch IPC handler still returns quickly to the renderer, but the actual relaunch waits for `prepareProfileSwitchRelaunch()`.
+- `prepareProfileSwitchRelaunch()`:
+  - clears pending Icom network reconnect timers,
+  - releases remote/PTT state,
+  - cancels active RS-BA1 TX audio if present,
+  - attempts DATA1 MOD restore,
+  - stops RS-BA1 RX watchdog/pacer,
+  - disconnects CAT/RS-BA1 and nulls local transport refs,
+  - sends a disconnected CAT status,
+  - waits `ICOM_NETWORK_PROFILE_SWITCH_RELEASE_DELAY_MS` (`1200 ms`) before relaunch.
+- The relaunched instance still uses the startup RS-BA1 delay (`3.5 s`), so the radio now gets both an explicit old-session release window and the normal new-session startup wait.
+
+Key files/functions:
+
+- `main.js`
+  - `switchProfile()`
+  - `prepareProfileSwitchRelaunch()`
+  - `ICOM_NETWORK_PROFILE_SWITCH_RELEASE_DELAY_MS`
+  - `profiles-switch` IPC handler
+  - `isRetriableIcomNetworkConnectError()`
+- `lib/rsba1-transport.js`
+  - `ControlStream._onStatus()` now emits `RSBA1_STATUS_REJECTED` when the radio returns a nonzero status and no CI-V port.
+
+Diagnostic signs:
+
+```text
+[multi-op] preparing clean profile switch W4LAB -> WD4DRA
+[multi-op] clean profile switch release complete after 1200ms
+[Icom Network] Waiting 3.5s before startup connect so the radio can release any previous RS-BA1 session.
+[rsba1/control] <- Status (error=0x0 civPort=50002 audioPort=50003)
+[Icom-Network-Audio] audio stream ready (RX/TX)
+```
+
+If future builds regress, check whether profile switch again bypasses graceful RS-BA1 teardown or whether app quit/relaunch paths are skipping `cat.disconnect()` before `app.exit(0)`.
+
+### JTCAT IP Waterfall Readiness After Profile Switch
+
+Problem seen with WD4DRA: JTCAT decoded over RS-BA1, but the waterfall looked wrong/blank. Logs showed RS-BA1 audio flowing and decoder audio being fed, but main repeatedly logged `JTCAT-IP-AUDIO-NO-READY`. This meant the FT8 engine path was alive while the renderer/popout synthetic IP-audio sink had not announced readiness after profile switch/relaunch.
+
+Working fix:
+
+- `sendIcomNetworkJtcatUiAudio()` now detects this state:
+  - RS-BA1 audio frames are flowing,
+  - JTCAT is running,
+  - neither main nor popout window has sent `jtcat-ip-audio-ready=true`.
+- It sends a throttled restart nudge to the active JTCAT UI:
+  - `restart-popout-audio` for the JTCAT popout,
+  - `restart-jtcat-audio` for the main window.
+- The nudge is throttled by `_icomNetworkJtcatReadyNudgeMs` so it cannot spin.
+
+Good log sequence:
+
+```text
+JTCAT-IP-AUDIO-NO-READY main=1 popout=0
+JTCAT-IP-AUDIO-READY wc=2 ready=0
+JTCAT-IP-AUDIO-NUDGE event=restart-popout-audio wc=2
+JTCAT-IP-AUDIO-READY wc=2 ready=1
+```
+
+This fix deliberately does not change CAT, RS-BA1 packet handling, or decoder audio. It only self-heals the UI waterfall/audio-monitor consumer.
+
+### Top Operator Switcher Visibility
+
+After upstream merge, the top-nav quick operator switcher was adjusted to only display when more than one profile exists. This avoids wasting top-nav space for single-operator installs while preserving quick switching for multi-op setups.
+
+Key behavior:
+
+- Summary Settings operator dropdown remains available.
+- Top nav operator dropdown is hidden when `profiles.length <= 1`.
+- Top nav operator dropdown is shown when two or more profiles exist.
+
+Key files:
+
+- `renderer/index.html` - `top-op-switch`, `top-op-select`
+- `renderer/app.js` - `_renderOperatorSelects()` toggles `hidden` on the top switcher.
+
+### RX Pacer Tuning Carried With v1.8.5.5
+
+The `v1.8.5.5` build also carried RS-BA1 RX pacer changes intended to reduce perceived dropouts without reintroducing the large real-time delay we saw in earlier attempts.
+
+Current relevant values:
+
+- `ICOM_NETWORK_RX_PACER_START_MS = 1000`
+- `ICOM_NETWORK_RX_PACER_RESUME_MS = 500`
+- `ICOM_NETWORK_RX_RESTART_STALL_MS = 8000`
+- `_tick()` can emit bounded catch-up frames when the event loop fires late.
+
+Reasoning:
+
+- Very deep buffers improved dropout masking but delayed FT8 waterfall/frequency reality too much.
+- Too little buffering made Wi-Fi/network stalls visible as audio dropouts.
+- The compromise keeps the buffer modest, allows limited catch-up after short event-loop stalls, and restarts audio only after a longer real stall.
+
+Caution: future changes to this area should be tested with JTCAT decodes, waterfall delay after band changes, and RS-BA1 RX diagnostics. Do not judge by “less dropout” alone if the waterfall becomes delayed or decode timing gets stale.
+
+### mDNS Bind Crash After Upstream Merge
+
+After the upstream merge, local launch could crash on mDNS bind conflicts, especially around `bonjour-service` / `multicast-dns` on UDP 5353. The local fix catches/logs mDNS bind errors instead of letting them become fatal startup exceptions.
+
+Key file:
+
+- `lib/remote-server.js`
+
+Commit:
+
+- `daef4e7 Handle mDNS bind errors without crashing`
+
+### Local Build / Deploy Practice
+
+Current local deployed build after this cycle:
+
+- `v1.8.5.5`
+- Branch: `codex/merge-upstream-v1.8.4`
+- GitHub fork: `78hawkeye/POTACAT`
+- Latest relevant commit: `6ef024a Cleanly release RS-BA1 on operator switch`
+
+Deployment pattern remains:
+
+```bash
+npm test
+npm run dist:mac
+osascript -e 'tell application "POTACAT" to quit' >/dev/null 2>&1 || true
+sleep 2
+rm -rf /Applications/POTACAT.app
+ditto dist/mac-arm64/POTACAT.app /Applications/POTACAT.app
+xattr -dr com.apple.quarantine /Applications/POTACAT.app 2>/dev/null || true
+open -a /Applications/POTACAT.app
+```
