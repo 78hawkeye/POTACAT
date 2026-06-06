@@ -4703,7 +4703,7 @@ function forceReleaseIcomNetworkTx(reason = 'safety release') {
   if (_icomNetworkTransport) {
     try { _icomNetworkTransport.cancelTx(); } catch {}
   }
-  sendCatLog(`[Icom-Network-Audio] Safety release: forcing repeated PTT off (${reason})`);
+  logIcomNetworkAudio(`[Icom-Network-Audio] Safety release: forcing repeated PTT off (${reason})`);
   try { handleRemotePtt(false); } catch {}
   const delays = [0, 150, 500, 1000, 2000];
   for (const delay of delays) {
@@ -5247,7 +5247,7 @@ function startJtcat(mode) {
   ft8Engine.on('tx-start', (data) => {
     const catState = cat ? `connected=${cat.connected}` : 'cat=null';
     console.log(`[JTCAT] TX start requested — message: ${data.message}, ${catState}`);
-    sendCatLog(`FT8 TX: ${data.message} freq=${data.freq}Hz slot=${data.slot} ${catState}`);
+    logIcomNetworkAudio(`FT8 TX: ${data.message} freq=${data.freq}Hz slot=${data.slot} ${catState}`);
     const smartSdrDirectTxOk = settings.audioSource === 'smartsdr' &&
                                smartSdrAudio &&
                                smartSdrAudio.connected &&
@@ -5336,7 +5336,7 @@ function startJtcat(mode) {
         tailSilenceMs: 200,
       })
         .then(() => {
-          sendCatLog('[Icom-Network-Audio] FT8/FT4 TX audio queued to radio');
+          logIcomNetworkAudio('[Icom-Network-Audio] FT8/FT4 TX audio queued to radio');
           setTimeout(() => {
             if (ft8Engine && ft8Engine._txActive) {
               ft8Engine.txComplete();
@@ -5347,7 +5347,7 @@ function startJtcat(mode) {
           }, 150);
         })
         .catch((e) => {
-          sendCatLog(`[Icom-Network-Audio] Direct TX failed: ${e.message} — forcing PTT off (no local-audio fallback while Icom Network audio is selected)`);
+          logIcomNetworkAudio(`[Icom-Network-Audio] Direct TX failed: ${e.message} — forcing PTT off (no local-audio fallback while Icom Network audio is selected)`);
           if (ft8Engine && ft8Engine._txActive) {
             ft8Engine.txComplete();
           } else {
@@ -6158,7 +6158,7 @@ let _icomNetworkJtcatReadyNudgeMs = 0;
 const ICOM_NETWORK_JTCAT_UI_FRAME_MS = 20;
 const ICOM_NETWORK_RX_PACER_FRAME_MS = 20;
 const ICOM_NETWORK_RX_PACER_START_MS = 1000;
-const ICOM_NETWORK_RX_PACER_RESUME_MS = 500;
+const ICOM_NETWORK_RX_PACER_RESUME_MS = 150;
 const ICOM_NETWORK_RX_PACER_MAX_MS = 5400;
 const ICOM_NETWORK_RX_STALL_MS = 1200;
 const ICOM_NETWORK_RX_RESTART_STALL_MS = 8000;
