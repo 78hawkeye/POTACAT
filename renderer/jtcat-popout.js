@@ -603,7 +603,7 @@ function _applyPopoutTheme(payload) {
         '<span class="jp-db">' + (d.db >= 0 ? '+' : '') + d.db + '</span>' +
         '<span class="jp-dt">' + dtStr + '</span>' +
         '<span class="jp-df">' + Math.round(d.df) + '</span>' +
-        '<span class="jp-km">' + (distKm > 0 ? Math.round(distKm) : '') + '</span>' +
+        '<span class="jp-km">' + (distKm > 0 ? Math.round(distKm) + 'km' : '') + '</span>' +
         '<span class="jp-msg">' + esc(text) + '</span>' +
         (badges ? '<span class="jp-badges">' + badges + '</span>' : '') +
         entityStr;
