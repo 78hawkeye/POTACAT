@@ -21,10 +21,16 @@ const audioEl = document.getElementById('remote-playback');
 
 window.api.onStartAudio(async (config) => {
   try {
-    // Clean up any previous session
+    // Clean up any previous session.
+    // IMPORTANT: tear down synthetic graphs BEFORE creating a new WebRTC session.
+    // If smartActive/kiwiActive/mixActive are still true from a previous connect,
+    // the replaceTrack() guards never fire on the new audioSender and localStream
+    // (Mac mic) stays on the WebRTC sender for the entire new session. K3SBP 2026-06-06.
     if (pc) { pc.close(); pc = null; }
     if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
     audioEl.srcObject = null;
+    tearDownSmartGraph();      // resets smartActive = false
+    tearDownLocalMixGraph();   // resets mixActive = false
 
     // Capture radio's USB audio output (RX audio to send to phone)
     const baseAudio = {
@@ -79,6 +85,25 @@ window.api.onStartAudio(async (config) => {
         });
         // Health monitor follows the sender, not localStream.
         try { startHealthMonitor(kiwiStream); } catch {}
+      }
+    }
+
+    // RS-BA1 / K4-network: audio arrives via IPC at all times (not from a USB
+    // audio device), so swap the sender immediately rather than waiting for the
+    // first smartsdr-audio-frame event. Without this, localStream (Mac internal
+    // mic) stays on the sender until the first frame fires and triggers the
+    // replaceTrack guard — which, after a session restart, was never firing at
+    // all because smartActive was still true from the previous session. K3SBP 2026-06-06.
+    if ((config.audioSource === 'icom-network' || config.audioSource === 'k4-network') && audioSender) {
+      const smartTrack = ensureSmartTrack();
+      if (smartTrack) {
+        smartActive = true;
+        audioSender.replaceTrack(smartTrack).catch((e) => {
+          window.api.sendAudioStatus({ error: 'IPC audio track setup failed: ' + e.message });
+          smartActive = false;
+        });
+        // Health monitor follows the sender — the synthetic stream, not localStream.
+        try { startHealthMonitor(smartStream); } catch {}
       }
     }
 
@@ -407,6 +432,7 @@ window.api.onStopAudio(() => {
     localStream = null;
   }
   tearDownKiwiGraph();
+  tearDownSmartGraph();    // was missing — smartActive would stay true across stops
   tearDownLocalMixGraph();
   stopDaxTxTap();
   audioSender = null;
