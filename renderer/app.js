@@ -22369,7 +22369,7 @@ async function startJtcatAudio() {
         throw e;
       }
       const vita49SourceOptions = s.audioSource === 'icom-network'
-        ? { sourceRate: 24000, bufferMs: 350, startBufferMs: 120, resumeBufferMs: 80 }
+        ? { sourceRate: 24000, bufferMs: 600, startBufferMs: 150, resumeBufferMs: 200 }
         : { sourceRate: 24000, bufferMs: 500, startBufferMs: 80, resumeBufferMs: 80 };
       jtcatVita49Node = new AudioWorkletNode(jtcatVita49Ctx, 'jtcat-vita49-source', {
         numberOfInputs: 0,
