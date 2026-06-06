@@ -183,6 +183,8 @@ contextBridge.exposeInMainWorld('api', {
   testHamlib: (config) => ipcRenderer.invoke('test-hamlib', config),
   testSerialCat: (config) => ipcRenderer.invoke('test-serial-cat', config),
   testIcomCiv: (config) => ipcRenderer.invoke('test-icom-civ', config),
+  testCivTcp: (config) => ipcRenderer.invoke('test-civ-tcp', config),
+  testIcomNetwork: (config) => ipcRenderer.invoke('test-icom-network', config),
   connectCat: (target) => ipcRenderer.send('connect-cat', target),
   onCatFrequency: (cb) => ipcRenderer.on('cat-frequency', (_e, hz) => cb(hz)),
   onCatMode: (cb) => ipcRenderer.on('cat-mode', (_e, mode) => cb(mode)),
@@ -250,6 +252,8 @@ contextBridge.exposeInMainWorld('api', {
   updateQsosByMatch: (data) => ipcRenderer.invoke('update-qsos-by-match', data),
   getDefaultLogPath: () => ipcRenderer.invoke('get-default-log-path'),
   chooseLogFile: (currentPath) => ipcRenderer.invoke('choose-log-file', currentPath),
+  getDefaultSstvGalleryPath: () => ipcRenderer.invoke('get-default-sstv-gallery-path'),
+  chooseSstvGalleryFolder: (currentPath) => ipcRenderer.invoke('choose-sstv-gallery-folder', currentPath),
   exportAdif: (qsos) => ipcRenderer.invoke('export-adif', qsos),
   onQrzData: (cb) => ipcRenderer.on('qrz-data', (_e, data) => cb(data)),
   onDonorCallsigns: (cb) => ipcRenderer.on('donor-callsigns', (_e, data) => cb(data)),
@@ -383,6 +387,7 @@ contextBridge.exposeInMainWorld('api', {
   jtcatSetAudioLatencyMs: (payload) => ipcRenderer.send('jtcat-set-audio-latency-ms', payload),
   onJtcatAudioLatency: (cb) => ipcRenderer.on('jtcat-audio-latency', (_e, data) => cb(data)),
   jtcatSetHoldTxFreq: (enabled) => ipcRenderer.send('jtcat-set-hold-tx-freq', !!enabled),
+  jtcatSetTxGain: (level) => ipcRenderer.send('jtcat-set-tx-gain', level),
   jtcatEnableTx: (enabled) => ipcRenderer.send('jtcat-enable-tx', enabled),
   jtcatHaltTx: () => ipcRenderer.send('jtcat-halt-tx'),
   jtcatTuneToggle: () => ipcRenderer.send('jtcat-tune-toggle'),
@@ -476,6 +481,7 @@ contextBridge.exposeInMainWorld('api', {
       }
     });
   },
+  setJtcatIpAudioReady: (ready) => ipcRenderer.send('jtcat-ip-audio-ready', { ready: !!ready }),
   // Cloud Sync
   qrzDownloadLogbook: () => ipcRenderer.invoke('qrz-download-logbook'),
   qrzDebugDump: () => ipcRenderer.invoke('qrz-debug-dump'),

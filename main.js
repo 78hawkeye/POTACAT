@@ -24,6 +24,19 @@ function logStartupStage(name) {
 const { app, BrowserWindow, ipcMain, Menu, dialog, Notification, screen, nativeImage, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const PACKAGE_VERSION = require('./package.json').version;
+function getAppDisplayVersion() {
+  try {
+    const localBuild = require('./local-build.json');
+    const build = Number(localBuild && localBuild.build);
+    if (localBuild && localBuild.baseVersion === PACKAGE_VERSION && Number.isInteger(build) && build > 0) {
+      return `${PACKAGE_VERSION}.${build}`;
+    }
+  } catch {
+    // Release builds do not need a local suffix.
+  }
+  return PACKAGE_VERSION;
+}
 // `app.name` defaults to package.json's `name` field, which is the
 // lowercase "potacat" used as the npm package name. Electron's native
 // confirm() / alert() dialogs put app.name in their title bar, so without
@@ -405,6 +418,12 @@ function saveSettings(s) {
   _writeJsonAtomic(profileSettingsPath(global.activeProfile), profile);
 }
 
+function setActiveProfilePointer(callsign) {
+  const global = _readJsonSafe(SETTINGS_PATH, {});
+  global.activeProfile = String(callsign || '').toUpperCase();
+  _writeJsonAtomic(SETTINGS_PATH, global);
+}
+
 // Profile management — used by IPC handlers below to back the
 // Settings → Summary → Operator dropdown.
 function listProfiles() {
@@ -456,8 +475,13 @@ function switchProfile(callsign) {
   // subsystems to chase down in one PR. Restart is one click and
   // guarantees correctness.
   try {
-    settings.activeProfile = call;
+    const currentProfile = settings.activeProfile;
     saveSettings(settings);
+    setActiveProfilePointer(call);
+    settings.activeProfile = call;
+    if (currentProfile && currentProfile !== call) {
+      console.log('[multi-op] switched activeProfile ' + currentProfile + ' -> ' + call);
+    }
   } catch (err) {
     return { ok: false, error: 'Failed to save before switching: ' + err.message };
   }
@@ -537,6 +561,7 @@ const _audioBus = new Map(); // wcId+':'+channel -> { sent, acked, dropped, last
 const AUDIO_MAX_BACKLOG = 40; // frames; ~210 ms at 190 fps — survives a
                               // GC pause without garbling, well below
                               // the multi-second backlog that leaks.
+const _jtcatIpAudioReady = new Set();
 
 function audioSafeSend(wc, channel, payload) {
   if (!wc || wc.isDestroyed()) return;
@@ -554,6 +579,9 @@ function audioSafeSend(wc, channel, payload) {
         // Single CAT log line every 10 s when a consumer is sustaining
         // a backlog — enough signal to diagnose, no flood.
         sendCatLog(`[Audio] Backpressure on ${channel}: ${info.dropped} frames dropped (renderer not keeping up)`);
+        if (channel === 'jtcat-vita49-audio' || channel === 'sstv-vita49-audio' || channel === 'smartsdr-audio-frame') {
+          appendDiagnosticLog('rsba1-rx-diagnostics.log', `BACKPRESSURE channel=${channel} wc=${wc.id} dropped=${info.dropped} backlog=${info.sent - info.acked}`);
+        }
       } catch {}
       info.dropped = 0;
       info.lastDropLogMs = now;
@@ -573,13 +601,34 @@ ipcMain.on('audio-ack', (e, msg) => {
   if (info) info.acked += count;
 });
 
+ipcMain.on('jtcat-ip-audio-ready', (e, msg) => {
+  const ready = !!(msg && msg.ready);
+  const wcId = e.sender && e.sender.id;
+  if (!wcId) return;
+  if (ready) {
+    _jtcatIpAudioReady.add(wcId);
+  } else {
+    _jtcatIpAudioReady.delete(wcId);
+  }
+  try {
+    appendDiagnosticLog('rsba1-rx-diagnostics.log', `JTCAT-IP-AUDIO-READY wc=${wcId} ready=${ready ? 1 : 0}`);
+  } catch {}
+});
+
+function isJtcatIpAudioReady(windowRef) {
+  return !!(windowRef && !windowRef.isDestroyed() && windowRef.webContents && _jtcatIpAudioReady.has(windowRef.webContents.id));
+}
+
 // Periodic sweep — drop entries whose webContents was destroyed so the
 // map doesn't grow unboundedly across popout open/close cycles.
 setInterval(() => {
   for (const [key, info] of _audioBus) {
     const wcId = parseInt(key.split(':')[0], 10);
     const wc = require('electron').webContents.fromId(wcId);
-    if (!wc || wc.isDestroyed()) _audioBus.delete(key);
+    if (!wc || wc.isDestroyed()) {
+      _audioBus.delete(key);
+      _jtcatIpAudioReady.delete(wcId);
+    }
   }
 }, 30_000);
 let _sstvLastActivityMs = 0; // last VIS/image timestamp — for heartbeat log
@@ -587,13 +636,56 @@ let _sstvHeartbeatTimer = null;
 let sstvManager = null;      // SSTV multi-slice manager
 let openSstvPopout = null;   // function — assigned in second whenReady block
 let startSstv = null;        // function — assigned in second whenReady block (same reason)
-const SSTV_GALLERY_DIR = path.join(app.getPath('userData'), 'sstv-gallery');
+function defaultSstvGalleryDir() {
+  return path.join(app.getPath('pictures'), 'POTACAT', 'SSTV-RX');
+}
+function legacySstvGalleryDir() {
+  return path.join(app.getPath('userData'), 'sstv-gallery');
+}
+function getSstvGalleryDir() {
+  return (settings && settings.sstvDecodedImagesPath) || defaultSstvGalleryDir();
+}
+let _sstvLegacyGalleryMigrated = false;
+function migrateLegacySstvGalleryIfNeeded(dir) {
+  if (_sstvLegacyGalleryMigrated) return;
+  _sstvLegacyGalleryMigrated = true;
+  if (settings && settings.sstvDecodedImagesPath) return;
+  const oldDir = legacySstvGalleryDir();
+  if (oldDir === dir || !fs.existsSync(oldDir)) return;
+  try {
+    const files = fs.readdirSync(oldDir).filter(f => /\.(png|json)$/i.test(f));
+    for (const f of files) {
+      const src = path.join(oldDir, f);
+      const dest = path.join(dir, f);
+      if (!fs.existsSync(dest)) fs.copyFileSync(src, dest);
+    }
+    if (files.length) sendCatLog(`[SSTV] Copied ${files.length} legacy gallery file(s) to ${dir}`);
+  } catch (err) {
+    console.error('[SSTV] Legacy gallery migration error:', err.message);
+  }
+}
 function ensureSstvGalleryDir() {
-  if (!fs.existsSync(SSTV_GALLERY_DIR)) fs.mkdirSync(SSTV_GALLERY_DIR, { recursive: true });
+  const dir = getSstvGalleryDir();
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  migrateLegacySstvGalleryIfNeeded(dir);
+  return dir;
 }
 let jtcatMapPopoutWin = null; // pop-out JTCAT map window
 let popoutJtcatQso = null;   // QSO state for popout (like remoteJtcatQso for ECHOCAT)
 let cat = null;
+let _icomNetworkTransport = null;
+let _icomNetworkDataModRestore = null;
+let _icomNetworkDataModSession = 0;
+const DEFAULT_JTCAT_TX_PWR_PCT = 100;
+const DEFAULT_JTCAT_TX_GAIN = (DEFAULT_JTCAT_TX_PWR_PCT / 100) * (DEFAULT_JTCAT_TX_PWR_PCT / 100);
+const DIRECT_TX_PEAK_LIMIT = 0.95;
+const ICOM_NETWORK_TX_SAMPLE_RATE = 48000;
+const ICOM_NETWORK_TX_BUFFER_MS = 150;
+const ICOM_NETWORK_TUNE_START_DELAY_MS = 200;
+const ICOM_NETWORK_TUNE_PEAK = 0.45;
+const DEFAULT_ICOM_NETWORK_TX_GAIN = 0.72;
+const ICOM_NETWORK_TX_AUDIO_ENABLED = true;
+let _jtcatDirectTxGainLevel = DEFAULT_JTCAT_TX_GAIN;
 let spotTimer = null;
 let solarTimer = null;
 let rigctldProc = null;
@@ -1360,6 +1452,348 @@ function sendCatLog(msg) {
   if (win && !win.isDestroyed()) win.webContents.send('cat-log', line);
 }
 
+function appendDiagnosticLog(fileName, msg) {
+  try {
+    const dir = app.getPath('userData');
+    const file = path.join(dir, fileName);
+    const maxBytes = 2 * 1024 * 1024;
+    if (fs.existsSync(file) && fs.statSync(file).size > maxBytes) {
+      const rotated = file + '.old';
+      try { if (fs.existsSync(rotated)) fs.unlinkSync(rotated); } catch {}
+      try { fs.renameSync(file, rotated); } catch {}
+    }
+    fs.appendFileSync(file, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch (err) {
+    try { console.log(`[diagnostic-log] ${fileName}: ${err.message || err}`); } catch {}
+  }
+}
+
+function appendIcomNetworkDiagnostic(msg) {
+  appendDiagnosticLog('rsba1-rx-diagnostics.log', msg);
+}
+
+function shouldKeepIcomNetworkTransportLog(msg) {
+  const line = String(msg || '');
+  if (!line) return false;
+  if (/length mismatch: header=0 actual=21/i.test(line)) return false;
+  if (/<- control type 0x0\b/i.test(line)) return false;
+  if (/retransmit request for unknown seq/i.test(line)) return false;
+  if (/^\[rsba1\/(?:civ|audio)\] send skipped: invalid remote UDP port 0/i.test(line)) return false;
+  if (/^\[rsba1\/civ\] (?:<-|->) CI-V /i.test(line)) return false;
+
+  const ayt = line.match(/-> AreYouThere #(\d+)/i);
+  if (ayt) {
+    const n = Number(ayt[1]);
+    return n <= 3 || n % 10 === 0;
+  }
+
+  return true;
+}
+
+function shouldShowIcomNetworkTransportLogInCat(msg) {
+  const line = String(msg || '');
+  if (!shouldKeepIcomNetworkTransportLog(line)) return false;
+  if (/-> AreYouThere #/i.test(line)) return false;
+  if (/bound on /i.test(line)) return false;
+  return true;
+}
+
+function clampNumber(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function setJtcatDirectTxGainLevel(level) {
+  _jtcatDirectTxGainLevel = clampNumber(level, 0, 1, _jtcatDirectTxGainLevel);
+  return _jtcatDirectTxGainLevel;
+}
+
+function getIcomNetworkTxGain() {
+  const target = settings && settings.catTarget && settings.catTarget.type === 'icom-network'
+    ? settings.catTarget
+    : null;
+  return clampNumber(target && target.networkTxGain, 0, 1.5, DEFAULT_ICOM_NETWORK_TX_GAIN);
+}
+
+function getIcomNetworkTunePeak() {
+  return clampNumber(ICOM_NETWORK_TUNE_PEAK * (getIcomNetworkTxGain() / DEFAULT_ICOM_NETWORK_TX_GAIN), 0.01, 1, ICOM_NETWORK_TUNE_PEAK);
+}
+
+function coerceTxFloat32(samples) {
+  if (samples instanceof Float32Array) return samples;
+  const length = samples && typeof samples.length === 'number' ? samples.length : 0;
+  const out = new Float32Array(length);
+  for (let i = 0; i < length; i++) {
+    const v = Number(samples[i]);
+    out[i] = Number.isFinite(v) ? v : 0;
+  }
+  return out;
+}
+
+function conditionDirectTxAudio(samples, gainLevel, peakLimit = DIRECT_TX_PEAK_LIMIT) {
+  const src = coerceTxFloat32(samples);
+  const gain = clampNumber(gainLevel, 0, 1, 1);
+  const limit = clampNumber(peakLimit, 0.01, 1, DIRECT_TX_PEAK_LIMIT);
+  const out = new Float32Array(src.length);
+  let inputPeak = 0;
+  let outputPeak = 0;
+  let inputSumSq = 0;
+  let outputSumSq = 0;
+  let limited = 0;
+
+  for (let i = 0; i < src.length; i++) {
+    const input = Number.isFinite(src[i]) ? src[i] : 0;
+    const absIn = Math.abs(input);
+    if (absIn > inputPeak) inputPeak = absIn;
+    inputSumSq += input * input;
+
+    let output = input * gain;
+    if (output > limit) {
+      output = limit;
+      limited++;
+    } else if (output < -limit) {
+      output = -limit;
+      limited++;
+    }
+
+    out[i] = output;
+    const absOut = Math.abs(output);
+    if (absOut > outputPeak) outputPeak = absOut;
+    outputSumSq += output * output;
+  }
+
+  const len = src.length || 1;
+  return {
+    samples: out,
+    gain,
+    peakLimit: limit,
+    inputPeak,
+    outputPeak,
+    inputRms: Math.sqrt(inputSumSq / len),
+    outputRms: Math.sqrt(outputSumSq / len),
+    limited,
+  };
+}
+
+function formatDirectTxAudioStats(shaped) {
+  return `gain=${shaped.gain.toFixed(3)} peak ${shaped.inputPeak.toFixed(3)}->${shaped.outputPeak.toFixed(3)} rms ${shaped.inputRms.toFixed(3)}->${shaped.outputRms.toFixed(3)} limited=${shaped.limited}`;
+}
+
+function analyzeDigitalTxEnvelope(samples, sampleRate = 12000, mode = 'FT8') {
+  const src = coerceTxFloat32(samples);
+  const rate = clampNumber(sampleRate, 1, 192000, 12000);
+  let peak = 0;
+  let sumSq = 0;
+  let maxDelta = 0;
+  let zeroRun = 0;
+  let maxZeroRun = 0;
+  for (let i = 0; i < src.length; i++) {
+    const v = Number.isFinite(src[i]) ? src[i] : 0;
+    const a = Math.abs(v);
+    if (a > peak) peak = a;
+    sumSq += v * v;
+    if (i > 0) {
+      const d = Math.abs(v - src[i - 1]);
+      if (d > maxDelta) maxDelta = d;
+    }
+    if (a < 1e-6) {
+      zeroRun++;
+      if (zeroRun > maxZeroRun) maxZeroRun = zeroRun;
+    } else {
+      zeroRun = 0;
+    }
+  }
+  const expected = mode === 'FT4' ? 60480 : mode === 'FT2' ? 30240 : 151680;
+  const len = src.length || 1;
+  return {
+    mode,
+    sampleRate: rate,
+    samples: src.length,
+    durationSec: src.length / rate,
+    expectedSamples: expected,
+    sampleDelta: src.length - expected,
+    peak,
+    rms: Math.sqrt(sumSq / len),
+    maxDelta,
+    maxZeroRunMs: maxZeroRun / rate * 1000,
+  };
+}
+
+function formatDigitalTxEnvelopeStats(stats) {
+  return `${stats.mode} envelope=${stats.samples}/${stats.expectedSamples} samples (${stats.durationSec.toFixed(3)}s, delta=${stats.sampleDelta}) peak=${stats.peak.toFixed(3)} rms=${stats.rms.toFixed(3)} maxDelta=${stats.maxDelta.toFixed(3)} zeroRunMax=${stats.maxZeroRunMs.toFixed(1)}ms`;
+}
+
+function makeSineToneSamples(freqHz, durationSec, sampleRate = 12000, peak = 0.5) {
+  const rate = clampNumber(sampleRate, 8000, 192000, 12000);
+  const total = Math.max(1, Math.round(clampNumber(durationSec, 0.1, 300, 1) * rate));
+  const freq = clampNumber(freqHz, 20, rate / 2 - 1, 1500);
+  const amp = clampNumber(peak, 0, 1, 0.5);
+  const out = new Float32Array(total);
+  const step = 2 * Math.PI * freq / rate;
+  for (let i = 0; i < total; i++) out[i] = Math.sin(i * step) * amp;
+  applyRaisedCosineFade(out, rate, 15);
+  return out;
+}
+
+function applyRaisedCosineFade(samples, sampleRate = 48000, fadeMs = 10) {
+  if (!samples || !samples.length) return samples;
+  const rate = clampNumber(sampleRate, 8000, 192000, 48000);
+  const fadeSamples = Math.min(Math.floor(samples.length / 2), Math.max(1, Math.round(rate * fadeMs / 1000)));
+  for (let i = 0; i < fadeSamples; i++) {
+    const gain = 0.5 - 0.5 * Math.cos(Math.PI * i / fadeSamples);
+    samples[i] *= gain;
+    samples[samples.length - 1 - i] *= gain;
+  }
+  return samples;
+}
+
+const ICOM_NETWORK_DATA_MOD_SPECS = [
+  {
+    models: ['IC-7610'],
+    civAddrs: [0x98],
+    settingId: 0x0092,
+    label: 'DATA1 MOD',
+    networkLabel: 'LAN',
+    networkValue: 0x05,
+    values: { 0x00: 'MIC', 0x01: 'ACC', 0x02: 'MIC+ACC', 0x03: 'USB', 0x04: 'MIC+USB', 0x05: 'LAN' },
+  },
+  {
+    models: ['IC-9700'],
+    civAddrs: [0xA2],
+    settingId: 0x0116,
+    label: 'DATA MOD',
+    networkLabel: 'LAN',
+    networkValue: 0x05,
+    values: { 0x00: 'MIC', 0x01: 'ACC', 0x02: 'MIC+ACC', 0x03: 'USB', 0x04: 'MIC+USB', 0x05: 'LAN' },
+  },
+  {
+    models: ['IC-705'],
+    civAddrs: [0xA4],
+    settingId: 0x0119,
+    label: 'DATA MOD',
+    networkLabel: 'WLAN',
+    networkValue: 0x03,
+    values: { 0x00: 'MIC', 0x01: 'USB', 0x02: 'MIC+USB', 0x03: 'WLAN' },
+  },
+];
+
+function getActiveRigModelName() {
+  const activeRig = (settings.rigs || []).find(r => r.id === settings.activeRigId);
+  return activeRig?.model || '';
+}
+
+function getIcomNetworkDataModSpec(target, rigModel) {
+  const modelName = String(getActiveRigModelName() || target?.model || target?.name || '').toUpperCase();
+  const civAddr = Number(target?.civAddr ?? rigModel?.civAddr);
+  return ICOM_NETWORK_DATA_MOD_SPECS.find((spec) => {
+    if (modelName && spec.models.some((m) => modelName === m.toUpperCase())) return true;
+    return Number.isFinite(civAddr) && spec.civAddrs.includes(civAddr);
+  }) || null;
+}
+
+function formatIcomDataModValue(spec, value) {
+  const n = Number(value);
+  const label = spec && spec.values ? spec.values[n] : null;
+  return label ? `${label} (0x${n.toString(16).toUpperCase().padStart(2, '0')})` : `0x${n.toString(16).toUpperCase().padStart(2, '0')}`;
+}
+
+function logIcomNetworkAudio(msg) {
+  sendCatLog(msg);
+  appendIcomNetworkDiagnostic(msg);
+}
+
+function waitForIcomDataMod(controller, settingId, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    if (!controller || typeof controller.getDataMod !== 'function') {
+      resolve(null);
+      return;
+    }
+    let done = false;
+    let timer = null;
+    const cleanup = () => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      controller.removeListener('data-mod', onDataMod);
+    };
+    const onDataMod = (data) => {
+      if (!data || data.settingId !== settingId) return;
+      cleanup();
+      resolve(data);
+    };
+    controller.on('data-mod', onDataMod);
+    timer = setTimeout(() => {
+      cleanup();
+      resolve(null);
+    }, timeoutMs);
+    try {
+      controller.getDataMod(settingId);
+    } catch {
+      cleanup();
+      resolve(null);
+    }
+  });
+}
+
+async function prepareIcomNetworkDataMod(controller, target, rigModel, sessionId) {
+  if (!controller || !controller.connected) return;
+  if (!target || target.type !== 'icom-network') return;
+  if (settings.audioSource !== 'icom-network') return;
+  const spec = getIcomNetworkDataModSpec(target, rigModel);
+  if (!spec) {
+    logIcomNetworkAudio('[Icom-Network-Audio] DATA MOD auto-LAN is not configured for this Icom model; leaving radio MOD input unchanged.');
+    return;
+  }
+  if (typeof controller.getDataMod !== 'function' || typeof controller.setDataMod !== 'function') {
+    logIcomNetworkAudio(`[Icom-Network-Audio] ${spec.label} auto-LAN skipped: CI-V settings commands are unavailable.`);
+    return;
+  }
+
+  const data = await waitForIcomDataMod(controller, spec.settingId, 1800);
+  if (sessionId !== _icomNetworkDataModSession || cat !== controller || !controller.connected) return;
+  if (!data) {
+    logIcomNetworkAudio(`[Icom-Network-Audio] Could not read ${spec.label}; leaving radio MOD input unchanged so there is no unsafe restore guess.`);
+    return;
+  }
+
+  const currentValue = data.value;
+  if (currentValue === spec.networkValue) {
+    logIcomNetworkAudio(`[Icom-Network-Audio] ${spec.label} is already ${formatIcomDataModValue(spec, currentValue)} for network TX audio.`);
+    return;
+  }
+
+  _icomNetworkDataModRestore = {
+    controller,
+    sessionId,
+    spec,
+    previousValue: currentValue,
+    target,
+  };
+  logIcomNetworkAudio(`[Icom-Network-Audio] ${spec.label} is ${formatIcomDataModValue(spec, currentValue)}; setting to ${formatIcomDataModValue(spec, spec.networkValue)} for RS-BA1 TX audio. It will be restored on disconnect.`);
+  controller.setDataMod(spec.settingId, spec.networkValue);
+}
+
+async function restoreIcomNetworkDataMod(reason = 'disconnect') {
+  const state = _icomNetworkDataModRestore;
+  if (!state) return false;
+  _icomNetworkDataModRestore = null;
+  const { controller, spec, previousValue } = state;
+  if (!controller || !controller.connected || typeof controller.setDataMod !== 'function') {
+    sendCatLog(`[Icom-Network-Audio] Could not restore ${spec.label} to ${formatIcomDataModValue(spec, previousValue)} (${reason}) because the Icom Network session is already closed.`);
+    return false;
+  }
+  try {
+    controller.setDataMod(spec.settingId, previousValue);
+    sendCatLog(`[Icom-Network-Audio] Restored ${spec.label} to ${formatIcomDataModValue(spec, previousValue)} (${reason}).`);
+    await new Promise(r => setTimeout(r, 150));
+    return true;
+  } catch (err) {
+    sendCatLog(`[Icom-Network-Audio] Failed to restore ${spec.label}: ${err.message || err}`);
+    return false;
+  }
+}
+
 // PstRotator UDP rotor control
 const dgram = require('dgram');
 let rotorSocket = null;
@@ -1699,16 +2133,128 @@ function tearDownRemoteClient() {
 }
 
 let _connectCatPending = false;
+let _icomNetworkConnectRetryTimer = null;
+let _icomNetworkConnectRetryAttempts = 0;
+let _icomNetworkConnectRetryKey = '';
+let _icomNetworkConnectRetryActive = false;
+const ICOM_NETWORK_STARTUP_CONNECT_DELAY_MS = 3500;
+const ICOM_NETWORK_CONNECT_RETRY_DELAYS_MS = [3000, 6000, 12000, 24000, 45000, 75000];
+
+function icomNetworkTargetKey(target = settings && settings.catTarget) {
+  if (!target || target.type !== 'icom-network') return '';
+  return [
+    String(target.host || '').trim(),
+    Number(target.controlPort || target.port || 50001) || 50001,
+    Number(target.civPort || 0) || 0,
+    String(target.username || ''),
+    settings && settings.audioSource === 'icom-network' ? 'audio' : 'cat',
+  ].join('|');
+}
+
+function clearIcomNetworkConnectRetry(resetAttempts = false) {
+  if (_icomNetworkConnectRetryTimer) {
+    clearTimeout(_icomNetworkConnectRetryTimer);
+    _icomNetworkConnectRetryTimer = null;
+  }
+  if (resetAttempts) {
+    _icomNetworkConnectRetryAttempts = 0;
+    _icomNetworkConnectRetryKey = '';
+  }
+}
+
+function isRetriableIcomNetworkConnectError(err) {
+  const code = err && err.code;
+  if (code === 'RSBA1_AUTH_FAILED' || code === 'RSBA1_DNS_FAILED') return false;
+  if (code && [
+    'RSBA1_NO_IAMHERE',
+    'RSBA1_NO_CIV_IAMHERE',
+    'RSBA1_CONTROL_AUTH_TIMEOUT',
+    'RSBA1_HANDSHAKE_TIMEOUT',
+    'RSBA1_LOCAL_PORT_FAILED',
+  ].includes(code)) return true;
+  const message = String((err && err.message) || err || '');
+  return /EHOSTUNREACH|ENETUNREACH|timed out|no reply from the radio|before IAmHere/i.test(message);
+}
+
+function scheduleIcomNetworkConnectRetry(err, targetKey = icomNetworkTargetKey()) {
+  const target = settings && settings.catTarget;
+  if (!target || target.type !== 'icom-network') return;
+  if (!targetKey) targetKey = icomNetworkTargetKey(target);
+  if (!isRetriableIcomNetworkConnectError(err)) return;
+  if (_icomNetworkConnectRetryKey && _icomNetworkConnectRetryKey !== targetKey) {
+    clearIcomNetworkConnectRetry(true);
+  }
+  _icomNetworkConnectRetryKey = targetKey;
+  if (_icomNetworkConnectRetryTimer) return;
+  if (_icomNetworkConnectRetryAttempts >= ICOM_NETWORK_CONNECT_RETRY_DELAYS_MS.length) {
+    const msg = `[Icom Network] Startup reconnect retries exhausted after ${_icomNetworkConnectRetryAttempts} attempt(s). The radio may still be holding a stale RS-BA1 session; fully quit other RS-BA1/wfview/SDR Control/POTACAT clients, then reconnect or restart POTACAT.`;
+    sendCatLog(msg);
+    appendIcomNetworkDiagnostic(msg);
+    return;
+  }
+  const attempt = _icomNetworkConnectRetryAttempts + 1;
+  const delay = ICOM_NETWORK_CONNECT_RETRY_DELAYS_MS[_icomNetworkConnectRetryAttempts];
+  _icomNetworkConnectRetryAttempts = attempt;
+  const code = (err && err.code) || 'connect-error';
+  const message = String((err && err.message) || err || '').split('\n')[0];
+  const msg = `[Icom Network] Connect retry ${attempt}/${ICOM_NETWORK_CONNECT_RETRY_DELAYS_MS.length} in ${(delay / 1000).toFixed(1)}s after ${code}: ${message}`;
+  sendCatLog(msg);
+  appendIcomNetworkDiagnostic(msg);
+  _icomNetworkConnectRetryTimer = setTimeout(() => {
+    _icomNetworkConnectRetryTimer = null;
+    if (!settings || !settings.catTarget || settings.catTarget.type !== 'icom-network') return;
+    if (icomNetworkTargetKey(settings.catTarget) !== targetKey) return;
+    if (cat && cat.connected) {
+      clearIcomNetworkConnectRetry(true);
+      return;
+    }
+    _icomNetworkConnectRetryActive = true;
+    connectCat()
+      .catch((retryErr) => {
+        const retryMsg = `[Icom Network] Connect retry failed to start: ${retryErr.message || retryErr}`;
+        sendCatLog(retryMsg);
+        appendIcomNetworkDiagnostic(retryMsg);
+      })
+      .finally(() => {
+        _icomNetworkConnectRetryActive = false;
+      });
+  }, delay);
+}
+
+function connectCatWithStartupDelay() {
+  const target = settings && settings.catTarget;
+  if (target && target.type === 'icom-network') {
+    const msg = `[Icom Network] Waiting ${(ICOM_NETWORK_STARTUP_CONNECT_DELAY_MS / 1000).toFixed(1)}s before startup connect so the radio can release any previous RS-BA1 session.`;
+    sendCatLog(msg);
+    appendIcomNetworkDiagnostic(msg);
+    setTimeout(() => {
+      if (!settings.enableWsjtx) connectCat();
+    }, ICOM_NETWORK_STARTUP_CONNECT_DELAY_MS);
+  } else {
+    connectCat();
+  }
+}
+
 async function connectCat() {
-  if (_connectCatPending) return; // prevent concurrent connectCat() calls
+  if (_connectCatPending) {
+    if (settings && settings.catTarget && settings.catTarget.type === 'icom-network') {
+      appendIcomNetworkDiagnostic('[Icom Network] connectCat skipped because another connect is already pending');
+    }
+    return; // prevent concurrent connectCat() calls
+  }
   // If we're in remote-client mode, the "CAT" is a shack on the other
   // end of a WebSocket — skip the local connection chain entirely.
   if (isRemoteActive()) return;
   _connectCatPending = true;
+  const dataModSession = ++_icomNetworkDataModSession;
   try {
   if (cat) {
+    await restoreIcomNetworkDataMod('reconnect');
+    stopIcomNetworkRxWatchdog();
+    resetIcomNetworkRxPacer('CAT reconnect');
     cat.removeAllListeners();
     cat.disconnect();
+    _icomNetworkTransport = null;
     // Brief delay to let serial port fully release before reconnecting
     // (prevents "Resource busy" on macOS when switching rigs)
     await new Promise(r => setTimeout(r, 300));
@@ -1720,6 +2266,9 @@ async function connectCat() {
   killRigctld();
   const target = settings.catTarget;
   if (!target) return;
+  if (target.type === 'icom-network' && !_icomNetworkConnectRetryActive && !_icomNetworkConnectRetryTimer) {
+    clearIcomNetworkConnectRetry(true);
+  }
 
   // --- New rig abstraction layer ---
   // Uses RigController (transport + codec + model) instead of ad-hoc wiring.
@@ -1921,6 +2470,7 @@ async function connectCat() {
     model.tune = getTuneQuirks(model);
     codec = new CivCodec(model, (data) => transport.write(data));
     cat = new RigController(model, transport, codec);
+    const networkCat = cat;
     cat._debug = true;
     cat.on('log', sendCatLog);
     cat.on('status', sendCatStatus);
@@ -1929,13 +2479,70 @@ async function connectCat() {
     cat.on('power', sendCatPower);
     cat.on('nb', sendCatNb);
     cat.on('smeter', sendCatSmeter);
-    cat.on('swr', sendCatSwr);
-    cat.on('alc', sendCatAlc);
-    transport.on('log', (m) => sendCatLog(m));
+	    cat.on('swr', sendCatSwr);
+	    cat.on('alc', sendCatAlc);
+	    transport.on('log', (m) => {
+	      if (!shouldKeepIcomNetworkTransportLog(m)) return;
+	      if (shouldShowIcomNetworkTransportLogInCat(m)) sendCatLog(m);
+	      appendIcomNetworkDiagnostic(m);
+	    });
     const host = target.host || '127.0.0.1';
     const controlPort = target.controlPort || target.port || 50001;
+    const connectRetryKey = icomNetworkTargetKey(target);
     const civPort = target.civPort || null; // null = use whatever the radio reports in Status
-    sendCatLog(`Connecting to Icom Network on ${host}:${controlPort} (RS-BA1 protocol)`);
+    const enableRxAudio = settings.audioSource === 'icom-network';
+    const enableTxAudio = settings.audioSource === 'icom-network' && ICOM_NETWORK_TX_AUDIO_ENABLED;
+    _icomNetworkTransport = transport;
+    _icomNetworkAudioFrameCount = 0;
+    _icomNetworkJtcatFrameCount = 0;
+    resetIcomNetworkRxDiagnostics(`connect ${host}:${controlPort}`);
+    startIcomNetworkRxWatchdog();
+    cat.on('status', (s) => {
+      if (!s || !s.connected || !enableTxAudio) return;
+      setTimeout(() => {
+        prepareIcomNetworkDataMod(networkCat, target, model, dataModSession).catch((err) => {
+          sendCatLog(`[Icom-Network-Audio] DATA MOD auto-LAN failed: ${err.message || err}`);
+        });
+      }, 700);
+    });
+    transport.on('audio-ready', () => {
+      const msg = `[Icom-Network-Audio] audio stream ready${transport.txReady ? ' (RX/TX)' : ' (RX only)'}`;
+      sendCatLog(msg);
+      appendIcomNetworkDiagnostic(msg);
+    });
+    transport.on('audio-frame', handleIcomNetworkAudioFrame);
+    transport.on('connect', () => {
+      clearIcomNetworkConnectRetry(true);
+      const msg = '[Icom Network] CI-V stream connected; startup retry state cleared.';
+      sendCatLog(msg);
+      appendIcomNetworkDiagnostic(msg);
+    });
+    transport.on('error', (err) => {
+      if (_icomNetworkTransport !== transport) return;
+      appendIcomNetworkDiagnostic(`[Icom Network] transport error ${err && err.code ? err.code + ': ' : ''}${err && err.message ? err.message : err}`);
+      if (err && err.diagnostics) {
+        try {
+          appendIcomNetworkDiagnostic(`[Icom Network] transport diagnostics ${JSON.stringify(err.diagnostics)}`);
+        } catch {}
+      }
+      scheduleIcomNetworkConnectRetry(err, connectRetryKey);
+    });
+    transport.on('close', () => {
+      appendIcomNetworkDiagnostic('[Icom Network] transport closed');
+      if (_icomNetworkTransport === transport) {
+        _icomNetworkTransport = null;
+        stopIcomNetworkRxWatchdog();
+        resetIcomNetworkRxPacer('transport close');
+      }
+    });
+    if (settings.audioSource === 'icom-network' && !enableTxAudio) {
+      const msg = '[Icom-Network-Audio] TX audio is not enabled for this connection. CAT and RX audio remain enabled.';
+      sendCatLog(msg);
+      appendIcomNetworkDiagnostic(msg);
+    }
+    const connectMsg = `Connecting to Icom Network on ${host}:${controlPort} (RS-BA1 protocol${enableRxAudio ? ', RX audio enabled' : ''}${enableTxAudio ? ', TX audio enabled' : ', TX audio disabled'})`;
+    sendCatLog(connectMsg);
+    appendIcomNetworkDiagnostic(connectMsg);
     transport.connect({
       host,
       controlPort,
@@ -1943,7 +2550,22 @@ async function connectCat() {
       username: target.username || '',
       password: target.password || '',
       compName: target.compName || 'POTACAT',
+      enableRxAudio,
+      enableTxAudio,
+      rxAudioSampleRate: 48000,
+      txAudioSampleRate: ICOM_NETWORK_TX_SAMPLE_RATE,
+      txAudioBufferMs: ICOM_NETWORK_TX_BUFFER_MS,
+      timeoutMs: 14000,
     });
+	    if (enableRxAudio) {
+	      setTimeout(() => {
+	        if (_icomNetworkTransport === transport && settings.audioSource === 'icom-network' && _icomNetworkAudioFrameCount === 0) {
+	          const msg = '[Icom-Network-Audio] No RX audio frames received after 10s. CAT/CI-V can still work while RS-BA1 audio is blocked or disabled; check the radio network audio stream, UDP audio port/firewall, and that this operator profile has Audio Source = Icom Network audio (RS-BA1).';
+	          sendCatLog(msg);
+	          appendIcomNetworkDiagnostic(msg);
+	        }
+	      }, 10_000);
+	    }
 
   } else {
     // Kenwood/Yaesu serial
@@ -3560,7 +4182,10 @@ function connectWsjtx() {
   if (!settings.enableWsjtx) return;
 
   // Release the radio so WSJT-X can control it (even on FlexRadio — dual CAT conflicts)
-  if (cat) cat.disconnect();
+  if (cat) {
+    restoreIcomNetworkDataMod('WSJT-X takeover');
+    cat.disconnect();
+  }
   killRigctld();
   sendCatStatus({ connected: false, wsjtxMode: true });
 
@@ -3816,6 +4441,8 @@ let jtcatManager = null; // initialized on first startJtcat()
 let ft8Engine = null;    // alias for jtcatManager.engine (Phase 0 compatibility)
 let remoteJtcatQso = null;
 let jtcatQuietFreq = 1500; // auto-detected quiet TX frequency from FFT analysis
+let _jtcatTxFailsafeTimer = null;
+let _jtcatIcomHardReleaseTimer = null;
 const JTCAT_MAX_CQ_RETRIES = 15;
 const JTCAT_MAX_QSO_RETRIES = 12; // ~3 minutes of retries at 15s/cycle
 
@@ -3965,6 +4592,83 @@ function jtcatFullAutoCqWatchdog() {
   if (Date.now() - jtcatFullAutoCqLastActivity > JTCAT_FULL_AUTO_CQ_WATCHDOG_MS) {
     stopFullAutoCq('30-minute attended limit reached — confirm you are at the radio to resume');
   }
+}
+
+function clearJtcatTxFailsafe() {
+  if (_jtcatTxFailsafeTimer) {
+    clearTimeout(_jtcatTxFailsafeTimer);
+    _jtcatTxFailsafeTimer = null;
+  }
+}
+
+function clearJtcatIcomHardRelease() {
+  if (_jtcatIcomHardReleaseTimer) {
+    clearTimeout(_jtcatIcomHardReleaseTimer);
+    _jtcatIcomHardReleaseTimer = null;
+  }
+}
+
+function forceReleaseIcomNetworkTx(reason = 'safety release') {
+  if (_icomNetworkTransport) {
+    try { _icomNetworkTransport.cancelTx(); } catch {}
+  }
+  sendCatLog(`[Icom-Network-Audio] Safety release: forcing repeated PTT off (${reason})`);
+  try { handleRemotePtt(false); } catch {}
+  const delays = [0, 150, 500, 1000, 2000];
+  for (const delay of delays) {
+    setTimeout(() => {
+      try {
+        if (cat && cat.connected && typeof cat.setTransmit === 'function') {
+          cat.setTransmit(false);
+        }
+      } catch {}
+    }, delay);
+  }
+}
+
+function jtcatNetworkTxStartDelayMs(mode) {
+  const m = String(mode || 'FT8').toUpperCase();
+  if (m === 'FT4') return 300;
+  return 500;
+}
+
+function armJtcatIcomHardRelease(samples, sampleRate = 12000, offsetMs = 0, startDelayMs = 500) {
+  clearJtcatIcomHardRelease();
+  const count = samples && typeof samples.length === 'number' ? samples.length : 0;
+  const rate = Number(sampleRate) || 12000;
+  const leadMs = Math.max(0, (Number(startDelayMs) || 500) - (Number(offsetMs) || 0));
+  const timeoutMs = Math.max(5000, Math.min(25000, Math.ceil((count / rate) * 1000 + leadMs + 3500)));
+  _jtcatIcomHardReleaseTimer = setTimeout(() => {
+    _jtcatIcomHardReleaseTimer = null;
+    sendCatLog(`[Icom-Network-Audio] HARD RELEASE: forcing PTT off after ${timeoutMs} ms`);
+    if (ft8Engine && ft8Engine._txActive) {
+      try { ft8Engine.txComplete(); } catch {}
+    }
+    forceReleaseIcomNetworkTx(`hard release after ${timeoutMs}ms`);
+  }, timeoutMs);
+}
+
+function armJtcatTxFailsafe(label, samples, sampleRate = 12000, offsetMs = 0, startDelayMs = 500) {
+  clearJtcatTxFailsafe();
+  const count = samples && typeof samples.length === 'number' ? samples.length : 0;
+  const rate = Number(sampleRate) || 12000;
+  const leadMs = Math.max(0, (Number(startDelayMs) || 500) - (Number(offsetMs) || 0));
+  const expectedMs = count > 0 ? Math.ceil(count / rate * 1000 + leadMs + 2500) : 18000;
+  const timeoutMs = Math.max(5000, Math.min(30000, expectedMs));
+  _jtcatTxFailsafeTimer = setTimeout(() => {
+    _jtcatTxFailsafeTimer = null;
+    clearJtcatIcomHardRelease();
+    sendCatLog(`[JTCAT TX] FAILSAFE: forcing PTT off after ${timeoutMs} ms (${label || 'unknown TX path'})`);
+    if (smartSdrAudio) { try { smartSdrAudio.cancelTx(); } catch {} }
+    if (ft8Engine && ft8Engine._txActive) {
+      try { ft8Engine.txComplete(); } catch {}
+    }
+    if (settings.audioSource === 'icom-network') {
+      forceReleaseIcomNetworkTx(`JTCAT failsafe ${label || 'unknown TX path'}`);
+    } else {
+      try { handleRemotePtt(false); } catch {}
+    }
+  }, timeoutMs);
 }
 
 function remoteJtcatMyCall() { return (settings.myCallsign || '').toUpperCase(); }
@@ -4451,9 +5155,32 @@ function startJtcat(mode) {
 
   ft8Engine.on('tx-start', (data) => {
     const catState = cat ? `connected=${cat.connected}` : 'cat=null';
-    console.log(`[JTCAT] TX start — PTT on, message: ${data.message}, ${catState}`);
+    console.log(`[JTCAT] TX start requested — message: ${data.message}, ${catState}`);
     sendCatLog(`FT8 TX: ${data.message} freq=${data.freq}Hz slot=${data.slot} ${catState}`);
-    handleRemotePtt(true);
+    const smartSdrDirectTxOk = settings.audioSource === 'smartsdr' &&
+                               smartSdrAudio &&
+                               smartSdrAudio.connected &&
+                               smartSdrAudio.txReady;
+    const icomNetworkDirectTxOk = settings.audioSource === 'icom-network' &&
+                                  ICOM_NETWORK_TX_AUDIO_ENABLED &&
+                                  _icomNetworkTransport &&
+                                  _icomNetworkTransport.txReady;
+    if (settings.audioSource === 'icom-network' && !icomNetworkDirectTxOk) {
+      const connected = _icomNetworkTransport ? 'yes' : 'no';
+      const txReady = _icomNetworkTransport && _icomNetworkTransport.txReady ? 'yes' : 'no';
+      sendCatLog(`[Icom-Network-Audio] TX aborted before PTT: RS-BA1 TX audio is not ready or was not negotiated (transport=${connected}, txReady=${txReady}). CAT/RX can still work while TX audio is unavailable.`);
+      if (ft8Engine && ft8Engine._txActive) {
+        setTimeout(() => {
+          if (ft8Engine && ft8Engine._txActive) ft8Engine.txComplete();
+        }, 0);
+      }
+      return;
+    }
+
+    const modeForTx = ft8Engine ? ft8Engine._mode : 'FT8';
+    const networkStartDelayMs = jtcatNetworkTxStartDelayMs(modeForTx);
+    handleRemotePtt(true, { audio: true });
+    armJtcatTxFailsafe(settings.audioSource === 'icom-network' ? 'Icom Network RS-BA1' : (settings.audioSource === 'smartsdr' ? 'SmartSDR Direct' : 'local audio'), data.samples, 12000, data.offsetMs || 0, networkStartDelayMs);
     if (win && !win.isDestroyed()) {
       win.webContents.send('jtcat-tx-status', { state: 'tx', message: data.message, slot: data.slot });
     }
@@ -4468,7 +5195,7 @@ function startJtcat(mode) {
       remoteServer.broadcastJtcatTxStatus({ state: 'tx', message: data.message, slot: data.slot, txFreq: ft8Engine._txFreq });
     }
 
-    // Audio dispatch. Two routes:
+    // Audio dispatch. Three routes:
     //
     //   1. SmartSDR Direct TX (preferred when available) — fire FT8 audio
     //      as VITA-49 dax_tx packets straight to the radio, no Windows
@@ -4477,16 +5204,16 @@ function startJtcat(mode) {
     //      Also eliminates the 200ms IPC + renderer-scheduling latency
     //      that used to eat into the FT8 safety budget.
     //
-    //   2. Renderer Windows DAX TX route (the historical path) — kicks
+    //   2. Icom Network TX — fire FT8 audio as RS-BA1/wfview LPCM16 UDP
+    //      packets straight to the radio. This gives IP-native Icoms the
+    //      same no-virtual-audio-device path as Flex Direct.
+    //
+    //   3. Renderer Windows DAX TX route (the historical path) — kicks
     //      in when the user is on a non-SmartSDR audio source OR the
-    //      dax_tx subscribe never completed OR the direct send fails
+    //      direct-radio audio stream never completed OR direct send fails
     //      mid-cycle. Audio still goes to settings.remoteAudioOutput;
-    //      DAX program is required.
-    const directTxOk = settings.audioSource === 'smartsdr' &&
-                       smartSdrAudio &&
-                       smartSdrAudio.connected &&
-                       smartSdrAudio.txReady;
-    if (directTxOk) {
+    //      DAX/USB/virtual audio is required.
+    if (smartSdrDirectTxOk) {
       sendCatLog(`[SmartSDR-Audio] DAX TX direct → radio (bypassing Windows DAX)`);
       smartSdrAudio.sendTxAudio(data.samples, data.offsetMs || 0)
         .then(() => {
@@ -4503,6 +5230,40 @@ function startJtcat(mode) {
             win.webContents.send('jtcat-tx-audio', { samples: Array.from(data.samples), offsetMs: data.offsetMs || 0 });
           }
         });
+    } else if (icomNetworkDirectTxOk) {
+      const mode = modeForTx;
+      const startDelayMs = jtcatNetworkTxStartDelayMs(mode);
+      const envelope = analyzeDigitalTxEnvelope(data.samples, 12000, mode);
+      const networkTxGain = getIcomNetworkTxGain();
+      const txAudio = conditionDirectTxAudio(data.samples, _jtcatDirectTxGainLevel * networkTxGain, 1.0);
+      sendCatLog(`[Icom-Network-Audio] JTCAT TX profile: WSJT-X timing, ${ICOM_NETWORK_TX_SAMPLE_RATE / 1000}k LPCM mono, ${ICOM_NETWORK_TX_BUFFER_MS}ms RS-BA1 buffer, startDelay=${startDelayMs}ms, networkTxGain=${Math.round(networkTxGain * 100)}%; ${formatDigitalTxEnvelopeStats(envelope)}; ${formatDirectTxAudioStats(txAudio)}. Use radio RF power for output and keep ALC low.`);
+      armJtcatIcomHardRelease(txAudio.samples, 12000, data.offsetMs || 0, startDelayMs);
+      _icomNetworkTransport.sendTxAudio(txAudio.samples, {
+        offsetMs: data.offsetMs || 0,
+        inputSampleRate: 12000,
+        startDelayMs,
+        tailSilenceMs: 200,
+      })
+        .then(() => {
+          sendCatLog('[Icom-Network-Audio] FT8/FT4 TX audio queued to radio');
+          setTimeout(() => {
+            if (ft8Engine && ft8Engine._txActive) {
+              ft8Engine.txComplete();
+            } else {
+              handleRemotePtt(false);
+              clearJtcatIcomHardRelease();
+            }
+          }, 150);
+        })
+        .catch((e) => {
+          sendCatLog(`[Icom-Network-Audio] Direct TX failed: ${e.message} — forcing PTT off (no local-audio fallback while Icom Network audio is selected)`);
+          if (ft8Engine && ft8Engine._txActive) {
+            ft8Engine.txComplete();
+          } else {
+            handleRemotePtt(false);
+            clearJtcatIcomHardRelease();
+          }
+        });
     } else {
       setTimeout(() => {
         if (win && !win.isDestroyed() && ft8Engine && ft8Engine._txActive) {
@@ -4512,14 +5273,21 @@ function startJtcat(mode) {
     }
   });
 
-  ft8Engine.on('tx-end', () => {
-    console.log('[JTCAT] TX end — PTT off');
-    handleRemotePtt(false);
+	  ft8Engine.on('tx-end', () => {
+	    console.log('[JTCAT] TX end — PTT off');
+	    clearJtcatTxFailsafe();
+	    clearJtcatIcomHardRelease();
+	    if (settings.audioSource === 'icom-network') {
+	      forceReleaseIcomNetworkTx('JTCAT tx-end');
+	    } else {
+	      handleRemotePtt(false);
+	    }
     // Stop the paced UDP pump if SmartSDR Direct TX was driving this cycle —
     // otherwise packets keep flowing after PTT release (harmless once the
     // radio is in RX, but wasted bandwidth, and a cancel mid-cycle would
     // bleed into the next slot).
     if (smartSdrAudio) { try { smartSdrAudio.cancelTx(); } catch {} }
+    if (_icomNetworkTransport) { try { _icomNetworkTransport.cancelTx(); } catch {} }
     if (win && !win.isDestroyed()) {
       win.webContents.send('jtcat-tx-status', { state: 'rx' });
     }
@@ -4605,6 +5373,7 @@ const jtcatTuneState = {
   endsAt: 0,        // wall-clock ms when it auto-stops
   endTimer: null,   // setTimeout ref
   tickTimer: null,  // setInterval ref for countdown broadcast
+  directIcom: false,
 };
 
 function broadcastJtcatTuneState() {
@@ -4623,13 +5392,46 @@ function broadcastJtcatTuneState() {
 
 function startJtcatTune() {
   if (jtcatTuneState.active) return;
+  const directIcomReady = settings.audioSource === 'icom-network' &&
+                          ICOM_NETWORK_TX_AUDIO_ENABLED &&
+                          _icomNetworkTransport &&
+                          _icomNetworkTransport.txReady;
+  if (settings.audioSource === 'icom-network' && !directIcomReady) {
+    sendCatLog('[Icom-Network-Audio] Tune blocked: RS-BA1 TX audio is not ready or was not negotiated. CAT/RX audio remain available.');
+    broadcastJtcatTuneState();
+    return;
+  }
   jtcatTuneState.active = true;
   jtcatTuneState.endsAt = Date.now() + JTCAT_TUNE_DURATION_S * 1000;
+  jtcatTuneState.directIcom = directIcomReady;
   // Audio is genuinely going to the rig USB CODEC, so audio:true triggers
   // SSB-over-DATA where appropriate (USB -> DIGU mute the rig mic during
   // the tone). The 90s timer auto-releases.
   handleRemotePtt(true, { audio: true });
-  if (win && !win.isDestroyed()) win.webContents.send('jtcat-tune-audio-start');
+  if (jtcatTuneState.directIcom) {
+    const networkTxGain = getIcomNetworkTxGain();
+    const tunePeak = getIcomNetworkTunePeak();
+    const tone = makeSineToneSamples(1500, JTCAT_TUNE_DURATION_S, ICOM_NETWORK_TX_SAMPLE_RATE, tunePeak);
+    const txAudio = conditionDirectTxAudio(tone, _jtcatDirectTxGainLevel);
+    sendCatLog(`[Icom-Network-Audio] Tune direct → radio: 1500 Hz sine over RS-BA1 audio (${ICOM_NETWORK_TX_SAMPLE_RATE / 1000}k LPCM, ${ICOM_NETWORK_TX_BUFFER_MS}ms buffer, networkTxGain=${Math.round(networkTxGain * 100)}%); ${formatDirectTxAudioStats(txAudio)}`);
+    _icomNetworkTransport.sendTxAudio(txAudio.samples, {
+      offsetMs: 0,
+      inputSampleRate: ICOM_NETWORK_TX_SAMPLE_RATE,
+      startDelayMs: ICOM_NETWORK_TUNE_START_DELAY_MS,
+      tailSilenceMs: 200,
+    })
+      .then(() => {
+        if (jtcatTuneState.active && jtcatTuneState.directIcom) stopJtcatTune();
+      })
+      .catch((e) => {
+        if (jtcatTuneState.active && jtcatTuneState.directIcom) {
+          sendCatLog(`[Icom-Network-Audio] Tune direct failed: ${e.message}`);
+          stopJtcatTune();
+        }
+      });
+  } else if (win && !win.isDestroyed()) {
+    win.webContents.send('jtcat-tune-audio-start');
+  }
   jtcatTuneState.endTimer = setTimeout(() => stopJtcatTune(), JTCAT_TUNE_DURATION_S * 1000);
   jtcatTuneState.tickTimer = setInterval(broadcastJtcatTuneState, 1000);
   broadcastJtcatTuneState();
@@ -4641,8 +5443,16 @@ function stopJtcatTune() {
   jtcatTuneState.active = false;
   if (jtcatTuneState.endTimer) { clearTimeout(jtcatTuneState.endTimer); jtcatTuneState.endTimer = null; }
   if (jtcatTuneState.tickTimer) { clearInterval(jtcatTuneState.tickTimer); jtcatTuneState.tickTimer = null; }
-  if (win && !win.isDestroyed()) win.webContents.send('jtcat-tune-audio-stop');
-  handleRemotePtt(false);
+  const wasDirectIcom = jtcatTuneState.directIcom;
+  jtcatTuneState.directIcom = false;
+  if (wasDirectIcom && _icomNetworkTransport) {
+    forceReleaseIcomNetworkTx('Tune OFF');
+  } else if (win && !win.isDestroyed()) {
+    win.webContents.send('jtcat-tune-audio-stop');
+    handleRemotePtt(false);
+  } else {
+    handleRemotePtt(false);
+  }
   broadcastJtcatTuneState();
   sendCatLog('[JTCAT] Tune OFF');
 }
@@ -4685,6 +5495,15 @@ function stopInProcessSpectrum() {
 }
 
 function stopJtcat() {
+  clearJtcatTxFailsafe();
+  clearJtcatIcomHardRelease();
+  if (smartSdrAudio) { try { smartSdrAudio.cancelTx(); } catch {} }
+  if (settings.audioSource === 'icom-network') {
+    forceReleaseIcomNetworkTx('JTCAT stop');
+  } else {
+    if (_icomNetworkTransport) { try { _icomNetworkTransport.cancelTx(); } catch {} }
+    try { handleRemotePtt(false); } catch {}
+  }
   // Spectrum loop has no reason to keep running once the engine is
   // gone — audioBuffer reads would all return zeros anyway. Mobile
   // re-subscribes on the next FT8-tab open.
@@ -5034,6 +5853,545 @@ function stopSmartSdrAudio() {
   if (!smartSdrAudio) return;
   try { smartSdrAudio.stop(); } catch {}
   smartSdrAudio = null;
+}
+
+function resampleMonoFloat32(input, fromRate, toRate) {
+  const src = (input instanceof Float32Array) ? input : new Float32Array(input || []);
+  if (!src.length) return new Float32Array(0);
+  if (!fromRate || !toRate || fromRate === toRate) return src;
+  const outLen = Math.max(1, Math.round(src.length * toRate / fromRate));
+  const out = new Float32Array(outLen);
+  const step = fromRate / toRate;
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * step;
+    const i0 = Math.floor(pos);
+    const i1 = Math.min(i0 + 1, src.length - 1);
+    const frac = pos - i0;
+    out[i] = src[i0] + (src[i1] - src[i0]) * frac;
+  }
+  return out;
+}
+
+function concatFloat32Chunks(chunks, totalSamples) {
+  if (!chunks || !chunks.length || !totalSamples) return new Float32Array(0);
+  if (chunks.length === 1 && chunks[0].length === totalSamples) return chunks[0];
+  const out = new Float32Array(totalSamples);
+  let offset = 0;
+  for (const chunk of chunks) {
+    if (!chunk || !chunk.length) continue;
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+
+function peakFloat32(samples) {
+  let peak = 0;
+  if (!samples) return peak;
+  for (let i = 0; i < samples.length; i++) {
+    const v = Math.abs(samples[i]);
+    if (v > peak) peak = v;
+  }
+  return peak;
+}
+
+class IcomNetworkRxPacer {
+  constructor(opts) {
+    this.sampleRate = opts.sampleRate || 48000;
+    this.frameMs = opts.frameMs || 20;
+    this.startBufferMs = opts.startBufferMs || 2200;
+    this.resumeBufferMs = opts.resumeBufferMs || 1400;
+    this.maxBufferMs = opts.maxBufferMs || 5200;
+    this.onFrame = opts.onFrame;
+    this.chunks = [];
+    this.totalSamples = 0;
+    this.timer = null;
+    this.buffering = true;
+    this.targetBufferMs = this.startBufferMs;
+    this.framesOut = 0;
+    this.underruns = 0;
+    this.drops = 0;
+    this.started = false;
+    this.lastLogMs = 0;
+  }
+
+  reset(reason = 'reset') {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    this.chunks = [];
+    this.totalSamples = 0;
+    this.buffering = true;
+    this.targetBufferMs = this.startBufferMs;
+    this.framesOut = 0;
+    this.underruns = 0;
+    this.drops = 0;
+    this.started = false;
+    this.lastLogMs = 0;
+    appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-PACER reset reason="${reason}"`);
+  }
+
+  push(pcm, sampleRate) {
+    if (!pcm || !pcm.length) return;
+    const rate = sampleRate || this.sampleRate;
+    if (rate !== this.sampleRate) {
+      this.sampleRate = rate;
+      this.reset(`sample-rate-change ${rate}`);
+    }
+    this.chunks.push(pcm instanceof Float32Array ? pcm : new Float32Array(pcm));
+    this.totalSamples += pcm.length;
+    this._trimToMaxBuffer();
+    if (!this.timer) {
+      this.timer = setInterval(() => this._tick(), this.frameMs);
+    }
+  }
+
+  bufferedMs() {
+    return this.sampleRate ? (this.totalSamples / this.sampleRate * 1000) : 0;
+  }
+
+  _trimToMaxBuffer() {
+    const maxSamples = Math.max(1, Math.round(this.sampleRate * this.maxBufferMs / 1000));
+    if (this.totalSamples <= maxSamples) return;
+    const drop = this.totalSamples - maxSamples;
+    this._dropSamples(drop);
+    this.drops++;
+    const now = Date.now();
+    if (now - this.lastLogMs > 1000) {
+      appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-PACER drop samples=${drop} bufferedMs=${this.bufferedMs().toFixed(0)} drops=${this.drops}`);
+      this.lastLogMs = now;
+    }
+  }
+
+  _tick() {
+    const frameSamples = Math.max(1, Math.round(this.sampleRate * this.frameMs / 1000));
+    if (this.buffering) {
+      if (this.bufferedMs() < this.targetBufferMs) {
+        this._emitSilence(frameSamples, true);
+        return;
+      }
+      this.buffering = false;
+      appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-PACER ${this.started ? 'resume' : 'start'} bufferedMs=${this.bufferedMs().toFixed(0)} targetMs=${this.targetBufferMs}`);
+      this.started = true;
+    }
+
+    if (this.totalSamples < frameSamples) {
+      this.underruns++;
+      appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-PACER underrun bufferedMs=${this.bufferedMs().toFixed(0)} underruns=${this.underruns}`);
+      this.buffering = true;
+      this.targetBufferMs = this.resumeBufferMs;
+      this._emitSilence(frameSamples, true);
+      return;
+    }
+
+    const pcm = this._consumeSamples(frameSamples);
+    this.framesOut++;
+    if (this.onFrame) this.onFrame(pcm, this.sampleRate, { silence: false, bufferedMs: this.bufferedMs() });
+  }
+
+  _emitSilence(frameSamples, buffering) {
+    this.framesOut++;
+    if (this.onFrame) {
+      this.onFrame(new Float32Array(frameSamples), this.sampleRate, {
+        silence: true,
+        buffering: !!buffering,
+        bufferedMs: this.bufferedMs(),
+      });
+    }
+  }
+
+  _consumeSamples(count) {
+    const out = new Float32Array(count);
+    let offset = 0;
+    while (offset < count && this.chunks.length) {
+      const chunk = this.chunks[0];
+      const take = Math.min(chunk.length, count - offset);
+      out.set(chunk.subarray(0, take), offset);
+      offset += take;
+      if (take === chunk.length) {
+        this.chunks.shift();
+      } else {
+        this.chunks[0] = chunk.subarray(take);
+      }
+      this.totalSamples -= take;
+    }
+    return out;
+  }
+
+  _dropSamples(count) {
+    let remaining = count;
+    while (remaining > 0 && this.chunks.length) {
+      const chunk = this.chunks[0];
+      const take = Math.min(chunk.length, remaining);
+      remaining -= take;
+      this.totalSamples -= take;
+      if (take === chunk.length) {
+        this.chunks.shift();
+      } else {
+        this.chunks[0] = chunk.subarray(take);
+      }
+    }
+  }
+}
+
+let _icomNetworkAudioFrameCount = 0;
+let _icomNetworkJtcatFrameCount = 0;
+let _icomNetworkRxDiag = null;
+let _icomNetworkRxWatchdogTimer = null;
+let _icomNetworkRxLastRecoveryMs = 0;
+let _icomNetworkRxAudioRestartAttempts = 0;
+let _icomNetworkRxPacer = null;
+let _icomNetworkEventLoopTimer = null;
+let _icomNetworkEventLoopExpectedMs = 0;
+let _icomNetworkEventLoopMaxLagMs = 0;
+let _icomNetworkEventLoopLastLagMs = 0;
+let _icomNetworkEventLoopLastLagAtMs = 0;
+let _icomNetworkJtcatUiChunks = [];
+let _icomNetworkJtcatUiSampleCount = 0;
+let _icomNetworkJtcatUiSampleRate = 0;
+let _icomNetworkJtcatUiPeak = 0;
+const ICOM_NETWORK_JTCAT_UI_FRAME_MS = 20;
+const ICOM_NETWORK_RX_PACER_FRAME_MS = 20;
+const ICOM_NETWORK_RX_PACER_START_MS = 2400;
+const ICOM_NETWORK_RX_PACER_RESUME_MS = 1400;
+const ICOM_NETWORK_RX_PACER_MAX_MS = 5400;
+const ICOM_NETWORK_RX_STALL_MS = 1200;
+const ICOM_NETWORK_RX_RESTART_STALL_MS = 30000;
+const ICOM_NETWORK_RX_RECOVERY_COOLDOWN_MS = 2500;
+const ICOM_NETWORK_RX_LOSSFILL_MAX_MS = 240;
+const ICOM_NETWORK_RX_LOSSFILL_MAX_ARRIVAL_GAP_MS = 120;
+const ICOM_NETWORK_EVENT_LOOP_PERIOD_MS = 100;
+const ICOM_NETWORK_EVENT_LOOP_LOG_LAG_MS = 180;
+
+function stopIcomNetworkEventLoopMonitor() {
+  if (_icomNetworkEventLoopTimer) {
+    clearInterval(_icomNetworkEventLoopTimer);
+    _icomNetworkEventLoopTimer = null;
+  }
+}
+
+function startIcomNetworkEventLoopMonitor() {
+  stopIcomNetworkEventLoopMonitor();
+  _icomNetworkEventLoopExpectedMs = Date.now() + ICOM_NETWORK_EVENT_LOOP_PERIOD_MS;
+  _icomNetworkEventLoopMaxLagMs = 0;
+  _icomNetworkEventLoopLastLagMs = 0;
+  _icomNetworkEventLoopLastLagAtMs = 0;
+  _icomNetworkEventLoopTimer = setInterval(() => {
+    const now = Date.now();
+    const lag = now - _icomNetworkEventLoopExpectedMs;
+    _icomNetworkEventLoopExpectedMs = now + ICOM_NETWORK_EVENT_LOOP_PERIOD_MS;
+    if (lag <= ICOM_NETWORK_EVENT_LOOP_LOG_LAG_MS) return;
+    if (settings.audioSource !== 'icom-network' || !_icomNetworkRxDiag) return;
+    _icomNetworkEventLoopLastLagMs = lag;
+    _icomNetworkEventLoopLastLagAtMs = now;
+    _icomNetworkEventLoopMaxLagMs = Math.max(_icomNetworkEventLoopMaxLagMs, lag);
+    const sinceFrame = _icomNetworkRxDiag.lastFrameMs ? now - _icomNetworkRxDiag.lastFrameMs : 0;
+    const msg = `EVENTLOOP-LAG lag=${Math.round(lag)}ms max=${Math.round(_icomNetworkEventLoopMaxLagMs)}ms sinceLastFrame=${sinceFrame}ms`;
+    appendDiagnosticLog('rsba1-rx-diagnostics.log', msg);
+    if (lag >= 500) sendCatLog(`[Icom-Network-Audio] ${msg}`);
+  }, ICOM_NETWORK_EVENT_LOOP_PERIOD_MS);
+}
+
+function resetIcomNetworkJtcatUiBuffer() {
+  _icomNetworkJtcatUiChunks = [];
+  _icomNetworkJtcatUiSampleCount = 0;
+  _icomNetworkJtcatUiSampleRate = 0;
+  _icomNetworkJtcatUiPeak = 0;
+}
+
+function resetIcomNetworkRxPacer(reason = 'reset') {
+  if (_icomNetworkRxPacer) _icomNetworkRxPacer.reset(reason);
+}
+
+function resetIcomNetworkRxDiagnostics(reason = 'reset') {
+  resetIcomNetworkJtcatUiBuffer();
+  resetIcomNetworkRxPacer(reason);
+  startIcomNetworkEventLoopMonitor();
+  _icomNetworkRxDiag = {
+    startedMs: Date.now(),
+    lastFrameMs: 0,
+    lastSummaryMs: Date.now(),
+    frames: 0,
+    gapEvents: 0,
+    maxGapMs: 0,
+    seqGapEvents: 0,
+    missingAdded: 0,
+    missingRecovered: 0,
+    duplicates: 0,
+    largeGaps: 0,
+    peakMax: 0,
+    payloads: new Map(),
+    sampleRates: new Map(),
+    stalled: false,
+    stallStartMs: 0,
+  };
+  appendDiagnosticLog('rsba1-rx-diagnostics.log', `--- ${reason}; activeProfile=${settings && settings.activeProfile || ''}; audioSource=${settings && settings.audioSource || ''}; catTarget=${settings && settings.catTarget && settings.catTarget.type || ''} ---`);
+}
+
+function stopIcomNetworkRxWatchdog() {
+  if (_icomNetworkRxWatchdogTimer) {
+    clearInterval(_icomNetworkRxWatchdogTimer);
+    _icomNetworkRxWatchdogTimer = null;
+  }
+  stopIcomNetworkEventLoopMonitor();
+}
+
+function startIcomNetworkRxWatchdog() {
+  stopIcomNetworkRxWatchdog();
+  _icomNetworkRxLastRecoveryMs = 0;
+  _icomNetworkRxAudioRestartAttempts = 0;
+  _icomNetworkRxWatchdogTimer = setInterval(() => {
+    if (settings.audioSource !== 'icom-network' || !_icomNetworkTransport || !_icomNetworkRxDiag) return;
+    const d = _icomNetworkRxDiag;
+    if (!d.lastFrameMs || d.frames <= 0) return;
+    const now = Date.now();
+    const quietMs = now - d.lastFrameMs;
+    if (quietMs < ICOM_NETWORK_RX_STALL_MS) return;
+    if (!d.stalled) {
+      d.stalled = true;
+      d.stallStartMs = d.lastFrameMs;
+      const msg = `RX-STALL noFramesFor=${quietMs}ms frame=${_icomNetworkAudioFrameCount} gaps=${d.gapEvents} seqGaps=${d.seqGapEvents} missingAdded=${d.missingAdded} recovered=${d.missingRecovered} dupes=${d.duplicates} largeGaps=${d.largeGaps}`;
+      appendDiagnosticLog('rsba1-rx-diagnostics.log', msg);
+      sendCatLog(`[Icom-Network-Audio] ${msg}`);
+    }
+    if (quietMs < ICOM_NETWORK_RX_RESTART_STALL_MS) return;
+    if (now - _icomNetworkRxLastRecoveryMs < ICOM_NETWORK_RX_RECOVERY_COOLDOWN_MS) return;
+    _icomNetworkRxLastRecoveryMs = now;
+    _icomNetworkRxAudioRestartAttempts++;
+    const reason = `RX stalled ${quietMs}ms (attempt ${_icomNetworkRxAudioRestartAttempts})`;
+    let restarted = false;
+    try {
+      restarted = !!(_icomNetworkTransport && _icomNetworkTransport.restartAudioStream && _icomNetworkTransport.restartAudioStream(reason));
+    } catch (err) {
+      appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-RECOVERY audio-restart-error ${err.message || err}`);
+    }
+    appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-RECOVERY audio-restart attempted=${restarted ? 1 : 0} reason="${reason}"`);
+    if (!restarted && _icomNetworkRxAudioRestartAttempts >= 2) {
+      appendDiagnosticLog('rsba1-rx-diagnostics.log', 'RX-RECOVERY full CAT reconnect requested');
+      connectCat().catch((err) => {
+        appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-RECOVERY full CAT reconnect failed: ${err.message || err}`);
+      });
+    }
+  }, 250);
+}
+
+function incDiagMap(map, key) {
+  if (!map) return;
+  const k = String(key);
+  map.set(k, (map.get(k) || 0) + 1);
+}
+
+function diagMapTop(map, limit = 5) {
+  if (!map || !map.size) return '-';
+  return Array.from(map.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([k, v]) => `${k}:${v}`)
+    .join(',');
+}
+
+function sendIcomNetworkJtcatUiAudio(pcm, sampleRate, peak, jtcatRunning) {
+  if (!pcm || !pcm.length) return;
+  const jtcatFrame = { pcm: resampleMonoFloat32(pcm, sampleRate, 24000), sampleRate: 24000 };
+  const popoutReady = isJtcatIpAudioReady(jtcatPopoutWin);
+  const mainReady = isJtcatIpAudioReady(win);
+  if (popoutReady) {
+    audioSafeSend(jtcatPopoutWin.webContents, 'jtcat-vita49-audio', jtcatFrame);
+  } else if (mainReady) {
+    audioSafeSend(win.webContents, 'jtcat-vita49-audio', jtcatFrame);
+  } else if (_icomNetworkJtcatFrameCount === 0 || _icomNetworkJtcatFrameCount % 250 === 0) {
+    appendDiagnosticLog('rsba1-rx-diagnostics.log', `JTCAT-IP-AUDIO-NO-READY main=${win && !win.isDestroyed() ? win.webContents.id : 0} popout=${jtcatPopoutWin && !jtcatPopoutWin.isDestroyed() ? jtcatPopoutWin.webContents.id : 0}`);
+  }
+  _icomNetworkJtcatFrameCount++;
+  if (_icomNetworkJtcatFrameCount === 1 || _icomNetworkJtcatFrameCount % 100 === 0) {
+    sendCatLog(`[Icom-Network-Audio] JTCAT UI RX frame #${_icomNetworkJtcatFrameCount}: decoder=${jtcatRunning ? 'yes' : 'no'} mainWin=${mainReady ? 'yes' : 'no'} popout=${popoutReady ? 'yes' : 'no'} ${pcm.length} samples @${sampleRate}Hz peak=${(peak || 0).toFixed(4)}`);
+  }
+}
+
+function queueIcomNetworkJtcatUiAudio(pcm, sampleRate, peak, jtcatRunning) {
+  if (!pcm || !pcm.length || !sampleRate) return;
+  if (_icomNetworkJtcatUiSampleRate && _icomNetworkJtcatUiSampleRate !== sampleRate) {
+    resetIcomNetworkJtcatUiBuffer();
+  }
+  _icomNetworkJtcatUiSampleRate = sampleRate;
+  _icomNetworkJtcatUiChunks.push(pcm);
+  _icomNetworkJtcatUiSampleCount += pcm.length;
+  _icomNetworkJtcatUiPeak = Math.max(_icomNetworkJtcatUiPeak, peak || 0);
+
+  const targetSamples = Math.max(1, Math.round(sampleRate * ICOM_NETWORK_JTCAT_UI_FRAME_MS / 1000));
+  if (_icomNetworkJtcatUiSampleCount < targetSamples) return;
+
+  const combined = concatFloat32Chunks(_icomNetworkJtcatUiChunks, _icomNetworkJtcatUiSampleCount);
+  const combinedPeak = _icomNetworkJtcatUiPeak;
+  resetIcomNetworkJtcatUiBuffer();
+  sendIcomNetworkJtcatUiAudio(combined, sampleRate, combinedPeak, jtcatRunning);
+}
+
+function handleIcomNetworkPacedRxFrame(pcm, sampleRate, meta = {}) {
+  if (!pcm || !pcm.length) return;
+  const peak = meta.silence ? 0 : peakFloat32(pcm);
+
+  if (remoteAudioWin) {
+    audioSafeSend(remoteAudioWin.webContents, 'smartsdr-audio-frame', { pcm, sampleRate });
+  }
+  if (vfoPopoutWin) {
+    audioSafeSend(vfoPopoutWin.webContents, 'smartsdr-audio-frame', { pcm, sampleRate });
+  }
+
+  if (settings.audioSource === 'icom-network') {
+    const jtcatRunning = !!((jtcatManager && jtcatManager.running) || (ft8Engine && ft8Engine._running));
+    if (jtcatManager && jtcatManager.running) {
+      jtcatManager.feedAudio('default', resampleMonoFloat32(pcm, sampleRate, 12000));
+    } else if (ft8Engine && ft8Engine._running) {
+      ft8Engine.feedAudio(resampleMonoFloat32(pcm, sampleRate, 12000));
+    }
+    queueIcomNetworkJtcatUiAudio(pcm, sampleRate, peak, jtcatRunning);
+  }
+
+  if (settings.audioSource === 'icom-network' && sstvEngine && !_sstvFeedPaused) {
+    // sstvEngine.feedAudio transfers the ArrayBuffer to its worker. Use a
+    // private copy so the same paced frame can safely feed JTCAT/UI/monitor
+    // consumers first.
+    const sstvPcm = sampleRate === 48000
+      ? new Float32Array(pcm)
+      : resampleMonoFloat32(pcm, sampleRate, 48000);
+    if (sstvPopoutWin) {
+      audioSafeSend(sstvPopoutWin.webContents, 'sstv-vita49-audio', { pcm: new Float32Array(sstvPcm), sampleRate: 48000 });
+    }
+    sstvEngine.feedAudio(sstvPcm);
+  }
+
+  if (meta.silence && meta.buffering && _icomNetworkRxPacer && _icomNetworkRxPacer.framesOut % 100 === 0) {
+    appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-PACER buffering-silence framesOut=${_icomNetworkRxPacer.framesOut} bufferedMs=${_icomNetworkRxPacer.bufferedMs().toFixed(0)}`);
+  }
+}
+
+function estimateIcomNetworkMissingSamples(missingPackets, currentSamples, sampleRate) {
+  const count = Math.max(0, Math.min(128, Number(missingPackets) || 0));
+  const rate = sampleRate || 48000;
+  if (!count) return 0;
+  const samples = Number(currentSamples) || 0;
+  const pairSamples = Math.max(1, Math.round(rate * 0.02));
+  const otherSamples = pairSamples - samples;
+  if (samples > 0 && otherSamples > 0 && otherSamples < pairSamples) {
+    let total = 0;
+    for (let i = 1; i <= count; i++) total += (i % 2 === 1) ? otherSamples : samples;
+    return total;
+  }
+  return Math.round(rate * 0.01 * count);
+}
+
+function getIcomNetworkRxPacer() {
+  if (!_icomNetworkRxPacer) {
+    _icomNetworkRxPacer = new IcomNetworkRxPacer({
+      sampleRate: 48000,
+      frameMs: ICOM_NETWORK_RX_PACER_FRAME_MS,
+      startBufferMs: ICOM_NETWORK_RX_PACER_START_MS,
+      resumeBufferMs: ICOM_NETWORK_RX_PACER_RESUME_MS,
+      maxBufferMs: ICOM_NETWORK_RX_PACER_MAX_MS,
+      onFrame: handleIcomNetworkPacedRxFrame,
+    });
+  }
+  return _icomNetworkRxPacer;
+}
+
+function noteIcomNetworkRxDiagnostics(frame, pcm, sampleRate, peak) {
+  if (!_icomNetworkRxDiag) resetIcomNetworkRxDiagnostics('RX diagnostics start');
+  const d = _icomNetworkRxDiag;
+  const now = Date.now();
+  const dt = d.lastFrameMs ? now - d.lastFrameMs : 0;
+  if (d.stalled) {
+    const stalledMs = d.stallStartMs ? now - d.stallStartMs : dt;
+    const msg = `RX-RECOVERED after=${stalledMs}ms frame=${_icomNetworkAudioFrameCount + 1} packetSeq=${frame.packetSeq ?? '-'} audioSeq=${frame.audioSeq ?? '-'}`;
+    appendDiagnosticLog('rsba1-rx-diagnostics.log', msg);
+    sendCatLog(`[Icom-Network-Audio] ${msg}`);
+    d.stalled = false;
+    d.stallStartMs = 0;
+    _icomNetworkRxAudioRestartAttempts = 0;
+  }
+  d.lastFrameMs = now;
+  d.frames++;
+  d.peakMax = Math.max(d.peakMax, peak || 0);
+  incDiagMap(d.payloads, frame.payloadBytes || (pcm.length * 2));
+  incDiagMap(d.sampleRates, sampleRate);
+
+  if (dt > 180) {
+    d.gapEvents++;
+    d.maxGapMs = Math.max(d.maxGapMs, dt);
+    const expectedMs = pcm.length && sampleRate ? (pcm.length / sampleRate * 1000) : 0;
+    const lagAge = _icomNetworkEventLoopLastLagAtMs ? now - _icomNetworkEventLoopLastLagAtMs : 0;
+    const recentLag = lagAge > 0 && lagAge <= 2500 ? Math.round(_icomNetworkEventLoopLastLagMs) : 0;
+    const msg = `RX-GAP dt=${dt}ms expected=${expectedMs.toFixed(1)}ms frame=${_icomNetworkAudioFrameCount} packetSeq=${frame.packetSeq ?? '-'} audioSeq=${frame.audioSeq ?? '-'} payload=${frame.payloadBytes ?? '-'} peak=${(peak || 0).toFixed(4)} eventLoopLag=${recentLag}ms`;
+    appendDiagnosticLog('rsba1-rx-diagnostics.log', msg);
+    sendCatLog(`[Icom-Network-Audio] ${msg}`);
+  }
+
+  const track = frame.rxTrack || {};
+  if (track.missingAdded || track.missingRecovered || track.duplicate || track.largeGap) {
+    if (track.missingAdded) {
+      d.seqGapEvents++;
+      d.missingAdded += track.missingAdded;
+    }
+    if (track.missingRecovered) d.missingRecovered++;
+    if (track.duplicate) d.duplicates++;
+    if (track.largeGap) d.largeGaps++;
+    if (track.missingAdded || track.missingRecovered || track.largeGap) {
+      const msg = `RX-SEQ frame=${_icomNetworkAudioFrameCount} seq=${frame.packetSeq ?? '-'} audioSeq=${frame.audioSeq ?? '-'} missingAdded=${track.missingAdded || 0} pending=${track.pendingMissing || 0} recovered=${track.missingRecovered ? 1 : 0} duplicate=${track.duplicate ? 1 : 0} largeGap=${track.largeGap ? 1 : 0} payload=${frame.payloadBytes ?? '-'} peak=${(peak || 0).toFixed(4)}`;
+      appendDiagnosticLog('rsba1-rx-diagnostics.log', msg);
+      if (track.missingAdded || track.largeGap) sendCatLog(`[Icom-Network-Audio] ${msg}`);
+    }
+  }
+
+  if (now - d.lastSummaryMs >= 10_000) {
+    const elapsedSec = Math.max(1, (now - d.startedMs) / 1000);
+    const msg = `RX-SUMMARY frames=${d.frames} rate=${(d.frames / elapsedSec).toFixed(1)}/s gaps=${d.gapEvents} maxGap=${Math.round(d.maxGapMs)}ms seqGaps=${d.seqGapEvents} missingAdded=${d.missingAdded} recovered=${d.missingRecovered} dupes=${d.duplicates} largeGaps=${d.largeGaps} payloads=${diagMapTop(d.payloads)} sampleRates=${diagMapTop(d.sampleRates)} peakMax=${d.peakMax.toFixed(4)}`;
+    appendDiagnosticLog('rsba1-rx-diagnostics.log', msg);
+    if (d.gapEvents || d.seqGapEvents || d.duplicates || d.largeGaps) {
+      sendCatLog(`[Icom-Network-Audio] ${msg}`);
+    }
+    d.lastSummaryMs = now;
+  }
+  return dt;
+}
+
+function handleIcomNetworkAudioFrame(frame) {
+  if (!frame || !frame.pcm) return;
+  const sampleRate = frame.sampleRate || 48000;
+  const pcm = (frame.pcm instanceof Float32Array) ? frame.pcm : new Float32Array(frame.pcm);
+  if (!pcm.length) return;
+  _icomNetworkAudioFrameCount++;
+  const peak = peakFloat32(pcm);
+  const arrivalGapMs = noteIcomNetworkRxDiagnostics(frame, pcm, sampleRate, peak);
+  const track = frame.rxTrack || {};
+
+  if (track.duplicate || track.missingRecovered) {
+    appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-SKIP-LATE frame=${_icomNetworkAudioFrameCount} seq=${frame.packetSeq ?? '-'} recovered=${track.missingRecovered ? 1 : 0} duplicate=${track.duplicate ? 1 : 0} payload=${frame.payloadBytes ?? '-'}`);
+    return;
+  }
+  if (track.largeGap) {
+    resetIcomNetworkJtcatUiBuffer();
+  }
+
+  // Keep Icom Network RX low-latency for FT8/FT4 and band changes. A deep
+  // wfview-style playback buffer is useful for ears, but it makes JTCAT's
+  // decode window stale and can leave the waterfall showing the old band
+  // after CAT has already QSY'd. Feed consumers from current packets and let
+  // the watchdog recover true RS-BA1 stream stalls.
+  if (track.missingAdded && !track.largeGap && arrivalGapMs <= ICOM_NETWORK_RX_LOSSFILL_MAX_ARRIVAL_GAP_MS) {
+    const fillSamples = estimateIcomNetworkMissingSamples(track.missingAdded, pcm.length, sampleRate);
+    const maxFillSamples = Math.round((sampleRate || 48000) * ICOM_NETWORK_RX_LOSSFILL_MAX_MS / 1000);
+    const cappedSamples = Math.min(fillSamples, maxFillSamples);
+    if (cappedSamples > 0) {
+      appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-LOSSFILL packets=${track.missingAdded} samples=${cappedSamples}${cappedSamples < fillSamples ? `/${fillSamples}` : ''} arrivalGap=${arrivalGapMs}ms beforeSeq=${frame.packetSeq ?? '-'}`);
+      handleIcomNetworkPacedRxFrame(new Float32Array(cappedSamples), sampleRate, { silence: true, lossFill: true });
+    }
+  }
+  handleIcomNetworkPacedRxFrame(pcm, sampleRate, { silence: false });
+
+  if (_icomNetworkAudioFrameCount === 1 || _icomNetworkAudioFrameCount % 100 === 0) {
+    sendCatLog(`[Icom-Network-Audio] RX frame #${_icomNetworkAudioFrameCount}: ${pcm.length} samples @ ${sampleRate} Hz, peak=${peak.toFixed(4)}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -8380,6 +9738,8 @@ function connectRemote() {
   });
 
   remoteServer.on('jtcat-halt-tx', () => {
+    clearJtcatTxFailsafe();
+    clearJtcatIcomHardRelease();
     if (jtcatManager) {
       for (const id of jtcatManager.sliceIds) {
         const eng = jtcatManager.getEngine(id);
@@ -8393,6 +9753,8 @@ function connectRemote() {
     }
     remoteJtcatQso = null;
     remoteJtcatBroadcastQso();
+    if (_icomNetworkTransport) { try { _icomNetworkTransport.cancelTx(); } catch {} }
+    if (smartSdrAudio) { try { smartSdrAudio.cancelTx(); } catch {} }
     handleRemotePtt(false);
   });
 
@@ -8462,6 +9824,7 @@ function connectRemote() {
     if (win && !win.isDestroyed()) win.webContents.send('jtcat-set-rx-gain', value);
   });
   remoteServer.on('jtcat-tx-gain', ({ value }) => {
+    setJtcatDirectTxGainLevel(value);
     if (win && !win.isDestroyed()) win.webContents.send('jtcat-set-tx-gain', value);
   });
 
@@ -8576,25 +9939,16 @@ function connectRemote() {
   });
 
   remoteServer.on('sstv-get-gallery', ({ limit, offset, requestId }) => {
-    ensureSstvGalleryDir();
     try {
-      const files = fs.readdirSync(SSTV_GALLERY_DIR)
+      const galleryDir = ensureSstvGalleryDir();
+      const files = fs.readdirSync(galleryDir)
         .filter(f => f.endsWith('.png'))
         .sort((a, b) => b.localeCompare(a));
       const total = files.length;
       const slice = files.slice(offset || 0, (offset || 0) + (limit || 10));
       const images = slice.map(f => {
-        const filePath = path.join(SSTV_GALLERY_DIR, f);
-        const stat = fs.statSync(filePath);
-        const data = fs.readFileSync(filePath);
-        const parts = f.replace('.png', '').split('_');
-        return {
-          filename: f,
-          dataUrl: 'data:image/png;base64,' + data.toString('base64'),
-          mode: parts[1] || '',
-          timestamp: stat.mtimeMs,
-        };
-      });
+        return sstvGalleryRecordFromFile(path.join(galleryDir, f));
+      }).filter(Boolean);
       remoteServer.sendSstvGallery(images, requestId, total);
     } catch (err) {
       console.error('[SSTV] Gallery fetch for ECHOCAT error:', err.message);
@@ -11334,7 +12688,7 @@ function createWindow() {
   win = new BrowserWindow({
     width: defaultW,
     height: defaultH,
-    title: `POTACAT - v${require('./package.json').version}`,
+    title: `POTACAT - v${getAppDisplayVersion()}`,
     ...(isMac ? { titleBarStyle: 'hiddenInset' } : { frame: false }),
     icon: getIconPath(),
     show: false,
@@ -12600,7 +13954,7 @@ function sendTelemetry(sessionSeconds) {
   const https = require('https');
   const payload = JSON.stringify({
     id: settings.telemetryId,
-    version: require('./package.json').version,
+    version: getAppDisplayVersion(),
     os: process.platform,
     sessionSeconds: sessionSeconds || 0,
     active: sessionSeconds === 0 ? true : isUserActive(), // launch ping always active
@@ -12864,6 +14218,10 @@ function tuneRadio(freqKhz, mode, brng, { clearXit } = {}) {
   }
   _lastTuneFreq = freqHz;
   _lastTuneTime = now;
+  if (settings.audioSource === 'icom-network' && settings.catTarget && settings.catTarget.type === 'icom-network') {
+    resetIcomNetworkJtcatUiBuffer();
+    resetIcomNetworkRxPacer(`CAT tune ${freqHz}Hz`);
+  }
 
   // Auto-tune KiwiSDR WebSDR to follow
   if (kiwiActive && kiwiClient && kiwiClient.connected && freqHz > 100000) {
@@ -13650,7 +15008,7 @@ app.whenReady().then(() => {
       }
     }, 1000);
   }
-  if (!settings.enableWsjtx) connectCat();
+  if (!settings.enableWsjtx) connectCatWithStartupDelay();
   if (settings.enableCluster) connectCluster();
   if (settings.enableCwSpots) connectCwSpots();
   // RBN auto-connects when myCallsign is set — passively collected so the
@@ -15505,6 +16863,14 @@ app.whenReady().then(() => {
       if (!sstvPopoutWin || sstvPopoutWin.isDestroyed()) {
         openSstvPopout();
       }
+      if (settings.audioSource === 'icom-network' &&
+          !(ICOM_NETWORK_TX_AUDIO_ENABLED && _icomNetworkTransport && _icomNetworkTransport.txReady)) {
+        sendCatLog('[SSTV] Icom Network TX blocked before PTT: RS-BA1 TX audio stream is not ready. Reconnect Icom Network / RS-BA1 or use a local/USB audio source for this transmit.');
+        if (remoteServer && remoteServer.hasClient()) {
+          remoteServer.broadcastSstvTxStatus({ state: autoSstvActive ? 'auto-rx' : 'rx' });
+        }
+        return;
+      }
       // Key PTT
       handleRemotePtt(true);
 
@@ -15539,13 +16905,13 @@ app.whenReady().then(() => {
         }
       }
 
-      // Flex Direct (SmartSDR Direct): there's no Windows DAX TX device for
-      // the pop-out's Web Audio to play into, so the radio would key but
-      // transmit silence. Route the encoded SSTV audio to the radio over
-      // VITA-49 dax_tx instead — the same path FT8/voice use. The pop-out
+      // Direct radio TX paths: if there is no local/virtual TX audio device,
+      // the pop-out's Web Audio would key the radio but transmit silence.
+      // Route encoded SSTV audio straight to the radio instead. The pop-out
       // still shows the TX progress bar but does NOT play audio (daxTx flag).
       // K3SBP 2026-05-28.
       const useDaxTx = settings.audioSource === 'smartsdr' && smartSdrAudio && smartSdrAudio.txReady;
+      const useIcomNetworkTx = settings.audioSource === 'icom-network' && ICOM_NETWORK_TX_AUDIO_ENABLED && _icomNetworkTransport && _icomNetworkTransport.txReady;
       const delay = (!sstvPopoutWin || sstvPopoutWin.isDestroyed()) ? 1500 : 200;
       setTimeout(() => {
         if (useDaxTx) {
@@ -15561,7 +16927,7 @@ app.whenReady().then(() => {
           }
           sendCatLog(`[SSTV] TX via Flex Direct dax_tx — ${outDurSec.toFixed(0)}s (${dn.length} samples @12k)`);
           if (sstvPopoutWin && !sstvPopoutWin.isDestroyed()) {
-            sstvPopoutWin.webContents.send('sstv-tx-audio', { samples: [], durationSec: outDurSec, daxTx: true });
+            sstvPopoutWin.webContents.send('sstv-tx-audio', { samples: [], durationSec: outDurSec, daxTx: true, directTxLabel: 'Flex Direct' });
           }
           smartSdrAudio.sendTxAudio(dn, 500)
             .then(() => {
@@ -15584,6 +16950,38 @@ app.whenReady().then(() => {
               // Same banner-clear on failure — leaving mobile stuck
               // on TRANSMITTING after an error would be worse than
               // dropping back to RX without a notification.
+              if (remoteServer && remoteServer.hasClient()) {
+                remoteServer.broadcastSstvTxStatus({
+                  state: autoSstvActive ? 'auto-rx' : 'rx',
+                });
+              }
+            });
+        } else if (useIcomNetworkTx) {
+          const sstvTxGain = clampNumber(settings.sstvTxGain, 0, 1, 0.5);
+          const networkTxGain = getIcomNetworkTxGain();
+          const txAudio = conditionDirectTxAudio(outSamples, sstvTxGain * (networkTxGain / DEFAULT_ICOM_NETWORK_TX_GAIN));
+          sendCatLog(`[SSTV] TX via Icom Network RS-BA1 audio — ${outDurSec.toFixed(0)}s (${outSamples.length} samples @48k, networkTxGain=${Math.round(networkTxGain * 100)}%); ${formatDirectTxAudioStats(txAudio)}`);
+          if (sstvPopoutWin && !sstvPopoutWin.isDestroyed()) {
+            sstvPopoutWin.webContents.send('sstv-tx-audio', { samples: [], durationSec: outDurSec, daxTx: true, directTxLabel: 'Icom Network' });
+          }
+          _icomNetworkTransport.sendTxAudio(txAudio.samples, {
+            offsetMs: 0,
+            inputSampleRate: SSTV_SAMPLE_RATE,
+            startDelayMs: ICOM_NETWORK_TUNE_START_DELAY_MS,
+            tailSilenceMs: 200,
+          })
+            .then(() => {
+              handleRemotePtt(false);
+              sendCatLog('[SSTV] TX complete (Icom Network)');
+              if (remoteServer && remoteServer.hasClient()) {
+                remoteServer.broadcastSstvTxStatus({
+                  state: autoSstvActive ? 'auto-rx' : 'rx',
+                });
+              }
+            })
+            .catch((err) => {
+              handleRemotePtt(false);
+              sendCatLog(`[SSTV] Icom Network TX failed: ${err.message}`);
               if (remoteServer && remoteServer.hasClient()) {
                 remoteServer.broadcastSstvTxStatus({
                   state: autoSstvActive ? 'auto-rx' : 'rx',
@@ -15638,7 +17036,7 @@ app.whenReady().then(() => {
       _sstvLastActivityMs = Date.now();
       applySstvPostProcess(data);
       // Save to gallery
-      saveSstvImage(data);
+      const saved = saveSstvImage(data);
       // Send to popout
       if (sstvPopoutWin && !sstvPopoutWin.isDestroyed()) {
         sstvPopoutWin.webContents.send('sstv-rx-image', {
@@ -15646,6 +17044,7 @@ app.whenReady().then(() => {
           width: data.width,
           height: data.height,
           mode: data.mode,
+          saved,
         });
       }
       // Send to ECHOCAT phone
@@ -15785,11 +17184,51 @@ app.whenReady().then(() => {
     }
   }
 
+  function sanitizeSstvFilenamePart(value, fallback) {
+    const s = String(value || fallback || '').trim().replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+    return s || fallback || 'sstv';
+  }
+
+  function sstvGalleryRecordFromFile(filePath) {
+    try {
+      const stat = fs.statSync(filePath);
+      const filename = path.basename(filePath);
+      const png = fs.readFileSync(filePath);
+      const img = nativeImage.createFromBuffer(png);
+      const size = img.getSize();
+      let meta = {};
+      const metaPath = filePath.replace(/\.png$/i, '.json');
+      if (fs.existsSync(metaPath)) {
+        try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')); } catch { meta = {}; }
+      }
+      const parts = filename.replace(/\.png$/i, '').split('_');
+      return {
+        filename,
+        filePath,
+        dataUrl: 'data:image/png;base64,' + png.toString('base64'),
+        mode: meta.mode || parts[1] || '',
+        timestamp: meta.timestamp || stat.mtimeMs,
+        width: meta.width || size.width || 320,
+        height: meta.height || size.height || 256,
+        freqHz: meta.freqHz || null,
+        freqKhz: meta.freqKhz || null,
+        callsign: meta.callsign || '',
+      };
+    } catch (err) {
+      console.error('[SSTV] Gallery record error:', err.message);
+      return null;
+    }
+  }
+
   function saveSstvImage(data) {
     try {
-      ensureSstvGalleryDir();
+      const galleryDir = ensureSstvGalleryDir();
       const ts = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
-      const filename = `sstv_${data.mode}_${ts}.png`;
+      const modePart = sanitizeSstvFilenamePart(data.mode, 'unknown');
+      const freqPart = _currentFreqHz ? `${Math.round(_currentFreqHz / 1000)}kHz` : '';
+      const callPart = sanitizeSstvFilenamePart(settings.myCallsign || '', '');
+      const pieces = ['sstv', modePart, freqPart, callPart, ts].filter(Boolean);
+      const filename = `${pieces.join('_')}.png`;
       const { nativeImage } = require('electron');
       // ImageData is RGBA, nativeImage expects BGRA — convert
       const rgba = new Uint8ClampedArray(data.imageData);
@@ -15801,10 +17240,27 @@ app.whenReady().then(() => {
         bgra[i + 3] = rgba[i + 3]; // A
       }
       const img = nativeImage.createFromBitmap(bgra, { width: data.width, height: data.height });
-      fs.writeFileSync(path.join(SSTV_GALLERY_DIR, filename), img.toPNG());
-      console.log('[SSTV] Saved decoded image:', filename);
+      const filePath = path.join(galleryDir, filename);
+      fs.writeFileSync(filePath, img.toPNG());
+      const meta = {
+        filename,
+        filePath,
+        mode: data.mode,
+        width: data.width,
+        height: data.height,
+        timestamp: Date.now(),
+        isoTime: new Date().toISOString(),
+        freqHz: _currentFreqHz || null,
+        freqKhz: _currentFreqHz ? Math.round(_currentFreqHz / 1000) : null,
+        callsign: settings.myCallsign || '',
+        postProcessed: settings.sstvPostProcess !== false,
+      };
+      fs.writeFileSync(filePath.replace(/\.png$/i, '.json'), JSON.stringify(meta, null, 2), 'utf-8');
+      console.log('[SSTV] Saved decoded image:', filePath);
+      return sstvGalleryRecordFromFile(filePath);
     } catch (err) {
       console.error('[SSTV] Save image error:', err.message);
+      return null;
     }
   }
 
@@ -15818,6 +17274,7 @@ app.whenReady().then(() => {
     // every decode into noise. Mirror the sstv-audio guards exactly.
     if (settings.audioSource === 'smartsdr' && smartSdrAudio) return;
     if (settings.catTarget && settings.catTarget.type === 'k4-network' && cat && cat.connected) return;
+    if (settings.audioSource === 'icom-network' && settings.catTarget && settings.catTarget.type === 'icom-network' && cat && cat.connected) return;
     if (sstvEngine) sstvEngine.setSampleRate(rate);
     console.log('[SSTV] Audio sample rate set to ' + rate + ' Hz');
   });
@@ -15830,6 +17287,8 @@ app.whenReady().then(() => {
     if (settings.audioSource === 'smartsdr' && smartSdrAudio) return;
     // K4 network: SSTV is fed by handleK4AudioFrame's 4x upsample.
     if (settings.catTarget && settings.catTarget.type === 'k4-network' && cat && cat.connected) return;
+    // Icom Network: SSTV is fed from RS-BA1 RX audio frames in main.
+    if (settings.audioSource === 'icom-network' && settings.catTarget && settings.catTarget.type === 'icom-network' && cat && cat.connected) return;
     if (_sstvFeedPaused) return; // circuit breaker — see flag definition
     let samples;
     if (buf instanceof Float32Array) samples = buf;
@@ -15872,21 +17331,15 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle('sstv-get-gallery', async () => {
-    ensureSstvGalleryDir();
     try {
-      const files = fs.readdirSync(SSTV_GALLERY_DIR)
+      const galleryDir = ensureSstvGalleryDir();
+      const files = fs.readdirSync(galleryDir)
         .filter(f => f.endsWith('.png'))
         .sort((a, b) => b.localeCompare(a)); // newest first
       const results = [];
       for (const f of files.slice(0, 50)) { // limit to 50 most recent
-        const filePath = path.join(SSTV_GALLERY_DIR, f);
-        const stat = fs.statSync(filePath);
-        const data = fs.readFileSync(filePath);
-        const dataUrl = 'data:image/png;base64,' + data.toString('base64');
-        // Parse mode from filename: sstv_MODE_DATE.png
-        const parts = f.replace('.png', '').split('_');
-        const mode = parts[1] || '';
-        results.push({ filename: f, dataUrl, mode, timestamp: stat.mtimeMs, width: 320, height: 256 });
+        const rec = sstvGalleryRecordFromFile(path.join(galleryDir, f));
+        if (rec) results.push(rec);
       }
       return results;
     } catch (err) {
@@ -15897,8 +17350,11 @@ app.whenReady().then(() => {
 
   ipcMain.handle('sstv-delete-image', async (_e, filename) => {
     try {
-      const filePath = path.join(SSTV_GALLERY_DIR, path.basename(filename));
+      const galleryDir = ensureSstvGalleryDir();
+      const filePath = path.join(galleryDir, path.basename(filename));
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      const metaPath = filePath.replace(/\.png$/i, '.json');
+      if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
       return true;
     } catch { return false; }
   });
@@ -15920,8 +17376,8 @@ app.whenReady().then(() => {
   });
 
   ipcMain.on('sstv-open-gallery-folder', () => {
-    ensureSstvGalleryDir();
-    require('electron').shell.openPath(SSTV_GALLERY_DIR);
+    const galleryDir = ensureSstvGalleryDir();
+    require('electron').shell.openPath(galleryDir);
   });
 
   // SSTV pop-out window
@@ -16025,12 +17481,13 @@ app.whenReady().then(() => {
 
     sstvManager.on('rx-image', (data) => {
       applySstvPostProcess(data);
-      saveSstvImage(data);
+      const saved = saveSstvImage(data);
       if (sstvPopoutWin && !sstvPopoutWin.isDestroyed()) {
         sstvPopoutWin.webContents.send('sstv-rx-image', {
           imageData: Array.from(data.imageData),
           width: data.width, height: data.height,
           mode: data.mode, sliceId: data.sliceId,
+          saved,
         });
       }
       if (remoteServer && remoteServer.hasClient()) {
@@ -17112,7 +18569,7 @@ app.whenReady().then(() => {
   ipcMain.on('refresh', () => { markUserActive(); refreshSpots(); });
 
   ipcMain.on('app-relaunch', () => { app.relaunch(); app.exit(0); });
-  ipcMain.handle('get-settings', () => ({ ...settings, appVersion: require('./package.json').version }));
+  ipcMain.handle('get-settings', () => ({ ...settings, appVersion: getAppDisplayVersion() }));
 
   // Manual refresh for one watchlist group's Ham2K PoLo URL. Renderer
   // calls this from the Settings dialog's "Refresh" button so the user
@@ -18680,6 +20137,9 @@ app.whenReady().then(() => {
           remoteAudioWin.webContents.send('smartsdr-audio-fallback');
         }
       }
+      if (settings.catTarget && settings.catTarget.type === 'icom-network') {
+        connectCat();
+      }
     }
 
     // Reconnect TCI if settings changed
@@ -18978,6 +20438,21 @@ app.whenReady().then(() => {
     return path.join(app.getPath('userData'), 'potacat_qso_log.adi');
   });
 
+  ipcMain.handle('get-default-sstv-gallery-path', () => {
+    return defaultSstvGalleryDir();
+  });
+
+  ipcMain.handle('choose-sstv-gallery-folder', async (_e, currentPath) => {
+    const defaultPath = currentPath || getSstvGalleryDir();
+    const result = await dialog.showOpenDialog(win, {
+      title: 'Choose SSTV Received Images Folder',
+      defaultPath,
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (result.canceled || !result.filePaths.length) return null;
+    return result.filePaths[0];
+  });
+
   // Generic file picker for the advanced ECHOCAT settings (TLS
   // cert + key path inputs). Open dialog only — these are existing
   // files the user manages outside POTACAT.
@@ -19077,7 +20552,10 @@ app.whenReady().then(() => {
     const { SerialPort } = require('serialport');
 
     // Temporarily disconnect live CAT + kill rigctld to release the serial port
-    if (cat) cat.disconnect();
+    if (cat) {
+      await restoreIcomNetworkDataMod('serial CAT test');
+      cat.disconnect();
+    }
     killRigctld();
 
     // Wait for OS to fully release the serial port
@@ -19159,7 +20637,10 @@ app.whenReady().then(() => {
     const { SerialPort } = require('serialport');
 
     // Temporarily disconnect live CAT to release the serial port
-    if (cat) cat.disconnect();
+    if (cat) {
+      await restoreIcomNetworkDataMod('Icom CI-V test');
+      cat.disconnect();
+    }
 
     await new Promise((r) => setTimeout(r, 500));
 
@@ -19242,6 +20723,197 @@ app.whenReady().then(() => {
 
       port.open((err) => {
         if (err && !settled) { settled = true; clearTimeout(timeout); resolve({ success: false, error: err.message }); }
+      });
+    });
+  });
+
+  ipcMain.handle('test-civ-tcp', async (_e, config) => {
+    const { host, port, civAddress } = config || {};
+
+    // Temporarily disconnect live CAT to avoid two clients driving the rig.
+    if (cat) {
+      await restoreIcomNetworkDataMod('CI-V TCP test');
+      cat.disconnect();
+    }
+    await new Promise((r) => setTimeout(r, 500));
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const transport = new TcpTransport();
+      const model = { brand: 'Icom', protocol: 'civ', civAddr: civAddress || 0x94, caps: {}, cw: {} };
+      const codec = new CivCodec(model, (data) => transport.write(data));
+
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        try { transport.disconnect(); } catch {}
+        resolve(result);
+      };
+
+      const timeout = setTimeout(() => {
+        finish({ success: false, error: 'No CI-V response. Check host, TCP port, CI-V address, and that this endpoint is a raw CI-V TCP bridge.' });
+      }, 6000);
+
+      transport.on('data', (chunk) => codec.onData(chunk));
+      transport.on('connect', () => {
+        setTimeout(() => codec.getFrequency(), 100);
+        setTimeout(() => { if (!settled) codec.getFrequency(); }, 1500);
+      });
+      transport.on('error', (err) => {
+        finish({ success: false, error: err.message || String(err) });
+      });
+      codec.on('frequency', (hz) => {
+        finish({ success: true, frequency: (hz / 1e6).toFixed(6) });
+      });
+      codec.on('error', (err) => {
+        finish({ success: false, error: err.message || 'CI-V NAK' });
+      });
+
+      transport.connect({
+        host: String(host || '').trim() || '127.0.0.1',
+        port: parseInt(port, 10) || 50001,
+      });
+    });
+  });
+
+  ipcMain.handle('test-icom-network', async (_e, config) => {
+    const { host, controlPort, civPort, username, password, civAddress } = config || {};
+
+    if (!String(host || '').trim()) {
+      return { success: false, error: 'Host/IP is required.' };
+    }
+
+    // Temporarily disconnect live CAT to avoid two clients driving the rig.
+    if (cat) {
+      await restoreIcomNetworkDataMod('Icom Network test');
+      cat.disconnect();
+    }
+    await new Promise((r) => setTimeout(r, 500));
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let civStreamReady = false;
+      let activeProbeAddr = civAddress || 0x94;
+      const probeTimers = [];
+      const transport = new RsBa1Transport();
+      const model = { brand: 'Icom', protocol: 'civ', civAddr: civAddress || 0x94, caps: {}, cw: {} };
+      const codec = new CivCodec(model, (data) => transport.write(data));
+      const logs = [];
+
+      const uniq = (items) => {
+        const seen = new Set();
+        return items.filter((item) => {
+          const n = Number(item);
+          if (!Number.isFinite(n) || n < 0 || n > 0xff || seen.has(n)) return false;
+          seen.add(n);
+          return true;
+        });
+      };
+      const probeAddrs = uniq([
+        civAddress || 0x94,
+        0x00, // CI-V broadcast/default probe.
+        0x98, // IC-7610
+        0x94, // IC-7300
+        0xB6, // IC-7300 MK II
+        0xA4, // IC-705
+        0xA2, // IC-9700
+        0x8E, // IC-7851
+        0x96, // IC-7850
+        0x88, // IC-7100
+        0x7A, // IC-7200
+        0x76, // IC-9100
+      ]);
+
+      const recordLog = (msg) => {
+        if (!msg) return;
+        logs.push(String(msg));
+        if (logs.length > 40) logs.shift();
+      };
+
+      const failureForError = (err) => {
+        const code = err && err.code;
+        let message = (err && err.message) || String(err || 'unknown error');
+        if (code === 'RSBA1_NO_IAMHERE') {
+          message += ' Try the radio numeric IPv4 address instead of the hostname, fully quit any other POTACAT/RS-BA1/wfview/USB-CAT controller that may be occupying the radio, confirm Network Control/RS-BA1 is enabled on the radio, confirm UDP control port 50001, and make sure macOS/Windows firewall is not blocking the UDP reply. Credentials are not being checked yet.';
+        } else if (code === 'RSBA1_DNS_FAILED') {
+          message += ' Try entering the radio numeric IPv4 address directly.';
+        } else if (code === 'RSBA1_NO_CIV_IAMHERE') {
+          message += ' Login worked, but the CI-V UDP stream did not open. Check the radio CI-V/network data port settings or try setting the CI-V port explicitly.';
+        }
+        const tail = logs.slice(-12);
+        if (code && String(code).startsWith('RSBA1_') && logs.length) {
+          const head = logs.slice(0, 8);
+          const diagnosticLines = head.length + tail.length < logs.length
+            ? [...head, '...', ...tail]
+            : logs.slice();
+          message += `\nDiagnostics:\n${diagnosticLines.join('\n')}`;
+        }
+        return { success: false, error: message, code: code || null, logs: tail };
+      };
+
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        probeTimers.forEach((t) => clearTimeout(t));
+        try { transport.disconnect(); } catch {}
+        resolve(result);
+      };
+
+      const timeout = setTimeout(() => {
+        const tail = logs.slice(-12);
+        const tried = probeAddrs.map((addr) => `0x${addr.toString(16).toUpperCase().padStart(2, '0')}`).join(', ');
+        const hint = civStreamReady
+          ? `RS-BA1 connected, but the radio did not answer CI-V frequency probes (${tried}). Check the radio CI-V address, CI-V Transceive setting, and whether Network CI-V allows remote control.`
+          : 'No RS-BA1/CI-V response before the CI-V stream opened. Check Network Control, UDP ports, username/password, and CI-V address.';
+        finish({ success: false, error: hint, logs: tail });
+      }, 22000);
+
+      transport.on('log', recordLog);
+      transport.on('data', (chunk) => codec.onData(chunk));
+      transport.on('connect', () => {
+        civStreamReady = true;
+        const probeStartMs = 1200;
+        const probeIntervalMs = 550;
+        const probeRounds = 2;
+        for (let round = 0; round < probeRounds; round++) {
+          probeAddrs.forEach((addr, idx) => {
+            const offset = (round * probeAddrs.length + idx) * probeIntervalMs;
+            probeTimers.push(setTimeout(() => {
+              if (settled) return;
+              activeProbeAddr = addr;
+              codec.setRadioAddress(addr);
+              recordLog(`[rsba1/test] probing CI-V address 0x${addr.toString(16).toUpperCase().padStart(2, '0')} (round ${round + 1})`);
+              codec.getFrequency();
+            }, probeStartMs + offset));
+          });
+        }
+      });
+      transport.on('error', (err) => {
+        finish(failureForError(err));
+      });
+      codec.on('frequency', (hz, meta = {}) => {
+        const responseAddr = meta.fromAddr != null ? meta.fromAddr : activeProbeAddr;
+        finish({
+          success: true,
+          frequency: (hz / 1e6).toFixed(6),
+          civAddress: responseAddr,
+          probedAddress: activeProbeAddr,
+        });
+      });
+      codec.on('error', (err) => {
+        finish({ success: false, error: err.message || 'CI-V NAK' });
+      });
+
+      transport.connect({
+        host: String(host || '').trim(),
+        controlPort: parseInt(controlPort, 10) || 50001,
+        civPort: parseInt(civPort, 10) || null,
+        username: username || '',
+        password: password || '',
+        compName: 'POTACAT-Test',
+        timeoutMs: 18000,
       });
     });
   });
@@ -19522,6 +21194,8 @@ app.whenReady().then(() => {
   ipcMain.on('jtcat-enable-tx', (_e, enabled) => { if (ft8Engine) ft8Engine._txEnabled = enabled; });
   ipcMain.on('jtcat-halt-tx', () => {
     if (jtcatFullAutoCq) stopFullAutoCq('Halt TX');
+    clearJtcatTxFailsafe();
+    clearJtcatIcomHardRelease();
     // Halt TX on ALL engines (multi-slice: any engine could be TX'ing)
     if (jtcatManager) {
       for (const id of jtcatManager.sliceIds) {
@@ -19537,13 +21211,19 @@ app.whenReady().then(() => {
       ft8Engine._txEnabled = false;
       if (ft8Engine._txActive) ft8Engine.txComplete();
     }
-    // Halt also kills any active tune
-    if (jtcatTuneState.active) stopJtcatTune();
+	    // Halt also kills any active tune
+	    if (jtcatTuneState.active) stopJtcatTune();
+	    if (smartSdrAudio) { try { smartSdrAudio.cancelTx(); } catch {} }
     // Also clear QSO state
     if (popoutJtcatQso) { popoutJtcatQso = null; popoutBroadcastQso(); }
     if (remoteJtcatQso) { remoteJtcatQso = null; remoteJtcatBroadcastQso(); }
-    handleRemotePtt(false);
-  });
+	    if (settings.audioSource === 'icom-network') {
+	      forceReleaseIcomNetworkTx('JTCAT halt');
+	    } else {
+	      if (_icomNetworkTransport) { try { _icomNetworkTransport.cancelTx(); } catch {} }
+	      handleRemotePtt(false);
+	    }
+	  });
 
   // KD2TJU: WSJT-X-style Tune button — keys PTT and plays a steady tone
   // through the rig USB CODEC for up to 90s, so the user can dial in TX
@@ -19556,6 +21236,7 @@ app.whenReady().then(() => {
   ipcMain.on('jtcat-set-tx-msg', (_e, text) => { if (ft8Engine) ft8Engine.setTxMessage(text); });
   ipcMain.on('jtcat-set-tx-slot', (_e, slot) => { if (ft8Engine) ft8Engine.setTxSlot(slot); });
   ipcMain.on('jtcat-set-tx-gain', (_e, level) => {
+    setJtcatDirectTxGainLevel(level);
     // Relay TX gain from popout to main renderer
     if (win && !win.isDestroyed()) win.webContents.send('jtcat-set-tx-gain', level);
   });
@@ -19681,6 +21362,8 @@ app.whenReady().then(() => {
     // DAX capture (which on a K4-network setup would just be silence or
     // mis-routed audio anyway) must not double-feed. K3SBP 2026-05-16.
     if (settings.catTarget && settings.catTarget.type === 'k4-network' && cat && cat.connected) return;
+    // Icom Network RX audio follows the same main-process feed pattern.
+    if (settings.audioSource === 'icom-network' && settings.catTarget && settings.catTarget.type === 'icom-network' && cat && cat.connected) return;
     _jtcatAudioDiag++;
     // Ensure buf is a proper array — IPC serialization on macOS can produce
     // objects that Float32Array constructor interprets as length instead of data
@@ -20665,7 +22348,10 @@ function gracefulCleanup() {
   } catch {}
   if (spotTimer) clearInterval(spotTimer);
   if (solarTimer) clearInterval(solarTimer);
-  if (cat) try { cat.disconnect(); } catch {}
+  if (cat) try {
+    restoreIcomNetworkDataMod('app quit');
+    cat.disconnect();
+  } catch {}
   for (const [, entry] of clusterClients) { try { entry.client.disconnect(); } catch {} }
   clusterClients.clear();
   for (const [, c] of cwSpotsClients) { try { c.disconnect(); } catch {} }

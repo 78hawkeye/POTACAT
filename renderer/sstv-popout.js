@@ -1182,14 +1182,15 @@ window.api.onSstvTxAudio(async (data) => {
   progressBar.style.width = '0%';
   progressBar.classList.add('tx');
 
-  // Flex Direct: main is streaming the audio to the radio over dax_tx; we
-  // must NOT play it through Web Audio (no DAX TX device exists, and it
+  // Direct radio TX: main is streaming the audio to the radio, so we must
+  // NOT play it through Web Audio (no local TX device is involved, and it
   // would just blast the PC speakers). Show the progress bar for the
   // duration, then reset UI. PTT is owned by main on this path, so don't
   // call sstvTxComplete here. K3SBP 2026-05-28.
   if (data && data.daxTx) {
     const durationSec = data.durationSec || 0;
-    statusBar.textContent = 'Transmitting ' + modeSelect.value + ' via Flex Direct... ' + durationSec.toFixed(0) + 's';
+    const directTxLabel = data.directTxLabel || 'direct radio audio';
+    statusBar.textContent = 'Transmitting ' + modeSelect.value + ' via ' + directTxLabel + '... ' + durationSec.toFixed(0) + 's';
     const startTime = Date.now();
     const iv = setInterval(() => {
       const pct = Math.min(100, ((Date.now() - startTime) / 1000 / durationSec) * 100);
@@ -1334,21 +1335,26 @@ window.api.onSstvStatus((data) => {
 async function loadGallery() {
   try {
     const images = await window.api.sstvGetGallery();
+    galleryImages = [];
     if (images && images.length) {
       for (const img of images) {
         galleryImages.push({
           filename: img.filename,
+          filePath: img.filePath || '',
           dataUrl: img.dataUrl,
           mode: img.mode,
           timestamp: img.timestamp,
           width: img.width || 320,
           height: img.height || 256,
+          freqKhz: img.freqKhz || null,
+          callsign: img.callsign || '',
         });
       }
-      renderGallery();
     }
+    renderGallery();
   } catch (e) {
     console.warn('[SSTV] Gallery load error:', e);
+    renderGallery();
   }
 }
 
@@ -1357,6 +1363,13 @@ function renderGallery() {
   // Sort by timestamp descending (newest first)
   galleryImages.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
   galleryCount.textContent = '(' + galleryImages.length + ')';
+  if (galleryImages.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'sstv-gallery-empty';
+    empty.textContent = 'No decoded SSTV images yet. When a VIS decode completes, saved PNGs will appear here.';
+    gallery.appendChild(empty);
+    return;
+  }
   for (let i = 0; i < galleryImages.length; i++) {
     const entry = galleryImages[i];
     const thumb = document.createElement('div');
@@ -1369,7 +1382,9 @@ function renderGallery() {
     info.className = 'sstv-thumb-info';
     const d = entry.timestamp ? new Date(entry.timestamp) : null;
     const dateStr = d ? d.toLocaleDateString([], { month: 'numeric', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-    info.textContent = dateStr + ' ' + (entry.mode || '');
+    const freqStr = entry.freqKhz ? ' ' + entry.freqKhz + ' kHz' : '';
+    info.textContent = dateStr + ' ' + (entry.mode || '') + freqStr;
+    if (entry.filePath) thumb.title = entry.filePath;
     thumb.appendChild(info);
 
     // Click to view fullscreen
@@ -2040,19 +2055,37 @@ window.api.onSstvRxImage((data) => {
     rxSlantPx = 0;
   }
 
-  // Add to gallery regardless of mode
+  // Add to gallery regardless of mode. Prefer the saved record from main so
+  // the pane points at the real PNG on disk instead of a temporary data URL.
   const w = data.width, h = data.height;
-  const tmpC = document.createElement('canvas');
-  tmpC.width = w; tmpC.height = h;
-  const tmpCtx = tmpC.getContext('2d');
-  const imgData = new ImageData(new Uint8ClampedArray(data.imageData), w, h);
-  tmpCtx.putImageData(imgData, 0, 0);
-  const dataUrl = tmpC.toDataURL('image/png');
-  const entry = {
-    dataUrl, mode: data.mode, timestamp: Date.now(),
-    width: w, height: h, imageData: Array.from(data.imageData),
+  let entry = data.saved ? {
+    filename: data.saved.filename,
+    filePath: data.saved.filePath || '',
+    dataUrl: data.saved.dataUrl,
+    mode: data.saved.mode || data.mode,
+    timestamp: data.saved.timestamp || Date.now(),
+    width: data.saved.width || w,
+    height: data.saved.height || h,
+    freqKhz: data.saved.freqKhz || null,
+    callsign: data.saved.callsign || '',
+    imageData: Array.from(data.imageData || []),
     sliceId: data.sliceId || null,
-  };
+  } : null;
+  if (!entry || !entry.dataUrl) {
+    const tmpC = document.createElement('canvas');
+    tmpC.width = w; tmpC.height = h;
+    const tmpCtx = tmpC.getContext('2d');
+    const imgData = new ImageData(new Uint8ClampedArray(data.imageData), w, h);
+    tmpCtx.putImageData(imgData, 0, 0);
+    entry = {
+      dataUrl: tmpC.toDataURL('image/png'), mode: data.mode, timestamp: Date.now(),
+      width: w, height: h, imageData: Array.from(data.imageData),
+      sliceId: data.sliceId || null,
+    };
+  }
+  if (entry.filename) {
+    galleryImages = galleryImages.filter((img) => img.filename !== entry.filename);
+  }
   galleryImages.unshift(entry);
   renderGallery();
 });

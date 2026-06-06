@@ -423,10 +423,9 @@ section('SSTV calling-frequency table');
 // =====================================================================
 section('PENDING — features to implement (these aren\'t failures, they\'re contracts)');
 {
-  // (a) Saving decoded images to disk on successful decode
-  todo('decoded images saved to disk in a configurable folder (currently lives in memory only)');
-  todo('decoded image save preserves: mode, timestamp, frequency, decoded callsign if extracted, PSNR');
-  todo('decoded image folder configurable via settings.sstvDecodedImagesPath (default ~/POTACAT/sstv-rx/)');
+  // (a) Rich received-image metadata beyond the current PNG + JSON sidecar
+  todo('decoded image save extracts and preserves remote callsign when the decoder can infer it');
+  todo('decoded image save preserves decoder quality metrics such as PSNR when available');
 
   // (b) Sent-image history
   todo('sent images persisted to settings.sstvSentHistory: [{ tplIdx, mode, freqKhz, at, dataUrl, durationMs }]');

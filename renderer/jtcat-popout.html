@@ -129,6 +129,8 @@
     .jtcat-arc-reverse { animation: jtcat-arc-flow-rev 1.5s linear infinite; }
     @keyframes jtcat-arc-flow { from { stroke-dashoffset: 28; } to { stroke-dashoffset: 0; } }
     @keyframes jtcat-arc-flow-rev { from { stroke-dashoffset: 0; } to { stroke-dashoffset: 28; } }
+    body.platform-darwin .titlebar { padding-left: 92px; }
+    body.platform-darwin .titlebar-title { display: inline-block; max-width: calc(100vw - 120px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   </style>
 </head>
 <body>
@@ -203,7 +205,7 @@
   <div class="jp-main">
     <div class="jp-decode-pane">
       <div class="jp-decode-section">
-        <div class="jp-decode-header">Band Activity <div style="display:flex;gap:4px;align-items:center;"><input type="text" id="jp-search" placeholder="Filter..." style="width:70px;font-size:10px;padding:1px 4px;border:1px solid var(--border-primary);background:var(--bg-primary);color:var(--text-primary);border-radius:3px;" spellcheck="false"><button id="jp-cq-filter" class="jtcat-filter-btn" title="CQ/73 only">CQ/73</button><button id="jp-wanted-filter" class="jtcat-filter-btn" title="Show only needed DXCC/grid/call">Wanted</button><button id="jp-sort-signal" class="jtcat-filter-btn" title="Sort by signal strength (strongest first)">dB</button><button id="jp-clear" class="jtcat-filter-btn" title="Clear all decodes">Clear</button></div></div>
+        <div class="jp-decode-header">Band Activity <div style="display:flex;gap:4px;align-items:center;"><input type="text" id="jp-search" placeholder="Filter..." style="width:70px;font-size:10px;padding:1px 4px;border:1px solid var(--border-primary);background:var(--bg-primary);color:var(--text-primary);border-radius:3px;" spellcheck="false"><button id="jp-cq-filter" class="jtcat-filter-btn" title="CQ calls only">CQ</button><button id="jp-wanted-filter" class="jtcat-filter-btn" title="Show only needed DXCC/grid/call">Wanted</button><button id="jp-sort-signal" class="jtcat-filter-btn" title="Sort by signal strength (strongest first)">dB</button><button id="jp-clear" class="jtcat-filter-btn" title="Clear all decodes">Clear</button></div></div>
         <div id="jp-band-activity" class="jp-decode-list">
           <div class="jp-empty">Waiting for decodes...</div>
         </div>
