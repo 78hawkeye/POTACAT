@@ -334,8 +334,6 @@ const GLOBAL_KEYS = new Set([
   'profiles',          // (reserved — currently unused but reserved against name collision)
   'rigs',              // rig hardware definitions
   'activeRigId',       // last-selected rig (global default)
-  'pairedDevices',     // ECHOCAT paired-device tokens
-  'cloudTunnelToken',  // CF Tunnel credential (machine-scoped)
   'firstRun',          // first-time-launch flag
   'piAccess',          // easter egg unlock
   'lightMode',         // theme
@@ -350,11 +348,66 @@ const GLOBAL_KEYS = new Set([
   'enableEchoCat',     // ECHOCAT server enable (machine-level)
 ]);
 
+const CLOUD_TUNNEL_CONFIG_FILENAME = 'cloud-tunnel.json';
+
 function profileDir(callsign) {
   return path.join(PROFILES_DIR, String(callsign || '').toUpperCase());
 }
 function profileSettingsPath(callsign) {
   return path.join(profileDir(callsign), 'settings.json');
+}
+function profileCloudTunnelPath(callsign) {
+  const call = String(callsign || '').toUpperCase().trim();
+  return call
+    ? path.join(profileDir(call), CLOUD_TUNNEL_CONFIG_FILENAME)
+    : path.join(app.getPath('userData'), CLOUD_TUNNEL_CONFIG_FILENAME);
+}
+
+function inferCallsignFromCloudHost(host) {
+  const firstLabel = String(host || '').trim().split(':')[0].split('.')[0].toUpperCase();
+  return /^[A-Z0-9/]{3,12}$/.test(firstLabel) ? firstLabel : '';
+}
+
+function migrateLegacyCloudTunnelConfig(settingsObj) {
+  const legacyPath = path.join(app.getPath('userData'), CLOUD_TUNNEL_CONFIG_FILENAME);
+  if (!fs.existsSync(legacyPath)) return;
+  let cfg = null;
+  try {
+    cfg = JSON.parse(fs.readFileSync(legacyPath, 'utf8'));
+  } catch (err) {
+    console.log('[cloud-tunnel] legacy config parse failed; leaving shared file in place: ' + (err.message || err));
+    return;
+  }
+
+  const activeCall = String((settingsObj && (settingsObj.activeProfile || settingsObj.myCallsign)) || '').toUpperCase().trim();
+  const hostCall = inferCallsignFromCloudHost(cfg.cloudHost);
+  let ownerCall = '';
+  if (hostCall && fs.existsSync(profileDir(hostCall))) ownerCall = hostCall;
+  else if (activeCall && (!hostCall || hostCall === activeCall)) ownerCall = activeCall;
+
+  if (!ownerCall) {
+    console.log('[cloud-tunnel] legacy shared tunnel has no matching operator profile; leaving it inactive at ' + legacyPath);
+    return;
+  }
+
+  const destPath = profileCloudTunnelPath(ownerCall);
+  try {
+    fs.mkdirSync(path.dirname(destPath), { recursive: true });
+    if (!fs.existsSync(destPath)) {
+      fs.copyFileSync(legacyPath, destPath);
+      try { fs.chmodSync(destPath, 0o600); } catch {}
+      console.log('[cloud-tunnel] migrated shared tunnel config to profiles/' + ownerCall + '/' + CLOUD_TUNNEL_CONFIG_FILENAME);
+    }
+    const archivedPath = legacyPath + '.legacy';
+    try {
+      if (!fs.existsSync(archivedPath)) fs.renameSync(legacyPath, archivedPath);
+      else fs.unlinkSync(legacyPath);
+    } catch (err) {
+      console.log('[cloud-tunnel] could not archive legacy shared tunnel config: ' + (err.message || err));
+    }
+  } catch (err) {
+    console.log('[cloud-tunnel] legacy config migration failed: ' + (err.message || err));
+  }
 }
 
 function _readJsonSafe(p, fallback) {
@@ -14528,6 +14581,7 @@ app.whenReady().then(() => {
       console.error('[multi-op] migration failed:', err.message);
     }
   }
+  migrateLegacyCloudTunnelConfig(settings);
   logStartupStage('settings loaded');
   if (settings.colorblindMode) {
     setSmartSdrColorblind(true);
@@ -14689,6 +14743,7 @@ app.whenReady().then(() => {
     const { safeStorage } = require('electron');
     cloudTunnel = new CloudTunnelManager({
       userDataPath: app.getPath('userData'),
+      configPath: profileCloudTunnelPath(settings.activeProfile || settings.myCallsign),
       getCloudSync: () => (cloudIpc ? cloudIpc.getCloudSync() : null),
       getCloudflaredPath: resolveCloudflaredPath,
       log: (msg) => sendCatLog(msg),

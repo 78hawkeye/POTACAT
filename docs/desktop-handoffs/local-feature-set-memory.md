@@ -615,14 +615,49 @@ Commit:
 
 - `daef4e7 Handle mDNS bind errors without crashing`
 
+### ECHOCAT Cloud Tunnel Operator Isolation
+
+`v1.8.5.6` changes the POTACAT Cloud Tunnel from a shared machine-level file to a profile-scoped file:
+
+- Old/shared path: `~/Library/Application Support/POTACAT/cloud-tunnel.json`
+- New/operator path: `~/Library/Application Support/POTACAT/profiles/<CALL>/cloud-tunnel.json`
+
+Why this matters:
+
+- The Summary/ECHOCAT card used to show a green Cloud Tunnel for every operator if the station computer had one live tunnel.
+- That meant WD4DRA could appear to have `w4lab.potacat.com` configured even though the tunnel belonged to W4LAB's cloud account.
+- This conflicted with the multi-operator design promise that each operator has their own Cloud account/tunnel identity.
+
+Implementation notes:
+
+- `lib/cloud-tunnel.js` now accepts an explicit `configPath`.
+- `main.js` passes `profileCloudTunnelPath(settings.activeProfile || settings.myCallsign)` when constructing `CloudTunnelManager`.
+- Startup runs `migrateLegacyCloudTunnelConfig(settings)` once. It infers the owner from the first label of `cloudHost`, so `w4lab.potacat.com` migrates to `profiles/W4LAB/cloud-tunnel.json` even if another profile is currently active.
+- The old shared file is archived as `cloud-tunnel.json.legacy` after a successful migration.
+- `pairedDevices` and legacy `cloudTunnelToken` were removed from `GLOBAL_KEYS`, so future ECHOCAT pairings/token-like settings save operator-scoped instead of globally.
+
+Validation on K3SBP Mac:
+
+- Active profile was `WD4DRA`.
+- Existing shared tunnel was `w4lab.potacat.com`.
+- After first `v1.8.5.6` launch:
+  - `profiles/W4LAB/cloud-tunnel.json` exists and is enabled.
+  - `profiles/WD4DRA/cloud-tunnel.json` does not exist.
+  - shared `cloud-tunnel.json` no longer exists.
+  - shared `cloud-tunnel.json.legacy` exists as a safety archive.
+
+Regression guard:
+
+- `test/cloud-tunnel.test.js` verifies `CloudTunnelManager` persists to an explicit profile-scoped `configPath` instead of the shared app folder.
+
 ### Local Build / Deploy Practice
 
 Current local deployed build after this cycle:
 
-- `v1.8.5.5`
+- `v1.8.5.6`
 - Branch: `codex/merge-upstream-v1.8.4`
 - GitHub fork: `78hawkeye/POTACAT`
-- Latest relevant commit: `6ef024a Cleanly release RS-BA1 on operator switch`
+- Latest relevant commit before this note: `6ef024a Cleanly release RS-BA1 on operator switch`
 
 Deployment pattern remains:
 
