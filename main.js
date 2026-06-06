@@ -468,8 +468,9 @@ function switchProfile(callsign) {
   // against the new operator's settings) is a follow-up — too many cached
   // subsystems to chase down in one PR. Restart is one click and
   // guarantees correctness.
+  let currentProfile = '';
   try {
-    const currentProfile = settings.activeProfile;
+    currentProfile = settings.activeProfile;
     saveSettings(settings);
     setActiveProfilePointer(call);
     settings.activeProfile = call;
@@ -479,7 +480,42 @@ function switchProfile(callsign) {
   } catch (err) {
     return { ok: false, error: 'Failed to save before switching: ' + err.message };
   }
-  return { ok: true, callsign: call, restartRequired: true };
+  return { ok: true, callsign: call, previousCallsign: currentProfile || '', restartRequired: true };
+}
+
+let _profileSwitchRelaunchPending = false;
+async function prepareProfileSwitchRelaunch(fromCall, toCall) {
+  if (_profileSwitchRelaunchPending) return;
+  _profileSwitchRelaunchPending = true;
+  const label = `[multi-op] preparing clean profile switch ${fromCall || '?'} -> ${toCall || '?'}`;
+  try { appendIcomNetworkDiagnostic(label); } catch {}
+  try { sendCatLog(label); } catch {}
+
+  clearIcomNetworkConnectRetry(true);
+  try { handleRemotePtt(false, { source: 'profile-switch' }); } catch {}
+  try { if (_icomNetworkTransport) _icomNetworkTransport.cancelTx(); } catch {}
+  try { await restoreIcomNetworkDataMod('operator switch'); } catch (err) {
+    try { appendIcomNetworkDiagnostic(`[multi-op] DATA MOD restore before switch failed: ${err.message || err}`); } catch {}
+  }
+  try { stopIcomNetworkRxWatchdog(); } catch {}
+  try { resetIcomNetworkRxPacer('profile switch'); } catch {}
+  try {
+    if (cat) {
+      cat.removeAllListeners();
+      cat.disconnect();
+      cat = null;
+    }
+  } catch (err) {
+    try { appendIcomNetworkDiagnostic(`[multi-op] CAT disconnect before switch failed: ${err.message || err}`); } catch {}
+  }
+  _icomNetworkTransport = null;
+  try { sendCatStatus({ connected: false, target: null }); } catch {}
+
+  // RS-BA1 disconnect packets are sent over UDP just before socket close.
+  // Give them time to leave this process and give the radio a short release
+  // window before the relaunched instance starts its startup-delay reconnect.
+  await new Promise(r => setTimeout(r, ICOM_NETWORK_PROFILE_SWITCH_RELEASE_DELAY_MS));
+  try { appendIcomNetworkDiagnostic(`[multi-op] clean profile switch release complete after ${ICOM_NETWORK_PROFILE_SWITCH_RELEASE_DELAY_MS}ms`); } catch {}
 }
 
 function archiveProfile(callsign) {
@@ -679,6 +715,7 @@ const ICOM_NETWORK_TUNE_START_DELAY_MS = 200;
 const ICOM_NETWORK_TUNE_PEAK = 0.45;
 const DEFAULT_ICOM_NETWORK_TX_GAIN = 0.72;
 const ICOM_NETWORK_TX_AUDIO_ENABLED = true;
+const ICOM_NETWORK_PROFILE_SWITCH_RELEASE_DELAY_MS = 1200;
 let _jtcatDirectTxGainLevel = DEFAULT_JTCAT_TX_GAIN;
 let spotTimer = null;
 let solarTimer = null;
@@ -2128,9 +2165,10 @@ function isRetriableIcomNetworkConnectError(err) {
     'RSBA1_CONTROL_AUTH_TIMEOUT',
     'RSBA1_HANDSHAKE_TIMEOUT',
     'RSBA1_LOCAL_PORT_FAILED',
+    'RSBA1_STATUS_REJECTED',
   ].includes(code)) return true;
   const message = String((err && err.message) || err || '');
-  return /EHOSTUNREACH|ENETUNREACH|timed out|no reply from the radio|before IAmHere/i.test(message);
+  return /EHOSTUNREACH|ENETUNREACH|timed out|no reply from the radio|before IAmHere|rejected stream request|status error/i.test(message);
 }
 
 function scheduleIcomNetworkConnectRetry(err, targetKey = icomNetworkTargetKey()) {
@@ -5731,28 +5769,39 @@ class IcomNetworkRxPacer {
 
   _tick() {
     const frameSamples = Math.max(1, Math.round(this.sampleRate * this.frameMs / 1000));
-    if (this.buffering) {
-      if (this.bufferedMs() < this.targetBufferMs) {
-        this._emitSilence(frameSamples, true);
-        return;
+    const now = Date.now();
+
+    // Emit catch-up frames when the event loop fired this tick late. Without
+    // this, a 80-180ms Node.js GC/render lag causes the worklet ring buffer to
+    // drain and underrun because only one frame is sent for multiple periods.
+    const elapsed = this._lastTickMs ? now - this._lastTickMs : this.frameMs;
+    this._lastTickMs = now;
+    const catchUpFrames = Math.min(4, Math.max(1, Math.round(elapsed / this.frameMs)));
+
+    for (let f = 0; f < catchUpFrames; f++) {
+      if (this.buffering) {
+        if (this.bufferedMs() < this.targetBufferMs) {
+          this._emitSilence(frameSamples, true);
+          continue;
+        }
+        this.buffering = false;
+        appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-PACER ${this.started ? 'resume' : 'start'} bufferedMs=${this.bufferedMs().toFixed(0)} targetMs=${this.targetBufferMs}`);
+        this.started = true;
       }
-      this.buffering = false;
-      appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-PACER ${this.started ? 'resume' : 'start'} bufferedMs=${this.bufferedMs().toFixed(0)} targetMs=${this.targetBufferMs}`);
-      this.started = true;
-    }
 
-    if (this.totalSamples < frameSamples) {
-      this.underruns++;
-      appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-PACER underrun bufferedMs=${this.bufferedMs().toFixed(0)} underruns=${this.underruns}`);
-      this.buffering = true;
-      this.targetBufferMs = this.resumeBufferMs;
-      this._emitSilence(frameSamples, true);
-      return;
-    }
+      if (this.totalSamples < frameSamples) {
+        this.underruns++;
+        appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-PACER underrun bufferedMs=${this.bufferedMs().toFixed(0)} underruns=${this.underruns}`);
+        this.buffering = true;
+        this.targetBufferMs = this.resumeBufferMs;
+        this._emitSilence(frameSamples, true);
+        break;
+      }
 
-    const pcm = this._consumeSamples(frameSamples);
-    this.framesOut++;
-    if (this.onFrame) this.onFrame(pcm, this.sampleRate, { silence: false, bufferedMs: this.bufferedMs() });
+      const pcm = this._consumeSamples(frameSamples);
+      this.framesOut++;
+      if (this.onFrame) this.onFrame(pcm, this.sampleRate, { silence: false, bufferedMs: this.bufferedMs() });
+    }
   }
 
   _emitSilence(frameSamples, buffering) {
@@ -5819,11 +5868,11 @@ let _icomNetworkJtcatUiPeak = 0;
 let _icomNetworkJtcatReadyNudgeMs = 0;
 const ICOM_NETWORK_JTCAT_UI_FRAME_MS = 20;
 const ICOM_NETWORK_RX_PACER_FRAME_MS = 20;
-const ICOM_NETWORK_RX_PACER_START_MS = 2400;
-const ICOM_NETWORK_RX_PACER_RESUME_MS = 1400;
+const ICOM_NETWORK_RX_PACER_START_MS = 1000;
+const ICOM_NETWORK_RX_PACER_RESUME_MS = 500;
 const ICOM_NETWORK_RX_PACER_MAX_MS = 5400;
 const ICOM_NETWORK_RX_STALL_MS = 1200;
-const ICOM_NETWORK_RX_RESTART_STALL_MS = 30000;
+const ICOM_NETWORK_RX_RESTART_STALL_MS = 8000;
 const ICOM_NETWORK_RX_RECOVERY_COOLDOWN_MS = 2500;
 const ICOM_NETWORK_RX_LOSSFILL_MAX_MS = 240;
 const ICOM_NETWORK_RX_LOSSFILL_MAX_ARRIVAL_GAP_MS = 120;
@@ -18790,8 +18839,14 @@ app.whenReady().then(() => {
       // operator's settings. setImmediate gives the IPC response time
       // to land in the renderer before the window goes away.
       setImmediate(() => {
-        app.relaunch();
-        app.exit(0);
+        prepareProfileSwitchRelaunch(r.previousCallsign, r.callsign)
+          .catch((err) => {
+            try { appendIcomNetworkDiagnostic(`[multi-op] profile switch cleanup error: ${err.message || err}`); } catch {}
+          })
+          .finally(() => {
+            app.relaunch();
+            app.exit(0);
+          });
       });
     }
     return r;
