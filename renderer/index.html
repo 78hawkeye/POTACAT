@@ -146,60 +146,7 @@
         </div>
       </div>
       <button id="scan-btn" title="Scan through spots">Scan</button>
-      <div class="multi-dropdown" id="settings-dropdown">
-        <button class="multi-dropdown-btn" type="button" id="settings-btn" title="Settings">Settings</button>
-        <div class="settings-dropdown-panel">
-          <label class="switch-label compact">
-            <span>Dark</span>
-            <div class="switch"><input type="checkbox" id="quick-light-mode"><span class="switch-slider"></span></div>
-            <span>Light</span>
-          </label>
-          <div class="spots-panel-divider"></div>
-          <label class="switch-label compact">
-            <span>Hunter</span>
-            <div class="switch"><input type="checkbox" id="quick-activator-mode"><span class="switch-slider"></span></div>
-            <span>Activator</span>
-          </label>
-          <div class="spots-panel-divider"></div>
-          <div class="echo-cat-quick">
-            <div class="echo-cat-quick-title">ECHOCAT</div>
-            <div id="echo-cat-info" class="echo-cat-info">
-              <div class="echo-cat-url-row">
-                <div class="echo-cat-url" id="echo-cat-url"></div>
-                <button type="button" id="echo-cat-copy-url" class="echo-cat-copy-icon" title="Copy URL">&#x1F4CB;</button>
-              </div>
-              <div class="echo-cat-https-note">You must use https:// — http:// will not work</div>
-              <div class="echo-cat-token-row">
-                <span class="echo-cat-token-label">Token:</span>
-                <span class="echo-cat-token-value" id="echo-cat-token"></span>
-                <button type="button" id="echo-cat-copy" class="echo-cat-copy-btn" title="Copy connection info">Copy All</button>
-              </div>
-              <div class="echo-cat-audio-section">
-                <div class="echo-cat-audio-label">Audio</div>
-                <div class="echo-cat-audio-row">
-                  <span class="echo-cat-audio-icon" title="Radio RX to phone">&#x1F50A;</span>
-                  <select id="quick-audio-input" class="echo-cat-audio-select"><option value="">System Default</option></select>
-                </div>
-                <div class="echo-cat-audio-row">
-                  <span class="echo-cat-audio-icon" title="Phone to radio TX">&#x1F3A4;</span>
-                  <select id="quick-audio-output" class="echo-cat-audio-select"><option value="">System Default</option></select>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="spots-panel-divider"></div>
-          <label class="spots-toggle compact"><input type="checkbox" id="quick-hide-worked-parks"> Hide Worked Parks</label>
-          <button type="button" id="quick-import-logs-btn" class="settings-dropdown-link" style="font-size:11px;padding:4px 6px;margin:2px 0 4px;color:var(--text-secondary);" title="Import ADIF/SQLite logs from N3FJP, HRD, HAMRS, Log4OM, etc. — populates the Worked Parks filter">Import existing logs…</button>
-          <label class="spots-toggle compact"><input type="checkbox" id="quick-show-meter" checked> S-Meter / SWR</label>
-          <label class="spots-toggle compact"><input type="checkbox" id="quick-show-cw-macros"> CW Macros</label>
-          <label class="spots-toggle compact"><input type="checkbox" id="quick-show-voice-macros"> Voice Macros</label>
-          <div id="quick-rotor-divider" class="spots-panel-divider hidden"></div>
-          <label id="quick-rotor-label" class="spots-toggle compact hidden"><input type="checkbox" id="quick-rotor"> PSTRotator</label>
-          <div class="spots-panel-divider"></div>
-          <button type="button" id="report-bug-btn" class="settings-dropdown-link" style="color:#c24150;" title="Captures a verbose log and builds a bug report for Discord #bug-report">🐞 Report a Bug</button>
-          <button type="button" id="open-settings-btn" class="settings-dropdown-link">Open Settings...</button>
-        </div>
-      </div>
+      <button type="button" id="settings-btn" title="Settings">Settings</button>
       <button id="logbook-btn" title="View/Edit Logbook (F2)">Logbook</button>
       <div class="view-toggle">
         <button id="view-table-btn" class="view-btn active" title="Table view">Table</button>
@@ -216,6 +163,9 @@
             <button class="view-menu-item" id="cluster-terminal-btn">Terminal</button>
             <button class="view-menu-item" id="view-directory-btn">SWL/HF Net Directory</button>
             <button class="view-menu-item" id="view-conditions-btn" title="Open Solar &amp; Propagation Conditions in a new window">Conditions &#x2197;</button>
+            <div class="view-menu-divider"></div>
+            <button class="view-menu-item" id="quick-activator-mode" title="Switch to Activator mode (rapid logging for park activations). Return via the Back to Hunter button in the Activator UI.">Activator mode</button>
+            <button class="view-menu-item" id="view-remote-radios-btn" title="Manage paired shacks — switch this desktop between local rig and remote shacks.">Remote Radios&hellip;</button>
           </div>
         </div>
         <button id="vfo-popout-btn" class="view-btn" title="VFO — Frequency dial, keypad, modes, profiles">VFO</button>
@@ -224,6 +174,11 @@
     <div class="status-bar">
       <span id="utc-clock" class="utc-clock"></span>
       <span id="cat-status" class="status disconnected">CAT</span>
+      <!-- Active remote shack indicator (v1.9 desktop-to-desktop).
+           Hidden when activeTargetId is null; shown when this desktop
+           is acting as a client to a paired shack. Click opens the
+           Remote Radios dialog for quick disconnect / switch. -->
+      <span id="remote-shack-status" class="status hidden" style="background:#4ecca3;color:#0a1a14;cursor:pointer;" title="Active remote shack — click to manage">REMOTE</span>
       <!-- Split-mode indicator. Hidden by default; shown when settings.enableSplit
            is true. Click to disable (asks for confirmation since some operators
            do use split legitimately). KQ4MHD report 2026-04-30. -->
@@ -264,13 +219,44 @@
             <button id="rig-anf-btn" class="rig-btn" title="Auto Notch Filter">ANF</button>
             <button id="rig-vox-btn" class="rig-btn" title="Voice-Operated Transmit">VOX</button>
           </div>
+          <div class="rig-popover-row" id="rig-rfgain-row">
+            <label>RF Gain</label>
+            <input type="range" id="rig-rfgain" min="0" max="100" value="0" style="flex:1;accent-color:#4ecca3;">
+            <span id="rig-rfgain-label">0</span>
+          </div>
+          <div class="rig-popover-row" id="rig-txpower-row">
+            <label>TX Power</label>
+            <input type="range" id="rig-txpower" min="0" max="100" value="0" style="flex:1;accent-color:#4ecca3;">
+            <select id="rig-txpower-select" class="hidden" style="flex:1;background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border-secondary);padding:2px 4px;font-size:12px;"></select>
+            <span id="rig-txpower-label">0W</span>
+          </div>
+          <div class="rig-popover-row" id="rig-preamp-target-row">
+            <label>Pre Target</label>
+            <select id="rig-preamp-target-select" style="flex:1;background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border-secondary);padding:2px 4px;font-size:12px;">
+              <option value="hf50">HF / 50 MHz</option>
+              <option value="vhf">VHF</option>
+              <option value="uhf">UHF</option>
+            </select>
+            <select id="rig-preamp-level-select" title="Preamp level - IPO bypass, AMP1, AMP2 (HF/50 only)" style="background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border-secondary);padding:2px 4px;font-size:12px;">
+              <option value="0">IPO</option>
+              <option value="1">AMP1</option>
+              <option value="2">AMP2</option>
+            </select>
+          </div>
+          <div class="rig-popover-row" id="rig-antenna-port-row">
+            <label>HF Ant</label>
+            <select id="rig-antenna-port-select" title="FTX-1 Optima HF antenna port" style="flex:1;background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border-secondary);padding:2px 4px;font-size:12px;">
+              <option value="1">ANT 1</option>
+              <option value="2">ANT 2</option>
+            </select>
+          </div>
           <div class="rig-popover-row" id="rig-agc-row">
             <label>AGC</label>
             <select id="rig-agc-select" style="flex:1;background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border-secondary);padding:2px 4px;font-size:12px;">
               <option value="">—</option>
               <option value="off">Off</option>
               <option value="fast">Fast</option>
-              <option value="med">Medium</option>
+              <option value="med">Mid</option>
               <option value="slow">Slow</option>
             </select>
           </div>
@@ -314,8 +300,8 @@
           </div>
           <div class="rig-popover-row" id="rig-dnrlevel-row">
             <label>DNR Lvl</label>
-            <input type="range" id="rig-dnrlevel" min="1" max="15" value="1" style="flex:1;accent-color:#4ecca3;">
-            <span id="rig-dnrlevel-label">1</span>
+            <input type="range" id="rig-dnrlevel" min="0" max="10" value="0" style="flex:1;accent-color:#4ecca3;">
+            <span id="rig-dnrlevel-label">0</span>
           </div>
           <div class="rig-popover-row rig-popover-buttons" id="rig-clar-row">
             <button id="rig-clarrx-btn" class="rig-btn" title="CLAR RX — enable the receive clarifier (offset RX only)">CLAR RX</button>
@@ -346,29 +332,6 @@
               <option value="2000">2000 ms</option>
               <option value="3000">3000 ms</option>
             </select>
-          </div>
-          <div class="rig-popover-row" id="rig-preamp-target-row">
-            <label>Pre Target</label>
-            <select id="rig-preamp-target-select" style="flex:1;background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border-secondary);padding:2px 4px;font-size:12px;">
-              <option value="hf50">HF / 50 MHz</option>
-              <option value="vhf">VHF</option>
-              <option value="uhf">UHF</option>
-            </select>
-            <select id="rig-preamp-level-select" title="Preamp level — IPO bypass, AMP1, AMP2 (HF/50 only)" style="background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border-secondary);padding:2px 4px;font-size:12px;">
-              <option value="0">IPO</option>
-              <option value="1">AMP1</option>
-              <option value="2">AMP2</option>
-            </select>
-          </div>
-          <div class="rig-popover-row">
-            <label>RF Gain</label>
-            <input type="range" id="rig-rfgain" min="0" max="100" value="0" style="flex:1;accent-color:#4ecca3;">
-            <span id="rig-rfgain-label">0</span>
-          </div>
-          <div class="rig-popover-row">
-            <label>TX Power</label>
-            <input type="range" id="rig-txpower" min="0" max="100" value="0" style="flex:1;accent-color:#4ecca3;">
-            <span id="rig-txpower-label">0W</span>
           </div>
           <div class="rig-popover-row">
             <label>Filter</label>
@@ -673,6 +636,19 @@
           <input type="text" id="bl-notes" class="bl-field bl-notes" placeholder="Notes" maxlength="80" spellcheck="false">
           <label class="bl-respot-label" id="bl-respot-label"><input type="checkbox" id="bl-respot" checked> Spot</label>
           <button type="button" id="bl-log-btn" class="bl-log-btn">Log</button>
+          <!-- Second line — station info pulled from QRZ on callsign
+               input. Grid square + great-circle distance + beam
+               heading from the operator's QTH. ALWAYS visible (no
+               appear/disappear jump per Casey 2026-06-04). Location
+               is intentionally NOT here — it's already in the Name
+               field. KM4CFT request 2026-05-26. -->
+          <div id="bl-station-info" class="bl-station-info">
+            <span class="bl-info-label">Station:</span>
+            <span id="bl-info-placeholder" class="bl-info-placeholder">Type a callsign to see grid, distance, and heading.</span>
+            <span id="bl-info-grid" class="bl-info-chip bl-info-grid"></span>
+            <span id="bl-info-distance" class="bl-info-chip"></span>
+            <span id="bl-info-heading" class="bl-info-chip bl-info-heading"></span>
+          </div>
         </div>
       </div>
       <div id="split-splitter" class="hidden"></div>
@@ -1125,6 +1101,18 @@
         <button type="button" class="settings-tab" data-tab="network">ECHOCAT</button>
         <button type="button" class="settings-tab" data-tab="display">Display</button>
         <button type="button" class="settings-tab" data-tab="cloud">Cloud</button>
+        <!-- Theme switch — sticks to the bottom-section of the
+             sidebar above Report a Bug. Labeled "Light Mode" when on,
+             "Dark Mode" when off so the current state is obvious
+             without having to flip and see what changes. -->
+        <label class="settings-tab-theme-toggle" title="Toggle dark / light theme">
+          <span class="switch"><input type="checkbox" id="quick-light-mode"><span class="switch-slider"></span></span>
+          <span class="settings-tab-theme-label" id="quick-light-mode-label">Dark Mode</span>
+        </label>
+        <!-- Action button styled like a tab, sits at the bottom of
+             the sidebar nav. Doesn't switch tabs — fires the
+             existing report-bug-btn click handler (Discord template). -->
+        <button type="button" class="settings-tab settings-tab-action" id="report-bug-btn" title="Captures a verbose log and builds a bug report for Discord #bug-report">🐞 Report a Bug</button>
       </div>
       <input type="text" id="settings-search" class="settings-search" placeholder="Search settings...">
     </div>
@@ -1218,6 +1206,82 @@
                 </label>
               </div>
               <div class="summary-help">Full keyer options (mode, paddles, MIDI/WinKeyer setup) live under Settings &rarr; Station &rarr; CW Keyer.</div>
+            </div>
+          </details>
+
+          <!-- Display — surfaced/hidden panels operators flip mid-session.
+               These were in the (now-removed) main-toolbar Settings
+               dropdown. IDs preserved so the existing event handlers
+               keep firing without any wire-up change. -->
+          <details class="summary-quick-section">
+            <summary class="summary-quick-summary">
+              <span>Display</span>
+              <span class="summary-quick-state" id="quick-display-state"></span>
+            </summary>
+            <div class="summary-quick-body">
+              <label class="summary-quick-row">
+                <input type="checkbox" id="quick-show-meter" checked>
+                <span>S-Meter / SWR</span>
+              </label>
+              <label class="summary-quick-row">
+                <input type="checkbox" id="quick-show-cw-macros">
+                <span>CW Macros</span>
+              </label>
+              <label class="summary-quick-row">
+                <input type="checkbox" id="quick-show-voice-macros">
+                <span>Voice Macros</span>
+              </label>
+              <label class="summary-quick-row">
+                <input type="checkbox" id="quick-hide-worked-parks">
+                <span>Hide Worked Parks</span>
+              </label>
+              <!-- PSTRotator: hidden until configured under Settings &rarr;
+                   Tuning. quickRotorLabel.classList.toggle('hidden', !rotorConfigured)
+                   in app.js continues to drive visibility. -->
+              <label class="summary-quick-row hidden" id="quick-rotor-label">
+                <input type="checkbox" id="quick-rotor">
+                <span>PSTRotator</span>
+              </label>
+              <!-- Vestigial divider element preserved for any code that
+                   toggles it alongside the rotor label. -->
+              <div id="quick-rotor-divider" class="hidden"></div>
+            </div>
+          </details>
+
+          <!-- ECHOCAT web access — relocated from the main-toolbar Settings
+               dropdown. Same IDs, same JS handlers. -->
+          <details class="summary-quick-section">
+            <summary class="summary-quick-summary">
+              <span>ECHOCAT web access</span>
+              <span class="summary-quick-state" id="quick-echocat-state"></span>
+            </summary>
+            <div class="summary-quick-body">
+              <div class="echo-cat-quick">
+                <div id="echo-cat-info" class="echo-cat-info">
+                  <div class="echo-cat-url-row">
+                    <div class="echo-cat-url" id="echo-cat-url"></div>
+                    <button type="button" id="echo-cat-copy-url" class="echo-cat-copy-icon" title="Copy URL">&#x1F4CB;</button>
+                  </div>
+                  <div class="echo-cat-https-note">You must use https:// — http:// will not work</div>
+                  <div class="echo-cat-token-row">
+                    <span class="echo-cat-token-label">Token:</span>
+                    <span class="echo-cat-token-value" id="echo-cat-token"></span>
+                    <button type="button" id="echo-cat-copy" class="echo-cat-copy-btn" title="Copy connection info">Copy All</button>
+                  </div>
+                  <div class="echo-cat-audio-section">
+                    <div class="echo-cat-audio-label">Audio</div>
+                    <div class="echo-cat-audio-row">
+                      <span class="echo-cat-audio-icon" title="Radio RX to phone">&#x1F50A;</span>
+                      <select id="quick-audio-input" class="echo-cat-audio-select"><option value="">System Default</option></select>
+                    </div>
+                    <div class="echo-cat-audio-row">
+                      <span class="echo-cat-audio-icon" title="Phone to radio TX">&#x1F3A4;</span>
+                      <select id="quick-audio-output" class="echo-cat-audio-select"><option value="">System Default</option></select>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="summary-help">Browser-based ECHOCAT (no phone app). Use the URL + token on a phone/tablet on your LAN. The mobile app uses the Pair flow instead.</div>
             </div>
           </details>
         </div>
@@ -2625,6 +2689,8 @@
             </div>
             <label class="checkbox-label" style="margin-top:6px;"><input type="checkbox" id="set-remote-stun"> Enable STUN (audio without VPN)</label>
             <span class="help-text" style="margin-left:12px;display:block;">Uses Google's public STUN server to discover your public IP, enabling WebRTC audio across the internet without a VPN. Only needed if you can't use Tailscale or both devices aren't on the same network.</span>
+            <label class="checkbox-label" style="margin-top:8px;"><input type="checkbox" id="set-allow-pair-requests" checked> Allow tap-to-pair from the local network</label>
+            <span class="help-text" style="margin-left:12px;display:block;">When the POTACAT mobile app sees your desktop on the LAN, tapping the discovered card sends a pair request and pops an Approve/Deny window here. Turn off if you share a network with strangers (libraries, coffee shops). POTACAT Cloud Tunnel exposure always blocks tap-to-pair regardless of this switch.</span>
           </div>
           <div>
             <label for="set-echocat-pair-host" style="font-size:12px;font-weight:600;display:block;margin-bottom:3px;">Pair host override</label>
@@ -2957,23 +3023,54 @@
   <dialog id="share-rig-dialog">
     <h3 style="display:flex;justify-content:space-between;align-items:baseline;">Share Your Rig <span style="font-size:11px;font-weight:normal;color:#666;">ESC to close</span></h3>
     <div id="share-rig-form-view">
-      <!-- Network-reach notice. Populated by _shareRigUpdateReachNotice()
-           based on cloud-tunnel + Tailscale state. Hidden when the
-           Cloud Tunnel is live (the unrestricted reach case). -->
-      <div id="share-rig-reach-notice" class="share-rig-notice hidden"></div>
-      <p class="share-rig-intro">Generate a time-boxed access pass for a friend. POTACAT enforces the privilege class, power cap, and expiry on this end — out-of-band tunes are blocked, TX power is clamped, the session auto-ends when the timer runs out.</p>
+      <!-- Network-reach notice. Always visible — leads the dialog so
+           the operator sees the share-scope boundary BEFORE filling
+           in privileges, power, and dates. Populated by
+           _shareRigUpdateReachNotice() based on cloud-tunnel +
+           Tailscale state. -->
+      <div id="share-rig-reach-notice" class="share-rig-notice"></div>
+      <p class="share-rig-intro">Generate a time-boxed access pass for someone else. POTACAT enforces the privilege class, power cap, and expiry on this end — out-of-band tunes are blocked, TX power is clamped, the session auto-ends when the timer runs out.</p>
 
       <div class="share-rig-section">
-        <div class="share-rig-section-title">Duration</div>
-        <div class="share-rig-presets" id="share-rig-duration-presets">
-          <button type="button" class="share-rig-preset" data-hours="1">1 hour</button>
-          <button type="button" class="share-rig-preset" data-hours="4">4 hours</button>
-          <button type="button" class="share-rig-preset active" data-hours="24">1 day</button>
-          <button type="button" class="share-rig-preset" data-hours="168">7 days</button>
+        <div class="share-rig-section-title">When?</div>
+        <div class="share-rig-when-mode">
+          <label class="share-rig-when-option">
+            <input type="radio" name="share-rig-when" value="now" checked>
+            <span>
+              <span class="share-rig-when-title">Starts now</span>
+              <span class="share-rig-when-sub">Active immediately, for the length you pick below.</span>
+            </span>
+          </label>
+          <label class="share-rig-when-option">
+            <input type="radio" name="share-rig-when" value="schedule">
+            <span>
+              <span class="share-rig-when-title">Schedule for later</span>
+              <span class="share-rig-when-sub">Pick exact start and end times — e.g. Saturday 8&ndash;10 pm.</span>
+            </span>
+          </label>
         </div>
-        <div class="share-rig-row">
-          <label>Custom: <input type="number" id="share-rig-custom-hours" min="1" max="720" value="24" class="share-rig-num"> hours</label>
-          <span class="help-text">Max 720 (30 days). Most operators email the link, so longer is fine.</span>
+
+        <!-- "Starts now" sub-form: duration presets + custom hours -->
+        <div class="share-rig-when-now" id="share-rig-when-now">
+          <div class="share-rig-presets" id="share-rig-duration-presets">
+            <button type="button" class="share-rig-preset" data-hours="1">1 hour</button>
+            <button type="button" class="share-rig-preset" data-hours="4">4 hours</button>
+            <button type="button" class="share-rig-preset active" data-hours="24">1 day</button>
+            <button type="button" class="share-rig-preset" data-hours="168">7 days</button>
+          </div>
+          <div class="share-rig-row">
+            <label>Custom: <input type="number" id="share-rig-custom-hours" min="1" max="720" value="24" class="share-rig-num"> hours</label>
+            <span class="help-text">Max 720 (30 days). Most operators email the link, so longer is fine.</span>
+          </div>
+        </div>
+
+        <!-- "Schedule for later" sub-form: two datetime-local pickers -->
+        <div class="share-rig-when-schedule hidden" id="share-rig-when-schedule">
+          <div class="share-rig-row share-rig-when-pair">
+            <label>Starts <input type="datetime-local" id="share-rig-starts-at"></label>
+            <label>Ends <input type="datetime-local" id="share-rig-ends-at"></label>
+          </div>
+          <span class="help-text" id="share-rig-when-schedule-help">Local time. Window must be at least 1 minute and at most 30 days.</span>
         </div>
       </div>
 
@@ -3021,6 +3118,17 @@
         <span class="help-text">POTACAT writes whatever you set into the QSO's ADIF — see <a href="https://www.ecfr.gov/current/title-47/chapter-I/subchapter-D/part-97/subpart-B/section-97.119" id="share-rig-97119-link" data-external="1" class="share-rig-extlink">&sect;97.119</a>. We don't interpret the rule for you.</span>
       </div>
 
+      <div class="share-rig-section">
+        <div class="share-rig-section-title">Sign-in requirement</div>
+        <label class="share-rig-anon-row">
+          <input type="checkbox" id="share-rig-allow-anonymous">
+          <span>
+            <span class="share-rig-anon-title">Allow without a POTACAT Cloud sign-in</span>
+            <span class="share-rig-anon-sub">By default, your friend needs a free POTACAT Cloud account to redeem. Tick this for one-off guests who can't sign up (Field Day visitor, club net rotation, etc.). <b>Weaker §97.119 audit trail</b> — the QSO log will show the placeholder name you set above as the operator.</span>
+          </span>
+        </label>
+      </div>
+
       <div class="dialog-buttons">
         <button type="button" class="primary" id="share-rig-issue">Generate share link</button>
         <button type="button" id="share-rig-close">Cancel</button>
@@ -3030,7 +3138,7 @@
 
     <!-- Generated view — shown after a successful issue -->
     <div id="share-rig-result-view" class="hidden">
-      <p class="share-rig-intro">Pass generated. Send the link below to your friend — they don't need a POTACAT Cloud subscription, just to be signed in to POTACAT (free trial counts).</p>
+      <p class="share-rig-intro" id="share-rig-result-intro">Pass generated. Send the link below to your friend.</p>
 
       <div class="share-rig-link-box">
         <div class="share-rig-link-label">Share link</div>
@@ -3069,6 +3177,107 @@
       <ul id="share-rig-list" class="share-rig-list"></ul>
     </div>
   </dialog>
+
+  <!-- Remote Radios panel (v1.9 — desktop-to-desktop client list).
+       Manages connectionTargets[]: shacks this desktop has paired
+       with. The active row drives the laptop's "rig" — switching
+       rows tears down the current ECHOCAT WS and dials the next
+       shack. Empty state guides the user to the Pair-Another-Desktop
+       dialog (Summary card → Pair another desktop…) since pairing
+       happens there, not here. -->
+  <dialog id="remote-radios-dialog">
+    <h3 style="display:flex;justify-content:space-between;align-items:baseline;">
+      Remote Radios
+      <span style="font-size:11px;font-weight:normal;color:#666;">ESC to close</span>
+    </h3>
+
+    <p class="remote-radios-intro">
+      Switch this desktop between your local rig and a remote shack.
+      Pair a new shack with the <b>Pair another desktop</b> button on the
+      Summary card.
+    </p>
+
+    <div class="remote-radios-local-row" id="remote-radios-local-row">
+      <div>
+        <div class="remote-radios-local-name">Local rig</div>
+        <div class="remote-radios-local-meta" id="remote-radios-local-meta">This computer</div>
+      </div>
+      <button type="button" id="remote-radios-local-btn" class="remote-radios-action">Use local rig</button>
+    </div>
+
+    <div class="remote-radios-list-header" style="margin-top:10px;">
+      <span>Paired shacks</span>
+      <button type="button" class="remote-radios-refresh" id="remote-radios-refresh">Refresh</button>
+    </div>
+    <ul id="remote-radios-list" class="remote-radios-list">
+      <li class="remote-radios-empty">No remote shacks paired yet. Open <b>Summary → Pair another desktop&hellip;</b> on your shack to generate a link.</li>
+    </ul>
+
+    <div class="dialog-buttons">
+      <button type="button" id="remote-radios-close">Close</button>
+    </div>
+  </dialog>
+
+  <!-- Pair My Device dialog (v1.9 — unified pair entry point).
+       Replaces three earlier buttons: "Pair my device" (QR popout),
+       "Pair my laptop" (share-link), and the older "Share with a
+       friend" path. Inside, the user picks a method:
+         📱 QR — best for an in-person phone/tablet, 5-min TTL
+         💻 Link — best for own laptop or off-site friend, 1h–30d
+       Each method has its own form below. The "Share my rig" button
+       (Guest Pass) stays separate because privileges + power caps
+       are conceptually different from a paired-device handshake.
+       Wired in app.js: _pairDeviceOpen / _pairDeviceQrGenerate /
+       _pairDeviceLinkGenerate. -->
+  <dialog id="pair-device-dialog">
+    <h3 style="display:flex;justify-content:space-between;align-items:baseline;">
+      Pair my device
+      <span style="font-size:11px;font-weight:normal;color:#666;">ESC to close</span>
+    </h3>
+
+    <p class="pair-link-intro">
+      Add another device — phone, tablet, laptop, or another POTACAT — to
+      control this shack. Scan the QR on a phone or tablet, or copy the URL
+      and open it in POTACAT on the other device.
+    </p>
+
+    <div class="pair-device-warning">
+      <strong>Warning:</strong> This gives access to your rig until it is revoked.
+      You should only use this for your devices. To share access with someone
+      else, use <b>Share my rig</b>.
+    </div>
+
+    <div id="pair-device-qr-form" class="pair-device-method-form">
+      <div class="pair-device-qr-card">
+        <div id="pair-device-qr-svg" class="pair-device-qr" style="display:none;"></div>
+        <img id="pair-device-qr-img" class="pair-device-qr" alt="POTACAT pairing QR" style="display:none;">
+        <div id="pair-device-qr-fallback" class="help-text" style="display:none;text-align:center;">
+          QR didn't render on this build — use the copy button below.
+        </div>
+        <div id="pair-device-qr-ttl" class="pair-device-qr-ttl"></div>
+      </div>
+      <div class="pair-device-qr-actions">
+        <button type="button" class="primary" id="pair-device-qr-copy-url">Copy URL</button>
+        <button type="button" id="pair-device-qr-regen">Regenerate</button>
+        <span class="help-text" id="pair-device-qr-status"></span>
+      </div>
+
+      <div class="pair-link-section pair-link-pending">
+        <div class="pair-link-section-title" style="display:flex;justify-content:space-between;align-items:baseline;">
+          <span>Active &amp; recent pair links</span>
+          <button type="button" class="pair-link-refresh" id="pair-link-refresh">Refresh</button>
+        </div>
+        <ul id="pair-link-list" class="pair-link-list">
+          <li class="pair-link-empty">No links yet.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="dialog-buttons">
+      <button type="button" id="pair-device-close">Close</button>
+    </div>
+  </dialog>
+
 
   <!-- Generic prompt dialog (Electron blocks window.prompt(),
        so anything needing a string from the user opens this instead) -->
@@ -3414,8 +3623,59 @@
       </label>
     </div>
 
+    <!-- Connect to a remote shack — first-class entry point for the
+         desktop-to-desktop initiative. Three paths surface here:
+           1. Cloud account: "Sign in to find your shacks" → Path 1 of
+              the auth model (cloud_devices listing → 1-click pair).
+           2. Tap-to-pair: mDNS-discovered shacks on the LAN → tap
+              Connect → shack pops an Approve modal → done.
+           3. Pair link: paste the URL from an email, or scan a QR.
+         Persona D (single-host user with local rig) doesn't lose
+         anything — the local-radio section is still right below this.
+         Persona B (Tailscale-only, off-LAN) sees an empty mDNS list
+         and falls naturally to the paste-link path. -->
+    <div class="welcome-remote-section">
+      <div class="welcome-section-label" style="margin-top:0;">Connect to a Remote Shack (recommended if you have one)</div>
+      <span class="help-text" style="display:block;margin-bottom:10px;">
+        Already have POTACAT running on a different computer connected to your radio?
+        Connect this one to it — your laptop becomes the shack's screen.
+      </span>
+
+      <div class="welcome-remote-discovered" id="welcome-remote-discovered">
+        <div class="welcome-remote-discovered-header">
+          <span>Shacks on your network</span>
+          <button type="button" class="welcome-remote-rescan" id="welcome-remote-rescan">Scan again</button>
+        </div>
+        <ul id="welcome-remote-list" class="welcome-remote-list">
+          <li class="welcome-remote-scanning">Looking on the local network&hellip;</li>
+        </ul>
+      </div>
+
+      <div class="welcome-remote-or">or</div>
+
+      <div class="welcome-remote-alt-row">
+        <button type="button" id="welcome-remote-cloud-btn" class="welcome-remote-alt">
+          <span class="welcome-remote-alt-icon">☁</span>
+          <span>
+            <span class="welcome-remote-alt-title">Sign in to POTACAT Cloud</span>
+            <span class="welcome-remote-alt-sub">See your shacks from anywhere &mdash; no QR or email needed.</span>
+          </span>
+        </button>
+      </div>
+
+      <div class="welcome-remote-alt-row">
+        <div class="welcome-remote-paste-row">
+          <input type="text" id="welcome-remote-paste-input" placeholder="potacat://pair?…  (paste from email or copied link)" autocomplete="off" spellcheck="false">
+          <button type="button" id="welcome-remote-paste-btn">Pair</button>
+        </div>
+        <span class="help-text" style="display:block;margin-top:4px;">Open the link in your email on this computer, or paste it here.</span>
+      </div>
+
+      <div id="welcome-remote-status" class="welcome-remote-status hidden"></div>
+    </div>
+
     <div class="welcome-radio-section">
-      <div class="welcome-section-label" style="margin-top:0;">Add Your Radio (optional)</div>
+      <div class="welcome-section-label" style="margin-top:0;">…or set up a Local Radio (this computer is connected to the rig)</div>
       <span class="help-text" style="display:block;margin-bottom:8px;">
         You may need to check out the <a href="#" id="welcome-radio-help-link">Set Up My Radio</a>
         section of the website. You can always edit your radio in Settings.

@@ -1071,6 +1071,7 @@ const setEnableRemote = null;
 const remoteConfig = null;
 const setRemotePort = document.getElementById('set-remote-port');
 const setRemoteRequireToken = document.getElementById('set-remote-require-token');
+const setAllowPairRequests = document.getElementById('set-allow-pair-requests');
 const remoteTokenRow = document.getElementById('remote-token-row');
 const setRemoteToken = document.getElementById('set-remote-token');
 const remoteRegenToken = document.getElementById('remote-regen-token');
@@ -2859,22 +2860,175 @@ function updateBlDupeChip() {
   }
 }
 
+// ─── Banner-logger station info (grid + distance + heading) ───────────
+//
+// KM4CFT request 2026-05-26 — show the worked station's grid, great-
+// circle distance, and beam heading on a second line under the input
+// fields. Powered by the QRZ lookup that already populates Name; we
+// just pull info.grid and compute distance + bearing from the operator's
+// own QTH grid. gridToLatLonLocal already lives in this file (~line 8129).
+
+function _blBearingDeg(lat1, lon1, lat2, lon2) {
+  // Initial bearing from (lat1, lon1) to (lat2, lon2) on a sphere.
+  // Matches lib/grid.js bearing() so the banner agrees with spot rows.
+  const toRad = (x) => x * Math.PI / 180;
+  const toDeg = (x) => x * 180 / Math.PI;
+  const f1 = toRad(lat1), f2 = toRad(lat2);
+  const dl = toRad(lon2 - lon1);
+  const y = Math.sin(dl) * Math.cos(f2);
+  const x = Math.cos(f1) * Math.sin(f2) - Math.sin(f1) * Math.cos(f2) * Math.cos(dl);
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+function _blHaversine(lat1, lon1, lat2, lon2, miles) {
+  const R = miles ? 3959 : 6371;
+  const toRad = (x) => x * Math.PI / 180;
+  const f1 = toRad(lat1), f2 = toRad(lat2);
+  const df = toRad(lat2 - lat1), dl = toRad(lon2 - lon1);
+  const a = Math.sin(df / 2) ** 2 + Math.cos(f1) * Math.cos(f2) * Math.sin(dl / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+function _blCardinal(brg) {
+  const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+  return dirs[Math.round(brg / 45) % 8];
+}
+
+function _blRenderStationInfo(info, callsign) {
+  // Always-visible model (Casey 2026-06-04). Swaps between a
+  // placeholder hint and the grid/distance/heading chips. Location
+  // is intentionally omitted — the Name field already shows it.
+  //
+  // Coordinate source priority (Casey 2026-06-04: QRZ alone misses
+  // too many ops; the spot table shows a grid because it falls back
+  // to lat/lon from POTA / cty.dat. Mirror that here):
+  //   1. QRZ grid                            (cleanest, when QRZ has it)
+  //   2. Active spot's lat/lon → grid        (most live POTA / SOTA / cluster spots have this)
+  //   3. cty.dat entity centroid via QRZ     (last resort; not yet wired)
+  const placeholder = document.getElementById('bl-info-placeholder');
+  const gridEl = document.getElementById('bl-info-grid');
+  const distEl = document.getElementById('bl-info-distance');
+  const hdgEl = document.getElementById('bl-info-heading');
+  if (!placeholder || !gridEl || !distEl || !hdgEl) return;
+
+  const setChips = (grid, dist, hdg) => {
+    gridEl.textContent = grid || '';
+    distEl.textContent = dist || '';
+    hdgEl.textContent = hdg || '';
+  };
+  const showPlaceholder = (msg) => {
+    placeholder.textContent = msg;
+    placeholder.classList.remove('hidden');
+    setChips('', '', '');
+  };
+  const hidePlaceholder = () => {
+    placeholder.classList.add('hidden');
+  };
+
+  if (!info && !callsign) {
+    showPlaceholder('Type a callsign to see grid, distance, and heading.');
+    return;
+  }
+
+  // Resolve (lat, lon, grid) from the best source we have.
+  let theirGrid = info && info.grid ? String(info.grid).trim().toUpperCase() : '';
+  let them = theirGrid ? gridToLatLonLocal(theirGrid) : null;
+  let gridSource = them ? 'qrz' : '';
+
+  // Fallback: look up the callsign in the current allSpots and use
+  // its lat/lon. Match on raw call AND on the suffix-stripped form
+  // (so "K3SBP/P" finds "K3SBP"). The spot's lat/lon usually points
+  // at the park / cty.dat centroid, which is the right location to
+  // turn a beam at for the contact.
+  if (!them && callsign && typeof allSpots !== 'undefined' && Array.isArray(allSpots)) {
+    const wanted = callsign.toUpperCase();
+    const base = wanted.split('/')[0];
+    const match = allSpots.find(s => {
+      const c = (s.callsign || '').toUpperCase();
+      return c === wanted || c === base || c.split('/')[0] === base;
+    });
+    if (match && typeof match.lat === 'number' && typeof match.lon === 'number') {
+      them = { lat: match.lat, lon: match.lon };
+      // Derive a 6-char grid from the spot's lat/lon so the chip
+      // still reads as a locator rather than a blank.
+      try {
+        const g = latLonToGridLocal(match.lat, match.lon);
+        if (g) theirGrid = g.toUpperCase();
+      } catch {}
+      gridSource = 'spot';
+    }
+  }
+
+  if (!them) {
+    // Nothing usable from any source.
+    if (info) {
+      showPlaceholder('No grid or location data for this callsign yet.');
+    } else {
+      showPlaceholder('Looking up ' + (callsign || 'callsign') + '…');
+    }
+    return;
+  }
+
+  // Operator's QTH lives in the module-scope `grid` var (loaded by
+  // loadPrefs from settings.grid). The renderer has no module-scope
+  // `settings` object — fetching it on every keystroke would be
+  // wasteful, and loadPrefs keeps `grid` + `distUnit` fresh.
+  const myGrid = (typeof grid === 'string' && grid) || '';
+  const me = myGrid ? gridToLatLonLocal(myGrid) : null;
+  let distTxt = '';
+  let hdgTxt = '';
+  if (me) {
+    const useMiles = (typeof distUnit === 'string' ? distUnit : 'mi') !== 'km';
+    const d = Math.round(_blHaversine(me.lat, me.lon, them.lat, them.lon, useMiles));
+    distTxt = d.toLocaleString() + (useMiles ? ' mi' : ' km');
+    const b = Math.round(_blBearingDeg(me.lat, me.lon, them.lat, them.lon));
+    hdgTxt = b + '° ' + _blCardinal(b);
+  }
+
+  // Annotate the grid chip's title attribute with the source so a
+  // curious operator can see WHERE we got it from (without cluttering
+  // the visible row).
+  gridEl.title = gridSource === 'spot'
+    ? 'Derived from spot location (park / cty.dat centroid)'
+    : (gridSource === 'qrz' ? 'From QRZ profile' : '');
+
+  hidePlaceholder();
+  setChips(theirGrid, distTxt, hdgTxt);
+}
+
 blCallsign.addEventListener('input', () => {
   blCallsign.value = blCallsign.value.toUpperCase();
   updateBlDupeChip();
   clearTimeout(blLookupTimer);
   const cs = blCallsign.value.trim();
-  if (cs.length < 3) { blName.value = ''; return; }
+  if (cs.length < 3) {
+    blName.value = '';
+    _blRenderStationInfo(null, null);
+    return;
+  }
+  // Render once with what we know NOW — spot-table data is local and
+  // free, so we can populate grid/distance/heading instantly from the
+  // current allSpots even before QRZ comes back. The QRZ result will
+  // upgrade the row if it has a more precise grid.
+  _blRenderStationInfo(null, cs);
   blLookupTimer = setTimeout(async () => {
     const cached = qrzData.get(cs.split('/')[0]);
-    if (cached) { blName.value = qrzNameAndLocation(cached); return; }
+    if (cached) {
+      blName.value = qrzNameAndLocation(cached);
+      _blRenderStationInfo(cached, cs);
+      return;
+    }
     try {
       const result = await window.api.qrzLookup(cs);
-      if (result && blCallsign.value.trim().toUpperCase() === cs) {
+      if (blCallsign.value.trim().toUpperCase() !== cs) return; // stale
+      if (result) {
         qrzData.set(cs.split('/')[0], result);
         blName.value = qrzNameAndLocation(result);
       }
-    } catch {}
+      // Pass result (possibly null) AND callsign so the spot-table
+      // fallback runs even when QRZ has no record at all.
+      _blRenderStationInfo(result, cs);
+    } catch {
+      _blRenderStationInfo(null, cs);
+    }
   }, 400);
 });
 // Re-check on freq / mode change too — a band-switch can drop a dupe and
@@ -3059,6 +3213,7 @@ async function saveBannerQso() {
       blCallsign.value = '';
       blName.value = '';
       blNotes.value = '';
+      _blRenderStationInfo(null);
       blFreqEdited = false;
       blModeEdited = false;
       blTimeEdited = false;
@@ -4724,6 +4879,25 @@ function refreshSummaryCard() {
   _renderSummaryCloud();
   _renderSummaryEchocat();
   _renderSummaryPota();
+  // The ECHOCAT web-access block in Quick Settings was relocated
+  // from the main-toolbar dropdown 2026-06-04. Same DOM IDs, same
+  // populator; just needs to fire on dialog open instead of on
+  // dropdown open.
+  if (typeof refreshEchoCatInfo === 'function') refreshEchoCatInfo();
+  // Sync the Summary header theme toggle to the current theme.
+  if (quickLightMode) {
+    quickLightMode.checked = document.documentElement.getAttribute('data-theme') === 'light';
+    if (typeof _updateThemeToggleLabel === 'function') _updateThemeToggleLabel();
+  }
+  // PSTRotator quick toggle: only visible when a rotor has been
+  // configured under Settings → Tuning. quickRotorLabel was
+  // gated on this in the old dropdown's open path.
+  if (quickRotorLabel) quickRotorLabel.classList.toggle('hidden', !rotorConfigured);
+  if (quickRotorDivider) quickRotorDivider.classList.toggle('hidden', !rotorConfigured);
+  // Sync Hide Worked Parks mirror with live state. (Activator mode
+  // is now a click-to-enter button in the More dropdown, no checked
+  // state to sync.)
+  if (quickHideWorkedParks) quickHideWorkedParks.checked = hideWorkedParks;
 }
 
 async function _renderSummaryOperator() {
@@ -4885,8 +5059,59 @@ function _shareRigOpen() {
   _shareRigPrefillCallsigns();
   _shareRigUpdateClassDetail();
   _shareRigUpdateReachNotice();
+  _shareRigResetWhenSection();
   _shareRigRefreshList();
   if (typeof dlg.showModal === 'function') dlg.showModal();
+}
+
+// ─── When? section helpers (mig 013 — Guest Pass scheduling) ──────────
+//
+// The Guest Pass form now supports two modes: "Starts now" (today's
+// behavior, sends duration_seconds) and "Schedule for later" (sends
+// starts_at + expires_at). _shareRigResetWhenSection rehydrates the
+// schedule pickers to sensible defaults every time the dialog opens.
+
+function _shareRigResetWhenSection() {
+  // Reset radio to "Starts now" — the common case.
+  const nowRadio = document.querySelector('input[name="share-rig-when"][value="now"]');
+  if (nowRadio) nowRadio.checked = true;
+  _shareRigSwapWhenMode('now');
+  // Default the anonymous-redemption opt-in to OFF on every reopen.
+  const anonChk = document.getElementById('share-rig-allow-anonymous');
+  if (anonChk) anonChk.checked = false;
+  // Pre-fill the schedule pickers so they're not empty when the user
+  // first reveals them. Starts = next round 5 min, Ends = +2 hours.
+  const startsEl = document.getElementById('share-rig-starts-at');
+  const endsEl = document.getElementById('share-rig-ends-at');
+  if (startsEl && endsEl) {
+    const round = (d, ms) => new Date(Math.ceil(d.getTime() / ms) * ms);
+    const s = round(new Date(Date.now() + 60 * 1000), 5 * 60 * 1000);
+    const e = new Date(s.getTime() + 2 * 60 * 60 * 1000);
+    startsEl.value = _toDatetimeLocal(s);
+    endsEl.value = _toDatetimeLocal(e);
+  }
+}
+function _toDatetimeLocal(d) {
+  // <input type="datetime-local"> wants `YYYY-MM-DDTHH:MM` in LOCAL
+  // time (no Z, no offset). Build by hand — toISOString gives UTC.
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function _shareRigSwapWhenMode(mode) {
+  const nowBox = document.getElementById('share-rig-when-now');
+  const schedBox = document.getElementById('share-rig-when-schedule');
+  if (!nowBox || !schedBox) return;
+  if (mode === 'schedule') {
+    nowBox.classList.add('hidden');
+    schedBox.classList.remove('hidden');
+  } else {
+    nowBox.classList.remove('hidden');
+    schedBox.classList.add('hidden');
+  }
+}
+function _shareRigSelectedWhen() {
+  const checked = document.querySelector('input[name="share-rig-when"]:checked');
+  return checked && checked.value === 'schedule' ? 'schedule' : 'now';
 }
 
 // Sets the notice banner at the top of the form based on the user's
@@ -4896,6 +5121,8 @@ function _shareRigOpen() {
 async function _shareRigUpdateReachNotice() {
   const box = document.getElementById('share-rig-reach-notice');
   if (!box) return;
+  // Detect the shack's current public reach. Cloud Tunnel beats
+  // Tailscale beats LAN-only — pick the one with the widest reach.
   let mode = 'lan';
   let detail = '';
   try {
@@ -4913,23 +5140,35 @@ async function _shareRigUpdateReachNotice() {
       }
     } catch {}
   }
+
+  // The notice is ALWAYS shown — Casey 2026-06-04. Sharing has a
+  // network-reach precondition that's invisible to users until they
+  // hand a code to a friend who can't reach the shack. Lead with the
+  // boundary so operators pick the right tier (or the right recipient)
+  // before they spend time on privileges + scheduling. Copy structure:
+  //   "You can share with <scope>. Since you <state>, <explanation>."
+  box.classList.remove('hidden', 'warn', 'ok', 'info');
   if (mode === 'cloud') {
-    // Cloud Tunnel is live — recipient can reach the rig from anywhere.
-    // Hide the notice; the form's intro is enough.
-    box.classList.add('hidden');
-    box.innerHTML = '';
-    return;
-  }
-  box.classList.remove('hidden');
-  box.classList.toggle('warn', true);
-  if (mode === 'tailscale') {
-    box.innerHTML = '<strong>You\'re on Tailscale' + _esc(detail) + '.</strong> '
-      + 'You can only share with someone who is also on your tailnet. '
-      + '<a href="#" data-act="open-cloud-signup">Join POTACAT Cloud</a> to share with anyone, anywhere.';
+    box.classList.add('ok');
+    box.innerHTML = '<strong>You can share with anyone, anywhere.</strong> '
+      + 'Since you have POTACAT Cloud Tunnel turned on, your friend can '
+      + 'connect from any internet connection. They\'ll need a free '
+      + 'POTACAT Cloud account to redeem the code.';
+  } else if (mode === 'tailscale') {
+    box.classList.add('info');
+    box.innerHTML = '<strong>You can share with people on your tailnet.</strong> '
+      + 'Since you\'re using Tailscale' + _esc(detail) + ', your friend must '
+      + 'be on YOUR tailnet — add their device to your Tailscale account '
+      + 'first, then send them the code. Want to share with anyone, '
+      + 'anywhere? <a href="#" data-act="open-cloud-signup">Join POTACAT Cloud</a>.';
   } else {
-    box.innerHTML = '<strong>You\'re on LAN mode.</strong> '
-      + 'You can only share with someone on the same local network as your shack. '
-      + '<a href="#" data-act="open-cloud-signup">Join POTACAT Cloud</a> to share with anyone, anywhere.';
+    box.classList.add('info');
+    box.innerHTML = '<strong>You can share with people on your local network.</strong> '
+      + 'Since you don\'t have Tailscale or POTACAT Cloud set up, your '
+      + 'friend must be on the same Wi-Fi / Ethernet as this shack. '
+      + 'Want them to connect from anywhere? Set up Tailscale (free for '
+      + 'a few devices) or '
+      + '<a href="#" data-act="open-cloud-signup">join POTACAT Cloud</a>.';
   }
 }
 
@@ -4979,21 +5218,59 @@ function _shareRigSelectedWatts() {
 async function _shareRigIssue() {
   const status = document.getElementById('share-rig-status');
   const btn = document.getElementById('share-rig-issue');
-  const hours = _shareRigSelectedHours();
   const watts = _shareRigSelectedWatts();
   const cls = document.getElementById('share-rig-class').value || 'general';
   const station = (document.getElementById('share-rig-station').value || '').toUpperCase().trim() || null;
   const operator = (document.getElementById('share-rig-operator').value || '').toUpperCase().trim() || null;
   const control = (document.getElementById('share-rig-control').value || '').toUpperCase().trim() || null;
+
+  // Body branches on When? mode. The "starts now" branch keeps the
+  // legacy duration_seconds shape — backwards compatible with every
+  // cloud + shack already in the field. The "schedule" branch sends
+  // starts_at + expires_at as ISO 8601 strings (the new mig 013 path).
+  const mode = _shareRigSelectedWhen();
+  const anonChk = document.getElementById('share-rig-allow-anonymous');
+  const allowAnonymous = !!(anonChk && anonChk.checked);
   const body = {
-    duration_seconds: hours * 3600,
     privilege_class: cls,
     max_power_w: watts,
     allowed_modes: null,
     station_callsign: station,
     operator_callsign: operator,
     control_operator_callsign: control,
+    allow_anonymous: allowAnonymous,
   };
+  let hoursForDisplay; // shown in the result summary line
+  if (mode === 'schedule') {
+    const startsEl = document.getElementById('share-rig-starts-at');
+    const endsEl = document.getElementById('share-rig-ends-at');
+    const startsVal = (startsEl && startsEl.value) || '';
+    const endsVal = (endsEl && endsEl.value) || '';
+    if (!startsVal || !endsVal) {
+      status.textContent = 'Pick both a start and an end time.';
+      return;
+    }
+    // datetime-local values lack a timezone — parsed as local time,
+    // which is what the user typed. new Date(...) handles that.
+    const startsAt = new Date(startsVal);
+    const endsAt = new Date(endsVal);
+    if (isNaN(startsAt.getTime()) || isNaN(endsAt.getTime())) {
+      status.textContent = 'Could not read those dates. Try again.';
+      return;
+    }
+    if (endsAt <= startsAt) {
+      status.textContent = 'End time must be after start time.';
+      return;
+    }
+    body.starts_at = startsAt.toISOString();
+    body.expires_at = endsAt.toISOString();
+    hoursForDisplay = (endsAt.getTime() - startsAt.getTime()) / 3600000;
+  } else {
+    const hours = _shareRigSelectedHours();
+    body.duration_seconds = hours * 3600;
+    hoursForDisplay = hours;
+  }
+
   btn.disabled = true;
   status.textContent = 'Generating…';
   try {
@@ -5009,10 +5286,29 @@ async function _shareRigIssue() {
     _shareRigShowResultView();
     document.getElementById('share-rig-result-code').textContent = res.code || '';
     document.getElementById('share-rig-result-url').textContent = res.share_url || '';
+    // Surface whether the recipient will need to sign in or not. The
+    // copy here is the source of truth — the operator just made this
+    // choice via the checkbox, and we want it loud at result time.
+    const introEl = document.getElementById('share-rig-result-intro');
+    if (introEl) {
+      introEl.innerHTML = res.allow_anonymous
+        ? 'Pass generated. Send the link below to your friend. <b>They can redeem without signing in to POTACAT Cloud</b> — perfect for one-off guests.'
+        : 'Pass generated. Send the link below to your friend. They\'ll need a free POTACAT Cloud account (sign-up is one click).';
+    }
+    const startsAt = res.starts_at ? new Date(res.starts_at) : null;
     const expiresAt = res.expires_at ? new Date(res.expires_at) : null;
-    document.getElementById('share-rig-result-expires').textContent = expiresAt ? expiresAt.toLocaleString() : '?';
+    const expiresEl = document.getElementById('share-rig-result-expires');
+    if (expiresEl) {
+      expiresEl.textContent = startsAt
+        ? (startsAt.toLocaleString() + ' → ' + (expiresAt ? expiresAt.toLocaleString() : '?') + ' (scheduled)')
+        : (expiresAt ? expiresAt.toLocaleString() : '?');
+    }
+    const lengthLabel = hoursForDisplay >= 1
+      ? (Math.round(hoursForDisplay * 10) / 10) + (hoursForDisplay === 1 ? ' hour' : ' hours')
+      : Math.round(hoursForDisplay * 60) + ' min';
+    const anonTag = res.allow_anonymous ? ' · no sign-in required' : '';
     const privTxt = (res.privilege_class || cls).toString().toUpperCase()
-      + ' · ' + (res.max_power_w || watts) + ' W max · ' + hours + (hours === 1 ? ' hour' : ' hours');
+      + ' · ' + (res.max_power_w || watts) + ' W max · ' + lengthLabel + anonTag;
     document.getElementById('share-rig-result-priv').textContent = privTxt;
     // QR is optional / collapsed — we set src lazily anyway so it's
     // there if the user expands the <details>.
@@ -5067,22 +5363,52 @@ async function _shareRigRefreshList() {
       ul.innerHTML = '<li class="share-rig-list-empty">No passes issued yet.</li>';
       return;
     }
+    const now = Date.now();
     ul.innerHTML = passes.map(p => {
+      const startsAtMs = p.starts_at ? new Date(p.starts_at).getTime() : null;
       const expires = p.expires_at ? new Date(p.expires_at).toLocaleString() : '?';
       const cls = p.privilege_class ? p.privilege_class.toUpperCase() : '';
       const watts = p.max_power_w || '?';
-      const st = (p.status || 'unknown').toLowerCase();
-      const stCls = st === 'active' ? 'active' : (st === 'expired' ? 'expired' : 'revoked');
+      // Derive the effective state for display. The cloud already
+      // emits status='scheduled' via shapePass when starts_at is in
+      // the future, but the list query returns the raw DB status —
+      // recompute here so the list and the validate path agree.
+      let st = (p.status || 'unknown').toLowerCase();
+      if (st === 'active' && startsAtMs != null && startsAtMs > now) st = 'scheduled';
+      const stCls = st === 'active' ? 'active'
+        : (st === 'scheduled' ? 'scheduled'
+          : (st === 'expired' ? 'expired' : 'revoked'));
       const sessions = (p.activeSessionCount || p.active_session_count || 0);
       const sessionLine = sessions > 0 ? '<span class="lst-meta" style="color:var(--accent-green);">· ' + sessions + ' guest connected now</span>' : '';
-      const revokeBtn = (st === 'active')
+      // Active and scheduled passes can both be revoked + their link
+      // copied. Expired/revoked can't.
+      const canActOn = (st === 'active' || st === 'scheduled');
+      const copyBtn = canActOn
+        ? '<button type="button" class="lst-copy" data-act="lst-copy-link" data-code="' + _esc(p.code) + '" title="Copy share link to clipboard">Copy link</button>'
+        : '';
+      const revokeBtn = canActOn
         ? '<button type="button" class="lst-revoke" data-act="lst-revoke" data-code="' + _esc(p.code) + '">Revoke</button>'
         : '';
+      // Callsign identity for the row — station_callsign is the
+      // on-air ID (always set; defaults to operator's myCallsign).
+      // If operator_callsign is also set, show "STATION → OPERATOR"
+      // so the owner can scan-spot "who's this pass for?" at a
+      // glance. NO 4-word code in the list — that's the share secret.
+      const stationCall = (p.station_callsign || '').trim();
+      const opCall = (p.operator_callsign || '').trim();
+      const callTxt = (stationCall && opCall)
+        ? (stationCall + ' → ' + opCall)
+        : (stationCall || opCall || '—');
+      const anonTag = p.allow_anonymous ? ' · anonymous OK' : '';
+      const metaTxt = (st === 'scheduled' && startsAtMs)
+        ? (cls + ' · ' + watts + 'W' + anonTag + ' · starts ' + new Date(startsAtMs).toLocaleString())
+        : (cls + ' · ' + watts + 'W' + anonTag + ' · expires ' + expires);
       return '<li>'
-        + '<span class="lst-code">' + _esc(p.code) + '</span>'
-        + '<span class="lst-meta">' + cls + ' · ' + watts + 'W · expires ' + _esc(expires) + '</span>'
+        + '<span class="lst-call">' + _esc(callTxt) + '</span>'
+        + '<span class="lst-meta">' + _esc(metaTxt) + '</span>'
         + sessionLine
         + '<span class="lst-status ' + stCls + '">' + st + '</span>'
+        + copyBtn
         + revokeBtn
         + '</li>';
     }).join('');
@@ -5100,6 +5426,14 @@ function _esc(s) {
 (function _shareRigWire() {
   const dlg = document.getElementById('share-rig-dialog');
   if (!dlg) return;
+
+  // When? radio — swap the sub-form between "Starts now" duration and
+  // "Schedule for later" datetime pickers. Wired here so opening +
+  // closing the dialog doesn't bind multiple times.
+  const whenRow = dlg.querySelector('.share-rig-when-mode');
+  if (whenRow) whenRow.addEventListener('change', () => {
+    _shareRigSwapWhenMode(_shareRigSelectedWhen());
+  });
 
   // Duration presets — clicking activates one, also writes hours into
   // the custom field so the two stay coherent. Typing in custom field
@@ -5203,13 +5537,35 @@ function _esc(s) {
   const refresh = document.getElementById('share-rig-refresh-list');
   if (refresh) refresh.addEventListener('click', _shareRigRefreshList);
 
-  // Per-row revoke in My recent passes
+  // Per-row Copy link + Revoke in My recent passes. The 4-word
+  // code is intentionally NOT displayed in the row (it's a share
+  // secret — shoulder-surfers shouldn't be able to read it off the
+  // dialog). The Copy link button reconstructs the share URL from
+  // the code that ships with each row's data-code attribute. Same
+  // URL shape as SHARE_URL_ROOT in potacat-cloudlog/routes/passes.js.
+  const SHARE_URL_ROOT = 'https://api.potacat.com/guest-pass.html';
   const list = document.getElementById('share-rig-list');
   if (list) list.addEventListener('click', async (e) => {
+    const copyBtn = e.target.closest('[data-act="lst-copy-link"]');
+    if (copyBtn) {
+      const code = copyBtn.dataset.code;
+      if (!code) return;
+      const url = SHARE_URL_ROOT + '?code=' + encodeURIComponent(code);
+      try { await navigator.clipboard.writeText(url); }
+      catch {
+        // Fallback for older Electron / blocked clipboard API.
+        try { window.api.copyToClipboard(url); } catch {}
+      }
+      const prev = copyBtn.textContent;
+      copyBtn.textContent = 'Copied';
+      setTimeout(() => { copyBtn.textContent = prev; }, 1400);
+      return;
+    }
+
     const btn = e.target.closest('[data-act="lst-revoke"]');
     if (!btn) return;
     const code = btn.dataset.code;
-    if (!code || !confirm('Revoke pass ' + code + '?')) return;
+    if (!code || !confirm('Revoke this pass? The guest will be kicked from the rig immediately.')) return;
     btn.disabled = true;
     try {
       const r = await window.api.passesRevoke(code);
@@ -5220,6 +5576,659 @@ function _esc(s) {
       btn.disabled = false;
     }
   });
+})();
+
+// ─── Remote Radios dialog — desktop-to-desktop client manager (v1.9) ─
+//
+// Lists settings.connectionTargets[] (shacks this desktop has paired
+// with) plus a "Local rig" row at the top. The active row drives the
+// laptop's rig backend; switching tears down the current ECHOCAT WS
+// and dials the next shack via the connection-targets-activate IPC.
+// Subscribes to remote-client-status pushes so the active row's badge
+// updates live without manual refresh.
+
+let _remoteRadiosLastStatus = { state: 'idle' };
+
+function _remoteRadiosOpen() {
+  const dlg = document.getElementById('remote-radios-dialog');
+  if (!dlg) return;
+  if (!dlg.open) dlg.showModal();
+  _remoteRadiosRefreshList();
+}
+
+async function _remoteRadiosRefreshList() {
+  const listEl = document.getElementById('remote-radios-list');
+  const localBtn = document.getElementById('remote-radios-local-btn');
+  const localRow = document.getElementById('remote-radios-local-row');
+  const localMeta = document.getElementById('remote-radios-local-meta');
+  if (!listEl) return;
+  let targets = [];
+  try { targets = await window.api.connectionTargetsList(); } catch {}
+  let status = _remoteRadiosLastStatus;
+  try { status = await window.api.connectionTargetsGetStatus(); } catch {}
+  _remoteRadiosLastStatus = status;
+
+  // Local-rig row visual state.
+  const activeIsRemote = status && status.state !== 'idle' && status.state !== 'auth-fail';
+  if (localRow) localRow.classList.toggle('active', !activeIsRemote);
+  if (localBtn) {
+    if (!activeIsRemote) {
+      localBtn.textContent = 'Active';
+      localBtn.disabled = true;
+      localBtn.classList.remove('primary');
+    } else {
+      localBtn.textContent = 'Use local rig';
+      localBtn.disabled = false;
+      localBtn.classList.add('primary');
+    }
+  }
+  if (localMeta) localMeta.textContent = 'This computer';
+
+  if (!Array.isArray(targets) || targets.length === 0) {
+    listEl.innerHTML = '<li class="remote-radios-empty">No remote shacks paired yet. Open <b>Summary → Pair another desktop&hellip;</b> on your shack to generate a link.</li>';
+    return;
+  }
+
+  const fmtAge = (ts) => {
+    if (!ts) return 'never connected';
+    const ago = Date.now() - ts;
+    if (ago < 60000) return 'just now';
+    if (ago < 3600000) return Math.floor(ago / 60000) + 'm ago';
+    if (ago < 86400000) return Math.floor(ago / 3600000) + 'h ago';
+    return Math.floor(ago / 86400000) + 'd ago';
+  };
+  const fmtExpiry = (ts) => {
+    if (ts == null) return null;
+    const ms = ts - Date.now();
+    if (ms <= 0) return 'expired';
+    const d = Math.floor(ms / (24 * 3600 * 1000));
+    if (d > 1) return 'expires in ' + d + 'd';
+    const h = Math.floor(ms / (3600 * 1000));
+    return 'expires in ' + h + 'h';
+  };
+
+  listEl.innerHTML = targets.map(t => {
+    const isActive = status && status.targetId === t.id;
+    const dotClass = (() => {
+      if (isActive && status.state === 'connected') return 'connected';
+      if (isActive && status.state === 'auth-fail') return 'expired';
+      if (t.expiresAt != null && t.expiresAt < Date.now()) return 'expired';
+      if (t.lastConnectedAt && (Date.now() - t.lastConnectedAt > 7 * 86400 * 1000)) return 'unreachable';
+      return '';
+    })();
+    const expBadgeRaw = fmtExpiry(t.expiresAt);
+    let trustBadgeHtml = '';
+    if (t.trust === 'account' || t.accountLinked) trustBadgeHtml = '<span class="rr-badge account">🔗 Account-linked</span>';
+    else if (t.trust === 'trusted' || t.trusted) trustBadgeHtml = '<span class="rr-badge trusted">🔒 Trusted</span>';
+    else trustBadgeHtml = '<span class="rr-badge guest">Guest</span>';
+    const expBadgeHtml = expBadgeRaw ? '<span class="rr-badge leg">' + _esc(expBadgeRaw) + '</span>' : '<span class="rr-badge leg">no expiry</span>';
+    const legBadge = (isActive && status.leg) ? '<span class="rr-badge leg">via ' + _esc(status.leg) + '</span>' : '';
+    const stateLine = (() => {
+      if (isActive && status.state === 'connected') return '<b>Connected.</b> Last used ' + _esc(fmtAge(t.lastConnectedAt));
+      if (isActive && status.state === 'connecting') return '<b>Connecting&hellip;</b>';
+      if (isActive && status.state === 'authing') return '<b>Authenticating&hellip;</b>';
+      if (isActive && status.state === 'auth-fail') return '<b>Auth failed.</b> Token may have expired — re-pair from your shack.';
+      if (isActive && status.state === 'disconnected') return '<b>Reconnecting&hellip;</b>';
+      return 'Last connected ' + _esc(fmtAge(t.lastConnectedAt));
+    })();
+    const actionBtnHtml = (() => {
+      if (isActive && status.state === 'connected') {
+        return '<button type="button" class="primary" data-act="rr-disconnect" data-id="' + _esc(t.id) + '">Disconnect</button>';
+      }
+      if (isActive && (status.state === 'connecting' || status.state === 'authing' || status.state === 'disconnected')) {
+        return '<button type="button" data-act="rr-disconnect" data-id="' + _esc(t.id) + '">Cancel</button>';
+      }
+      return '<button type="button" class="primary" data-act="rr-connect" data-id="' + _esc(t.id) + '">Connect</button>';
+    })();
+    const reachParts = [];
+    if (t.lanHost) reachParts.push('LAN');
+    if (t.tsHost) reachParts.push('Tailscale');
+    if (t.cloudHost) reachParts.push('Cloud');
+    const reach = reachParts.length > 0 ? reachParts.join(' / ') : '—';
+    return '<li class="' + (isActive ? 'active' : '') + '">'
+      + '<div class="rr-row">'
+      +   '<div class="rr-dot ' + dotClass + '"></div>'
+      +   '<div class="rr-name" data-act="rr-rename" data-id="' + _esc(t.id) + '" data-name="' + _esc(t.name) + '">' + _esc(t.name) + '</div>'
+      + '</div>'
+      + '<div class="rr-meta"><b>' + _esc(t.rigModel || 'Remote rig') + '</b> · ' + _esc(reach) + ' · ' + stateLine + '</div>'
+      + '<div class="rr-badges">' + trustBadgeHtml + expBadgeHtml + legBadge + '</div>'
+      + '<div class="rr-actions">'
+      +   actionBtnHtml
+      +   '<button type="button" data-act="rr-rename" data-id="' + _esc(t.id) + '" data-name="' + _esc(t.name) + '">Rename</button>'
+      +   '<button type="button" class="danger" data-act="rr-remove" data-id="' + _esc(t.id) + '">Remove</button>'
+      + '</div>'
+      + '</li>';
+  }).join('');
+}
+
+async function _remoteRadiosConnect(id) {
+  try {
+    const r = await window.api.connectionTargetsActivate(id);
+    if (r && r.error) alert('Connect failed: ' + r.error);
+  } catch (err) {
+    alert('Connect failed: ' + (err.message || err));
+  }
+  _remoteRadiosRefreshList();
+}
+
+async function _remoteRadiosDisconnect() {
+  try { await window.api.connectionTargetsActivate(null); } catch {}
+  _remoteRadiosRefreshList();
+}
+
+async function _remoteRadiosRename(id, currentName) {
+  const next = await _summaryPrompt({
+    title: 'Rename shack',
+    message: 'Pick a label you’ll recognize in this list.',
+    defaultValue: currentName,
+  });
+  if (next == null) return;
+  const trimmed = next.trim();
+  if (!trimmed || trimmed === currentName) return;
+  try { await window.api.connectionTargetsRename(id, trimmed); } catch {}
+  _remoteRadiosRefreshList();
+}
+
+async function _remoteRadiosRemove(id) {
+  if (!confirm('Remove this paired shack? You’ll need a new pair link to reconnect.')) return;
+  try { await window.api.connectionTargetsRemove(id); } catch {}
+  _remoteRadiosRefreshList();
+}
+
+(function _remoteRadiosWire() {
+  const dlg = document.getElementById('remote-radios-dialog');
+  if (!dlg) return;
+
+  const closeBtn = document.getElementById('remote-radios-close');
+  if (closeBtn) closeBtn.addEventListener('click', () => dlg.close());
+
+  const refresh = document.getElementById('remote-radios-refresh');
+  if (refresh) refresh.addEventListener('click', _remoteRadiosRefreshList);
+
+  const localBtn = document.getElementById('remote-radios-local-btn');
+  if (localBtn) localBtn.addEventListener('click', _remoteRadiosDisconnect);
+
+  // More-menu entry point.
+  const openBtn = document.getElementById('view-remote-radios-btn');
+  if (openBtn) openBtn.addEventListener('click', () => {
+    _remoteRadiosOpen();
+    // Close the More dropdown if it auto-stayed open.
+    const drop = document.getElementById('views-dropdown');
+    if (drop) drop.classList.remove('open');
+  });
+
+  // Delegated row action handler.
+  const listEl = document.getElementById('remote-radios-list');
+  if (listEl) listEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    const act = btn.dataset.act;
+    const id = btn.dataset.id;
+    if (act === 'rr-connect') return _remoteRadiosConnect(id);
+    if (act === 'rr-disconnect') return _remoteRadiosDisconnect();
+    if (act === 'rr-rename') return _remoteRadiosRename(id, btn.dataset.name || '');
+    if (act === 'rr-remove') return _remoteRadiosRemove(id);
+  });
+
+  // Live status pushes.
+  if (window.api && window.api.onRemoteClientStatus) {
+    window.api.onRemoteClientStatus((s) => {
+      _remoteRadiosLastStatus = s || { state: 'idle' };
+      if (dlg.open) _remoteRadiosRefreshList();
+    });
+  }
+  if (window.api && window.api.onConnectionTargetsUpdated) {
+    window.api.onConnectionTargetsUpdated(() => {
+      if (dlg.open) _remoteRadiosRefreshList();
+    });
+  }
+})();
+
+// Displacement banner — when the shack kicks our connection because
+// another client (phone, web ECHOCAT, second laptop) took over, show
+// a friendly explainer with a Reconnect button. Replaces the
+// otherwise-mystery "rig disconnected" experience that today's iOS +
+// browser users get. Phase 1, single-client model — see plan §4.
+// ─── Architecture B: log-error modal (Brief C §2g / Brief B §3) ──────
+//
+// Loud, dismiss-by-user modal that appears when the host couldn't
+// deliver an auto-logged QSO (no capability, sendToClient threw, WS
+// dropped). Casey's hard rule (2026-06-05): a guest's QSO never
+// falls back to the host's logbook — instead the operator gets the
+// full QSO details rendered loudly so they can write it down by hand.
+//
+// Modal, NOT a toast. Stays open until user dismisses. Copy is the
+// verbatim wording Casey wrote — do not "improve."
+function _showLogErrorModal(payload) {
+  const qso = (payload && payload.qso) || {};
+  const reason = (payload && payload.reason) || 'unknown';
+  const messageOverride = (payload && payload.message) || '';
+
+  // Pull QSO details defensively — any field may be missing.
+  const callsign = (qso.callsign || '').toUpperCase() || '(unknown)';
+  // timeOn is 'HHMM' on the wire; format 'HH:MM UTC'
+  const timeRaw = String(qso.timeOn || '').replace(/[^0-9]/g, '');
+  const timeUtc = timeRaw.length >= 4
+    ? (timeRaw.slice(0, 2) + ':' + timeRaw.slice(2, 4) + ' UTC')
+    : '(unknown time)';
+  // frequency is kHz string → MHz with 3 dp for display
+  const freqKhz = parseFloat(qso.frequency || '0');
+  const freqMHz = Number.isFinite(freqKhz) && freqKhz > 0
+    ? (freqKhz / 1000).toFixed(3) + ' MHz'
+    : '(unknown freq)';
+  const mode = qso.mode || '(unknown mode)';
+  const rstSent = qso.rstSent || '---';
+  const rstRcvd = qso.rstRcvd || '---';
+
+  // n-fer ref clause — list every program ref that's set. Mirror Brief B §3.
+  const refParts = [];
+  if (qso.potaRef) refParts.push('POTA ' + String(qso.potaRef).toUpperCase());
+  if (qso.sotaRef) refParts.push('SOTA ' + String(qso.sotaRef).toUpperCase());
+  if (qso.wwffRef) refParts.push('WWFF ' + String(qso.wwffRef).toUpperCase());
+  if (qso.llotaRef) refParts.push('LLOTA ' + String(qso.llotaRef).toUpperCase());
+  if (qso.wwbotaRef) refParts.push('WWBOTA ' + String(qso.wwbotaRef).toUpperCase());
+  if (refParts.length === 0 && qso.sig && qso.sigInfo) {
+    refParts.push(String(qso.sig).toUpperCase() + ' ' + String(qso.sigInfo).toUpperCase());
+  }
+  const refClause = refParts.length > 0 ? ' (at ' + refParts.join(' + ') + ')' : '';
+
+  // Compose modal DOM. Use existing <dialog> if present, else create.
+  let dlg = document.getElementById('log-error-dialog');
+  if (!dlg) {
+    dlg = document.createElement('dialog');
+    dlg.id = 'log-error-dialog';
+    dlg.className = 'log-error-dialog';
+    document.body.appendChild(dlg);
+  }
+  const heading = messageOverride || 'Logging Error.';
+  dlg.innerHTML =
+    '<h3 class="log-error-heading">' + _esc(heading) + '</h3>' +
+    '<p class="log-error-body">' +
+      'QSO with <b>' + _esc(callsign) + '</b> at <b>' + _esc(timeUtc) + '</b> on <b>' +
+      _esc(freqMHz) + ' ' + _esc(mode) + '</b> with RST Rcvd <b>' + _esc(rstRcvd) +
+      '</b> and RST Sent <b>' + _esc(rstSent) + '</b>' + _esc(refClause) +
+      ' failed to save.' +
+    '</p>' +
+    '<p class="log-error-action"><b>Write it down and manually add to your logbook.</b></p>' +
+    '<p class="log-error-meta">Reason: ' + _esc(reason) + '</p>' +
+    '<div class="dialog-buttons">' +
+      '<button type="button" id="log-error-dismiss" class="primary">I wrote it down</button>' +
+    '</div>';
+  const dismissBtn = dlg.querySelector('#log-error-dismiss');
+  if (dismissBtn) dismissBtn.addEventListener('click', () => dlg.close(), { once: true });
+  if (typeof dlg.showModal === 'function' && !dlg.open) dlg.showModal();
+}
+
+if (window.api && window.api.onLogError) {
+  window.api.onLogError(_showLogErrorModal);
+}
+
+function _displacedBannerShow(info) {
+  let banner = document.getElementById('displaced-banner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'displaced-banner';
+    banner.className = 'displaced-banner';
+    document.body.appendChild(banner);
+  }
+  const platform = (info.byPlatform || '').toLowerCase();
+  const friendly = (() => {
+    if (platform.includes('ios')) return '📱 Your iPhone took over the rig.';
+    if (platform.includes('android')) return '📱 Your Android took over the rig.';
+    if (platform.includes('desktop')) return '💻 Another POTACAT desktop took over the rig.';
+    if (platform.includes('browser') || platform.includes('web')) return '🌐 An ECHOCAT browser tab took over the rig.';
+    return '⚠️ Another device took over the rig.';
+  })();
+  const sub = 'Reconnect to take it back — the other device will be displaced.';
+  banner.innerHTML = '<div class="displaced-banner-msg">' + friendly + ' ' + sub + '</div>'
+    + '<div class="displaced-banner-actions">'
+    + '<button type="button" id="displaced-reconnect" class="primary">Reconnect</button>'
+    + '<button type="button" id="displaced-dismiss">Dismiss</button>'
+    + '</div>';
+  banner.classList.remove('hidden');
+  document.getElementById('displaced-dismiss').addEventListener('click', () => banner.classList.add('hidden'));
+  document.getElementById('displaced-reconnect').addEventListener('click', async () => {
+    banner.classList.add('hidden');
+    // Re-activate the same target — server will displace the new
+    // tenant in turn.
+    try {
+      const status = await window.api.connectionTargetsGetStatus();
+      if (status && status.targetId) {
+        await window.api.connectionTargetsActivate(status.targetId);
+      } else {
+        // Fall back to the last connection-targets list head.
+        const list = await window.api.connectionTargetsList();
+        const t = (list || []).find(t => t.lastConnectedAt) || (list || [])[0];
+        if (t) await window.api.connectionTargetsActivate(t.id);
+      }
+    } catch (err) {
+      alert('Reconnect failed: ' + (err.message || err));
+    }
+  });
+}
+if (window.api && window.api.onRemoteClientDisplaced) {
+  window.api.onRemoteClientDisplaced(_displacedBannerShow);
+}
+
+// Active-remote-shack status chip. Hidden unless this desktop is in
+// remote-client mode. State driven by the same onRemoteClientStatus
+// stream the Remote Radios dialog uses; the chip is the always-on
+// surface so users notice WHICH shack the rig pane is showing.
+(function _remoteChipWire() {
+  const chip = document.getElementById('remote-shack-status');
+  if (!chip) return;
+  let _lastChipState = null;
+  const setChip = (state) => {
+    _lastChipState = state;
+    if (!state || state.state === 'idle') {
+      chip.classList.add('hidden');
+      chip.textContent = 'REMOTE';
+      return;
+    }
+    chip.classList.remove('hidden');
+    const name = state.name || 'shack';
+    const leg = state.leg ? (' · ' + state.leg.toUpperCase()) : '';
+    if (state.state === 'connected') {
+      chip.textContent = '🔗 ' + name + leg;
+      chip.style.background = '#4ecca3';
+      chip.style.color = '#0a1a14';
+      chip.title = 'Connected to ' + name + ' — click to manage';
+    } else if (state.state === 'connecting' || state.state === 'authing') {
+      chip.textContent = '🔗 ' + name + ' · connecting';
+      chip.style.background = '#d4a64a';
+      chip.style.color = '#1a1a2e';
+      chip.title = 'Dialing ' + name + '…';
+    } else if (state.state === 'disconnected') {
+      chip.textContent = '🔗 ' + name + ' · reconnecting';
+      chip.style.background = '#d4a64a';
+      chip.style.color = '#1a1a2e';
+      chip.title = 'Lost connection to ' + name + ' — auto-reconnecting';
+    } else if (state.state === 'auth-fail') {
+      chip.textContent = '🔗 ' + name + ' · re-pair';
+      chip.style.background = '#e94560';
+      chip.style.color = '#fff';
+      chip.title = 'Auth failed (' + (state.reason || 'expired') + ') — open Remote Radios to re-pair';
+    }
+  };
+  chip.addEventListener('click', _remoteRadiosOpen);
+  if (window.api && window.api.onRemoteClientStatus) {
+    window.api.onRemoteClientStatus(setChip);
+  }
+  // Hydrate on load.
+  if (window.api && window.api.connectionTargetsGetStatus) {
+    window.api.connectionTargetsGetStatus().then(setChip).catch(() => {});
+  }
+})();
+
+// ─── Pair My Device dialog (unified pair entry point, v1.9) ─────────
+//
+// Single dialog hosting both pairing methods:
+//   📱 QR — for in-person mobile pairing (5-min single-use)
+//   💻 Link — for own laptop or off-site friend (1h–30d, owned/guest)
+// Replaces the old separate "Pair my device" QR popout and "Pair my
+// laptop" link dialog. Wires to the same backend (echocatCreatePairingQr
+// for QR, pairLinkCreate for link).
+
+let _pairLinkCurrentToken = null;
+let _pairLinkCurrentLink = null;
+let _pairDeviceQrTtlTimer = null;
+let _pairDeviceQrLastData = null;
+
+function _pairDeviceOpen() {
+  const dlg = document.getElementById('pair-device-dialog');
+  if (!dlg) return;
+  _pairLinkCurrentToken = null;
+  _pairLinkCurrentLink = null;
+  if (!dlg.open) dlg.showModal();
+  _pairLinkRefreshList();
+  // Auto-generate a pair URL the moment the dialog opens. The QR
+  // encodes the same URL the Copy button puts on the clipboard — the
+  // user scans on a phone OR copies for a desktop/laptop. One flow.
+  _pairDeviceQrGenerate();
+}
+
+// The Pair-my-device dialog now always mints an OWNED, 24-hour, single-
+// use pair link via the same pairLinkCreate IPC the link flow used to
+// use. The QR renders the resulting URL; Copy URL puts the same string
+// on the clipboard. Guest access is the separate "Share my rig" flow.
+const _PAIR_DEVICE_TTL_MS = 24 * 60 * 60 * 1000;
+
+async function _pairDeviceQrGenerate() {
+  const svgEl = document.getElementById('pair-device-qr-svg');
+  const imgEl = document.getElementById('pair-device-qr-img');
+  const fallback = document.getElementById('pair-device-qr-fallback');
+  const ttlEl = document.getElementById('pair-device-qr-ttl');
+  const status = document.getElementById('pair-device-qr-status');
+  const regen = document.getElementById('pair-device-qr-regen');
+  const copyBtn = document.getElementById('pair-device-qr-copy-url');
+
+  if (_pairDeviceQrTtlTimer) { clearInterval(_pairDeviceQrTtlTimer); _pairDeviceQrTtlTimer = null; }
+  if (regen) { regen.disabled = true; regen.textContent = 'Generating…'; }
+  if (copyBtn) copyBtn.disabled = true;
+  if (status) status.textContent = '';
+
+  // Revoke the previous link this dialog minted (if any) so the
+  // pending list doesn't pile up one row per Regenerate click.
+  const prevToken = _pairDeviceQrLastData && _pairDeviceQrLastData.token;
+  if (prevToken) {
+    try { await window.api.pairLinkRevoke(prevToken); } catch {}
+    _pairDeviceQrLastData = null;
+  }
+
+  let r;
+  try { r = await window.api.pairLinkCreate({ ttlMs: _PAIR_DEVICE_TTL_MS, trust: 'owned' }); }
+  catch (err) {
+    if (status) status.textContent = 'Pair URL failed: ' + (err.message || err);
+    if (regen) { regen.disabled = false; regen.textContent = 'Regenerate'; }
+    return;
+  }
+  if (r && r.error) {
+    if (status) status.textContent = r.error;
+    if (regen) { regen.disabled = false; regen.textContent = 'Regenerate'; }
+    if (svgEl) svgEl.style.display = 'none';
+    if (imgEl) imgEl.style.display = 'none';
+    return;
+  }
+  _pairDeviceQrLastData = r;
+  if (copyBtn) copyBtn.disabled = !r.url;
+
+  // Render QR. SVG first (crisp), PNG fallback, then text-only fallback.
+  let shown = false;
+  if (svgEl && r.qrSvg) {
+    try {
+      svgEl.innerHTML = r.qrSvg;
+      if (svgEl.querySelector('svg')) {
+        svgEl.style.display = '';
+        if (imgEl) imgEl.style.display = 'none';
+        if (fallback) fallback.style.display = 'none';
+        shown = true;
+      }
+    } catch {}
+  }
+  if (!shown && imgEl && r.qrDataUrl) {
+    imgEl.onerror = () => {
+      imgEl.style.display = 'none';
+      if (fallback) fallback.style.display = '';
+    };
+    imgEl.src = r.qrDataUrl;
+    imgEl.style.display = '';
+    if (svgEl) svgEl.style.display = 'none';
+    if (fallback) fallback.style.display = 'none';
+    shown = true;
+  }
+  if (!shown) {
+    if (svgEl) svgEl.style.display = 'none';
+    if (imgEl) imgEl.style.display = 'none';
+    if (fallback) fallback.style.display = '';
+  }
+  if (svgEl) svgEl.style.opacity = '1';
+  if (imgEl) imgEl.style.opacity = '1';
+
+  // TTL countdown — formatted for hours+minutes since the link lifetime
+  // is hours-to-days, not single-digit minutes like the old QR popout.
+  // Once the link expires, blank the Copy button and dim the QR.
+  if (ttlEl) ttlEl.classList.remove('expired');
+  const fmt = (ms) => {
+    if (ms <= 0) return 'expired';
+    const totalSec = Math.floor(ms / 1000);
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    if (h > 0) return h + 'h ' + String(m).padStart(2, '0') + 'm';
+    if (m > 0) return m + ':' + String(s).padStart(2, '0');
+    return s + 's';
+  };
+  const tick = () => {
+    const remaining = r.expiresAt - Date.now();
+    if (remaining <= 0) {
+      if (ttlEl) {
+        ttlEl.textContent = 'Link expired — click Regenerate.';
+        ttlEl.classList.add('expired');
+      }
+      if (svgEl) svgEl.style.opacity = '0.3';
+      if (imgEl) imgEl.style.opacity = '0.3';
+      if (copyBtn) copyBtn.disabled = true;
+      _pairDeviceQrLastData = null;
+      if (_pairDeviceQrTtlTimer) { clearInterval(_pairDeviceQrTtlTimer); _pairDeviceQrTtlTimer = null; }
+      return;
+    }
+    if (ttlEl) ttlEl.textContent = 'Link expires in ' + fmt(remaining);
+  };
+  tick();
+  _pairDeviceQrTtlTimer = setInterval(tick, 1000);
+
+  if (regen) { regen.disabled = false; regen.textContent = 'Regenerate'; }
+}
+
+function _pairDeviceTeardownQrTimers() {
+  if (_pairDeviceQrTtlTimer) { clearInterval(_pairDeviceQrTtlTimer); _pairDeviceQrTtlTimer = null; }
+}
+
+async function _pairLinkRefreshList() {
+  const listEl = document.getElementById('pair-link-list');
+  if (!listEl) return;
+  let list = [];
+  try { list = await window.api.pairLinkList(); } catch {}
+  if (!Array.isArray(list) || list.length === 0) {
+    listEl.innerHTML = '<li class="pair-link-empty">No pending links.</li>';
+    return;
+  }
+  // Newest first, used/expired drop to the bottom so the active
+  // links are the operator's first read.
+  const now = Date.now();
+  list.sort((a, b) => {
+    const aActive = !a.used && a.expiresAt > now;
+    const bActive = !b.used && b.expiresAt > now;
+    if (aActive !== bActive) return aActive ? -1 : 1;
+    return b.createdAt - a.createdAt;
+  });
+  const fmtRel = (ms) => {
+    if (ms <= 0) return 'expired';
+    const m = Math.floor(ms / 60000);
+    if (m < 60) return m + 'm left';
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + 'h left';
+    const d = Math.floor(h / 24);
+    return d + 'd left';
+  };
+  listEl.innerHTML = list.map(l => {
+    const remaining = l.expiresAt - now;
+    let statusCls = 'active';
+    let statusTxt = fmtRel(remaining);
+    if (l.used) { statusCls = 'used'; statusTxt = 'used'; }
+    else if (remaining <= 0) { statusCls = 'expired'; statusTxt = 'expired'; }
+    const label = l.label ? '<span class="pll-label">' + _esc(l.label) + '</span> · ' : '';
+    const created = new Date(l.createdAt).toLocaleDateString();
+    const trustTag = l.trust === 'owned' ? '🔒 ' : '👤 ';
+    return '<li>'
+      + '<div class="pll-meta">' + trustTag + label + 'created ' + _esc(created) + '</div>'
+      + '<span class="pll-status ' + statusCls + '">' + statusTxt + '</span>'
+      + '<button type="button" class="pll-revoke" data-act="pll-revoke" data-token="' + _esc(l.token) + '">Remove</button>'
+      + '</li>';
+  }).join('');
+}
+
+async function _pairLinkRevoke(token, confirmFirst) {
+  if (!token) return;
+  if (confirmFirst && !confirm('Revoke this pair link? Anyone holding it can no longer pair.')) return;
+  try { await window.api.pairLinkRevoke(token); } catch {}
+  // If the operator revoked the link currently showing on the QR,
+  // clear our cached pointer so Copy URL stops working until a new
+  // one is generated.
+  if (_pairDeviceQrLastData && _pairDeviceQrLastData.token === token) {
+    _pairDeviceQrLastData = null;
+    const copyBtn = document.getElementById('pair-device-qr-copy-url');
+    if (copyBtn) copyBtn.disabled = true;
+  }
+  _pairLinkRefreshList();
+}
+
+// Listen for pair-link redemption results pushed from main when this
+// desktop opens a potacat://pair?... URL (emailed link, second-instance
+// argv, or cold-start argv). Shown as a non-blocking confirmation so
+// the operator knows the pair landed and which leg succeeded. The
+// Remote Radios panel (task #13) will be the persistent UI for the
+// resulting connectionTargets row.
+if (window.api && window.api.onPairLinkRedeemed) {
+  window.api.onPairLinkRedeemed((r) => {
+    if (!r) return;
+    if (r.ok) {
+      const note = 'Paired with ' + (r.name || 'remote shack') + ' via ' + (r.leg || 'unknown') + '. Opens from More → Remote Radios.';
+      try { alert(note); } catch {}
+    } else {
+      try { alert('Pair link redemption failed: ' + (r.error || 'unknown error')); } catch {}
+    }
+  });
+}
+
+(function _pairDeviceWire() {
+  const dlg = document.getElementById('pair-device-dialog');
+  if (!dlg) return;
+
+  const closeBtn = document.getElementById('pair-device-close');
+  if (closeBtn) closeBtn.addEventListener('click', () => dlg.close());
+
+  const qrRegen = document.getElementById('pair-device-qr-regen');
+  if (qrRegen) qrRegen.addEventListener('click', () => _pairDeviceQrGenerate());
+
+  const qrCopy = document.getElementById('pair-device-qr-copy-url');
+  if (qrCopy) qrCopy.addEventListener('click', () => {
+    const url = _pairDeviceQrLastData && _pairDeviceQrLastData.url;
+    if (!url) return;
+    window.api.copyToClipboard(url);
+    const prev = qrCopy.textContent;
+    qrCopy.textContent = 'Copied';
+    setTimeout(() => { qrCopy.textContent = prev; }, 1400);
+  });
+
+  // Stop the TTL timer when the dialog closes; otherwise it keeps
+  // ticking for nothing and the next open double-stacks timers.
+  // _pairDeviceQrLastData stays set so the live link can be reused
+  // on reopen — but the QR view itself re-renders to keep the UI
+  // consistent.
+  dlg.addEventListener('close', () => {
+    _pairDeviceTeardownQrTimers();
+  });
+
+  const refresh = document.getElementById('pair-link-refresh');
+  if (refresh) refresh.addEventListener('click', _pairLinkRefreshList);
+
+  // Delegated revoke clicks inside the pending-links list.
+  const listEl = document.getElementById('pair-link-list');
+  if (listEl) listEl.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-act="pll-revoke"]');
+    if (!b) return;
+    const token = b.dataset.token;
+    _pairLinkRevoke(token, true);
+  });
+
+  // Live push from main when a link is consumed or persisted — keeps
+  // the pending list fresh without manual Refresh.
+  if (window.api && window.api.onPairLinksUpdated) {
+    window.api.onPairLinksUpdated(() => {
+      if (dlg.open) _pairLinkRefreshList();
+    });
+  }
 })();
 
 // Electron renderers block window.prompt(). This is a Promise-based
@@ -5537,8 +6546,8 @@ function _buildEchocatCardHTML(tunnel, tail, devices) {
     + '<div class="summary-sub" style="margin-top:6px;font-weight:600;">My devices</div>'
     + '<div class="summary-device-list">' + _summaryDeviceListHTML(devices) + '</div>'
     + '<div class="summary-card-actions">'
-    + '<button type="button" data-act="echo-pair">Pair my device&hellip;</button>'
-    + '<button type="button" data-act="echo-share">Share your rig&hellip;</button>'
+    + '<button type="button" data-act="echo-pair-device">Pair my device&hellip;</button>'
+    + '<button type="button" data-act="echo-share">Share my rig&hellip;</button>'
     + tunnelBtn
     + '<button type="button" data-act="echo-diagnostics" title="Cloud Tunnel diagnostics">Diagnostics</button>'
     + '</div>';
@@ -5701,7 +6710,7 @@ function _wireSummaryCardActionsOnce() {
         }
       }
       else if (act === 'tunnel-off') await window.api.cloudTunnelDisable();
-      else if (act === 'echo-pair') window.api.pairPopoutOpen();
+      else if (act === 'echo-pair-device') _pairDeviceOpen();
       else if (act === 'echo-share') _shareRigOpen();
       else if (act === 'echo-diagnostics') _summaryTunnelDiagOpen();
       else if (act === 'pota-connect') await window.api.potaSyncConnect();
@@ -10117,6 +11126,7 @@ logSaveBtn.addEventListener('click', async () => {
   let sotaRef  = parsedByType.sota  ? parsedByType.sota.primary  : '';
   let wwffRef  = parsedByType.wwff  ? parsedByType.wwff.primary  : '';
   let llotaRef = parsedByType.llota ? parsedByType.llota.primary : '';
+  let wwbotaRef = parsedByType.wwbota ? parsedByType.wwbota.primary : '';
   // The primary type's additional refs (for the n-fer loop below).
   const addlParks = primaryType && parsedByType[primaryType] ? parsedByType[primaryType].additional : [];
   // Secondary types' additional refs get joined into the _REF fields
@@ -10132,6 +11142,7 @@ logSaveBtn.addEventListener('click', async () => {
   if (primaryType !== 'sota'  && parsedByType.sota)  sotaRef  = joinRefs('sota');
   if (primaryType !== 'wwff'  && parsedByType.wwff)  wwffRef  = joinRefs('wwff');
   if (primaryType !== 'llota' && parsedByType.llota) llotaRef = joinRefs('llota');
+  if (primaryType !== 'wwbota' && parsedByType.wwbota) wwbotaRef = joinRefs('wwbota');
 
   // Re-spot state from stored targets
   const respotCheckbox = document.getElementById('log-respot');
@@ -10141,6 +11152,7 @@ logSaveBtn.addEventListener('click', async () => {
   const wantsRespot = respotCheckbox.checked && logTargets.includes('pota');
   const wantsWwffRespot = respotCheckbox.checked && logTargets.includes('wwff');
   const wantsLlotaRespot = respotCheckbox.checked && logTargets.includes('llota');
+  const wantsWwbotaRespot = respotCheckbox.checked && logTargets.includes('wwbota');
   const wantsDxcRespot = respotCheckbox.checked && logTargets.includes('dxc');
 
   // Persist the re-spot toggle preference. The comment text itself
@@ -10230,8 +11242,10 @@ logSaveBtn.addEventListener('click', async () => {
         wwffReference: ci === 0 && wantsWwffRespot ? respotWwffRef : '',
         llotaRespot: ci === 0 && wantsLlotaRespot,
         llotaReference: ci === 0 && wantsLlotaRespot && parsedByType.llota ? parsedByType.llota.primary : '',
+        wwbotaRespot: ci === 0 && wantsWwbotaRespot,
+        wwbotaReference: ci === 0 && wantsWwbotaRespot && parsedByType.wwbota ? parsedByType.wwbota.primary : '',
         dxcRespot: ci === 0 && wantsDxcRespot,
-        respotComment: ci === 0 && (wantsRespot || wantsWwffRespot || wantsLlotaRespot || wantsDxcRespot) ? commentText : '',
+        respotComment: ci === 0 && (wantsRespot || wantsWwffRespot || wantsLlotaRespot || wantsWwbotaRespot || wantsDxcRespot) ? commentText : '',
       };
 
       lastResult = await window.api.saveQso(qsoData);
@@ -10247,10 +11261,12 @@ logSaveBtn.addEventListener('click', async () => {
           sotaRef: sig === 'SOTA' ? addlRef : qsoData.sotaRef,
           wwffRef: sig === 'WWFF' ? addlRef : qsoData.wwffRef,
           llotaRef: sig === 'LLOTA' ? addlRef : qsoData.llotaRef,
+          wwbotaRef: sig === 'WWBOTA' ? addlRef : qsoData.wwbotaRef,
           comment: addlComment,
           respot: false,
           wwffRespot: false,
           llotaRespot: false,
+          wwbotaRespot: false,
           dxcRespot: false,
           respotComment: '',
           skipLogbookForward: true,
@@ -10310,13 +11326,28 @@ logSaveBtn.addEventListener('click', async () => {
           ? 'Could not reach logbook — is it running and configured correctly?'
           : lastResult.logbookError;
         showLogToast(`Logged ${displayCalls} to ADIF, but logbook forwarding failed: ${friendly}`, { warn: true, duration: 8000 });
-      } else if (lastResult.respotError) {
-        showLogToast(`Logged ${displayCalls} to ADIF, but POTA re-spot failed: ${lastResult.respotError}`, { warn: true, duration: 8000 });
-      } else if (lastResult.resposted) {
-        const sources = logTargets.filter(t => respotCheckbox.checked).map(t => RESPOT_NAMES[t]).join(' & ');
-        showLogToast(`Logged ${displayCalls} — re-spotted on ${sources || 'POTA'}`);
       } else {
-        showLogToast(`Logged ${displayCalls}`);
+        // Surface the first re-spot error that fired, with the correct
+        // program name so the user knows which network rejected the
+        // re-spot. Previously this branch only checked respotError and
+        // always blamed POTA — wwbotaRespotError was silently dropped
+        // and llota/wwff users got a misleading "POTA re-spot failed"
+        // toast. K3SBP/AB9AI 2026-06-03.
+        const respotErrSpec =
+          lastResult.respotError      ? { net: 'POTA',   msg: lastResult.respotError }      :
+          lastResult.wwffRespotError  ? { net: 'WWFF',   msg: lastResult.wwffRespotError }  :
+          lastResult.llotaRespotError ? { net: 'LLOTA',  msg: lastResult.llotaRespotError } :
+          lastResult.wwbotaRespotError ? { net: 'WWBOTA', msg: lastResult.wwbotaRespotError } :
+          lastResult.dxcRespotError   ? { net: 'DX cluster', msg: lastResult.dxcRespotError } :
+          null;
+        if (respotErrSpec) {
+          showLogToast(`Logged ${displayCalls} to ADIF, but ${respotErrSpec.net} re-spot failed: ${respotErrSpec.msg}`, { warn: true, duration: 8000 });
+        } else if (lastResult.resposted) {
+          const sources = logTargets.filter(t => respotCheckbox.checked).map(t => RESPOT_NAMES[t]).join(' & ');
+          showLogToast(`Logged ${displayCalls} — re-spotted on ${sources || 'POTA'}`);
+        } else {
+          showLogToast(`Logged ${displayCalls}`);
+        }
       }
     } else if (lastResult) {
       showLogToast(`Error: ${lastResult.error}`, { warn: true, duration: 5000 });
@@ -10928,40 +11959,45 @@ document.querySelectorAll('thead th[data-sort]').forEach((th) => {
 // Logbook button
 logbookBtn.addEventListener('click', () => window.api.qsoPopoutOpen());
 
-// --- Settings quick-access dropdown ---
-const settingsDropdown = document.getElementById('settings-dropdown');
+// --- Settings button + quick-access input refs ---
+// The old "Settings dropdown" panel was retired 2026-06-04. Inputs
+// got rehomed: theme toggle to Summary header, ECHOCAT URL/audio
+// + Display toggles to Summary > Quick Settings, Activator mode to
+// the More dropdown. IDs preserved so each input's change handler
+// below still fires from its new home.
+// Stub so legacy `settingsDropdown.classList.toggle('open')` callsites
+// scattered through closeAllPopovers / activator UI silently no-op
+// after the dropdown panel was removed. Cheaper than auditing every
+// caller; the dropdown will never be re-introduced under this name.
+const _noopClassList = { add() {}, remove() {}, toggle() {}, contains() { return false; } };
+const settingsDropdown = {
+  classList: _noopClassList,
+  querySelector: () => null,
+  appendChild: () => {},
+};
 const quickLightMode = document.getElementById('quick-light-mode');
 const quickActivatorMode = document.getElementById('quick-activator-mode');
 const quickHideWorkedParks = document.getElementById('quick-hide-worked-parks');
-const openSettingsBtn = document.getElementById('open-settings-btn');
-
-settingsDropdown.querySelector('.settings-dropdown-panel').addEventListener('click', (e) => {
-  e.stopPropagation();
-});
 
 settingsBtn.addEventListener('click', (e) => {
   e.stopPropagation();
-  document.querySelectorAll('.multi-dropdown.open').forEach((d) => {
-    if (d !== settingsDropdown) d.classList.remove('open');
-  });
-  const opening = !settingsDropdown.classList.contains('open');
-  settingsDropdown.classList.toggle('open');
-  if (opening) {
-    // Sync switches to current state
-    quickLightMode.checked = document.documentElement.getAttribute('data-theme') === 'light';
-    quickActivatorMode.checked = appMode === 'activator';
-    quickHideWorkedParks.checked = hideWorkedParks;
-    // Show rotor toggle only when PSTRotator is configured in Settings
-    quickRotorLabel.classList.toggle('hidden', !rotorConfigured);
-    quickRotorDivider.classList.toggle('hidden', !rotorConfigured);
-    refreshEchoCatInfo();
-  }
+  openSettingsDialog();
 });
+
+// Reused by both the change handler below AND refreshSummaryCard
+// (which fires on dialog open) so the label always reflects current
+// theme state without waiting for a click.
+function _updateThemeToggleLabel() {
+  const label = document.getElementById('quick-light-mode-label');
+  if (!label) return;
+  label.textContent = quickLightMode && quickLightMode.checked ? 'Light Mode' : 'Dark Mode';
+}
 
 quickLightMode.addEventListener('change', async () => {
   const light = quickLightMode.checked;
   applyTheme(light);
   setLightMode.checked = light;
+  _updateThemeToggleLabel();
   if (popoutOpen) window.api.sendPopoutTheme(light ? 'light' : 'dark');
   if (qsoPopoutOpen) window.api.sendQsoPopoutTheme(light ? 'light' : 'dark');
   window.api.logPopoutTheme(light ? 'light' : 'dark');
@@ -10977,12 +12013,20 @@ quickLightMode.addEventListener('change', async () => {
   await window.api.saveSettings({ lightMode: light });
 });
 
-quickActivatorMode.addEventListener('change', async () => {
-  const mode = quickActivatorMode.checked ? 'activator' : 'hunter';
-  setAppMode(mode);
-  settingsDropdown.classList.remove('open');
-  closeActivatorSettingsPanel();
-  await window.api.saveSettings({ appMode: mode });
+// More dropdown → "Activator mode" entry. Behaves like the other
+// view-menu-item buttons: one click enters Activator mode. Exiting
+// is via the "Back to Hunter" button inside the Activator UI
+// (activatorBackBtn) — same way SSTV / JTCAT have their own
+// in-view exit affordances rather than a second menu entry.
+quickActivatorMode.addEventListener('click', async () => {
+  if (appMode === 'activator') {
+    // Already there — close the dropdown and bail.
+    document.getElementById('views-dropdown')?.classList.remove('open');
+    return;
+  }
+  setAppMode('activator');
+  document.getElementById('views-dropdown')?.classList.remove('open');
+  await window.api.saveSettings({ appMode: 'activator' });
 });
 
 quickHideWorkedParks.addEventListener('change', async () => {
@@ -11052,11 +12096,9 @@ quickRotor.addEventListener('change', async () => {
   await window.api.saveSettings({ rotorActive: quickRotor.checked });
 });
 
-openSettingsBtn.addEventListener('click', () => {
-  settingsDropdown.classList.remove('open');
-  closeActivatorSettingsPanel();
-  openSettingsDialog();
-});
+// openSettingsBtn — was inside the (now-removed) Settings dropdown
+// panel. Settings button on the main toolbar opens the dialog
+// directly now; this handler is intentionally gone.
 
 // ECHOCAT quick toggle
 // Quick toggle removed 2026-06-02 — ECHOCAT is always-on.
@@ -11220,6 +12262,9 @@ if (settingsTabBar) {
   settingsTabBar.addEventListener('click', (e) => {
     const btn = e.target.closest('.settings-tab');
     if (!btn) return;
+    // Report a Bug is styled like a tab but acts as an action — its
+    // own #report-bug-btn handler fires; don't try to switch tabs.
+    if (btn.classList.contains('settings-tab-action')) return;
     settingsSearch.value = '';
     settingsTabBar.querySelectorAll('.settings-tab').forEach(b => b.classList.remove('has-match'));
     // Clear any row-level search hiding so the picked tab renders fully.
@@ -11735,6 +12780,7 @@ async function openSettingsDialog(tab) {
   const requireToken = s.remoteRequireToken !== false; // default true for existing users
   setRemoteRequireToken.checked = requireToken;
   remoteTokenRow.classList.toggle('hidden', !requireToken);
+  if (setAllowPairRequests) setAllowPairRequests.checked = s.allowPairRequests !== false;
   setRemoteToken.value = s.remoteToken || '';
   setRemotePttTimeout.value = s.remotePttTimeout || 180;
   if (setEchocatPairHost) setEchocatPairHost.value = s.echocatPairHost || '';
@@ -12194,6 +13240,7 @@ settingsSave.addEventListener('click', async () => {
   const remoteEnabled = true;
   const remotePortVal = parseInt(setRemotePort.value, 10) || 7300;
   const remoteRequireTokenVal = setRemoteRequireToken.checked;
+  const allowPairRequestsVal = setAllowPairRequests ? setAllowPairRequests.checked : true;
   const remoteTokenVal = setRemoteToken.value;
   const remotePttTimeoutVal = parseInt(setRemotePttTimeout.value, 10) || 180;
   const ssbOverDataVal = setSsbOverData.checked;
@@ -12412,6 +13459,7 @@ settingsSave.addEventListener('click', async () => {
     enableRemote: remoteEnabled,
     remotePort: remotePortVal,
     remoteRequireToken: remoteRequireTokenVal,
+    allowPairRequests: allowPairRequestsVal,
     remoteToken: remoteTokenVal,
     remotePttTimeout: remotePttTimeoutVal,
     echocatPairHost: setEchocatPairHost ? setEchocatPairHost.value.trim() : '',
@@ -14832,6 +15880,10 @@ catLogClearBtn.addEventListener('click', () => {
   btn.addEventListener('click', () => {
     // Close the Quick Settings dropdown so the banner isn't hidden behind it
     if (settingsDropdown) settingsDropdown.classList.remove('open');
+    // Close the Settings dialog too — the recording banner shows on the main
+    // window, so leaving the modal up would hide it behind the dialog.
+    const dlg = document.getElementById('settings-dialog');
+    if (dlg && typeof dlg.close === 'function' && dlg.open) dlg.close();
     startBugReport();
   });
 })();
@@ -16448,6 +17500,7 @@ const rigPowerOffBtn = document.getElementById('rig-power-off-btn');
 const rigRfGain = document.getElementById('rig-rfgain');
 const rigRfGainLabel = document.getElementById('rig-rfgain-label');
 const rigTxPower = document.getElementById('rig-txpower');
+const rigTxPowerSelect = document.getElementById('rig-txpower-select');
 const rigTxPowerLabel = document.getElementById('rig-txpower-label');
 const rigFilterPresets = document.getElementById('rig-filter-presets');
 // Phase-1 expanded rig modifiers (Flex 8600M underbuild fix, 2026-05-25).
@@ -16485,18 +17538,66 @@ const rigBreakInBtn       = document.getElementById('rig-breakin-btn');
 const rigBreakInDelaySel  = document.getElementById('rig-breakin-delay-select');
 const rigPreampTargetSel  = document.getElementById('rig-preamp-target-select');
 const rigPreampLevelSel   = document.getElementById('rig-preamp-level-select');
+const rigAntennaPortSel   = document.getElementById('rig-antenna-port-select');
 let rigPopoverOpen = false;
 let rigCurrentCaps = {};
 let rigCurrentMode = '';
+let rigPowerChoicesSignature = '';
+let rigLastFtx1Layout = null;
 
 const RIG_FILTER_PRESETS = {
   SSB: [1800, 2100, 2400, 2700, 3000, 3600],
   CW:  [50, 100, 200, 500, 1000, 1500, 2400],
   DIG: [500, 1000, 2000, 3000, 4000],
 };
+const RIG_DEFAULT_AGC_MODES = ['off', 'fast', 'med', 'slow'];
+const RIG_AGC_LABELS = { off: 'Off', auto: 'Auto', fast: 'Fast', med: 'Mid', mid: 'Mid', slow: 'Slow' };
 
 function formatFilterWidth(hz) {
   return hz >= 1000 ? (hz / 1000).toFixed(hz % 1000 === 0 ? 0 : 1) + 'k' : hz + '';
+}
+
+function rigFormatPower(watts) {
+  const decimals = Math.max(0, parseInt(rigCurrentCaps.powerDecimals || 0, 10));
+  const numeric = Number(watts);
+  if (!Number.isFinite(numeric)) return watts + 'W';
+  return numeric.toFixed(decimals) + 'W';
+}
+
+function rigUsesPowerSelect() {
+  return Array.isArray(rigCurrentCaps.powerChoices) && rigCurrentCaps.powerChoices.length > 0;
+}
+
+function rigPopulatePowerChoices(caps) {
+  if (!rigTxPowerSelect) return;
+  const choices = Array.isArray(caps.powerChoices) ? caps.powerChoices : [];
+  const useSelect = choices.length > 0;
+  rigTxPower.classList.toggle('hidden', useSelect);
+  rigTxPowerSelect.classList.toggle('hidden', !useSelect);
+  if (!useSelect) {
+    rigPowerChoicesSignature = '';
+    return;
+  }
+
+  const normalizedChoices = choices
+    .map(choice => Number(choice))
+    .filter(choice => Number.isFinite(choice));
+  const signature = normalizedChoices.join(',');
+  if (signature === rigPowerChoicesSignature) return;
+  if (document.activeElement === rigTxPowerSelect) return;
+
+  const previous = rigTxPowerSelect.value;
+  rigTxPowerSelect.innerHTML = '';
+  for (const value of normalizedChoices) {
+    const opt = document.createElement('option');
+    opt.value = String(value);
+    opt.textContent = rigFormatPower(value);
+    rigTxPowerSelect.appendChild(opt);
+  }
+  rigPowerChoicesSignature = signature;
+  if (previous && Array.from(rigTxPowerSelect.options).some(o => o.value === previous)) {
+    rigTxPowerSelect.value = previous;
+  }
 }
 
 function rigGetFilterPresets(mode) {
@@ -16521,8 +17622,117 @@ function rigBuildFilterPresets(mode, currentWidth) {
   }
 }
 
+function rigPopulateAgcOptions(caps) {
+  if (!rigAgcSelect) return;
+  const previous = rigAgcSelect.value === 'mid' ? 'med' : rigAgcSelect.value;
+  const rawModes = Array.isArray(caps.agcModes) && caps.agcModes.length
+    ? caps.agcModes
+    : RIG_DEFAULT_AGC_MODES;
+  const modes = [];
+  for (const mode of rawModes) {
+    const normalized = mode === 'mid' ? 'med' : mode;
+    if (!modes.includes(normalized)) modes.push(normalized);
+  }
+
+  rigAgcSelect.innerHTML = '';
+  const empty = document.createElement('option');
+  empty.value = '';
+  empty.textContent = '—';
+  rigAgcSelect.appendChild(empty);
+  for (const mode of modes) {
+    const opt = document.createElement('option');
+    opt.value = mode;
+    opt.textContent = RIG_AGC_LABELS[mode] || mode.toUpperCase();
+    rigAgcSelect.appendChild(opt);
+  }
+  rigAgcSelect.value = modes.includes(previous) ? previous : '';
+}
+
+function rigRefreshPreampLevelOptions() {
+  if (!rigPreampTargetSel || !rigPreampLevelSel) return;
+  const target = rigPreampTargetSel.value || 'hf50';
+  const previous = parseInt(rigPreampLevelSel.value || '0', 10);
+  const options = target === 'hf50'
+    ? [
+        { value: '0', label: 'IPO' },
+        { value: '1', label: 'AMP1' },
+        { value: '2', label: 'AMP2' },
+      ]
+    : [
+        { value: '0', label: 'Off' },
+        { value: '1', label: 'On' },
+      ];
+
+  rigPreampLevelSel.innerHTML = '';
+  for (const optDef of options) {
+    const opt = document.createElement('option');
+    opt.value = optDef.value;
+    opt.textContent = optDef.label;
+    rigPreampLevelSel.appendChild(opt);
+  }
+
+  const clamped = Math.min(previous, target === 'hf50' ? 2 : 1);
+  rigPreampLevelSel.value = String(clamped);
+  rigPreampLevelSel.title = target === 'hf50'
+    ? 'HF/50 preamp level: IPO, AMP1, or AMP2'
+    : 'VHF/UHF preamp: Off or On';
+}
+
+function rigPlaceMonitorNearCwControls(isFtx1) {
+  const delayRow = document.getElementById('rig-breakindelay-row');
+  const defaultAnchor = document.getElementById('rig-voxlevel-row');
+  const monRow = document.getElementById('rig-mon-row');
+  const monLevelRow = document.getElementById('rig-monlevel-row');
+  const anchor = isFtx1 ? delayRow : defaultAnchor;
+  if (!anchor || !monRow || !monLevelRow) return;
+  anchor.insertAdjacentElement('afterend', monLevelRow);
+  anchor.insertAdjacentElement('afterend', monRow);
+}
+
+function rigPlaceFtx1PriorityControls(isFtx1) {
+  const modRow = document.getElementById('rig-modifiers-row');
+  const filterRow = rigFilterPresets ? rigFilterPresets.closest('.rig-popover-row') : null;
+  const rows = {
+    rfGain: document.getElementById('rig-rfgain-row'),
+    txPower: document.getElementById('rig-txpower-row'),
+    preamp: document.getElementById('rig-preamp-target-row'),
+    antenna: document.getElementById('rig-antenna-port-row'),
+  };
+
+  const insertAfter = (anchor, orderedRows) => {
+    if (!anchor) return;
+    for (const row of orderedRows.slice().reverse()) {
+      if (row) anchor.insertAdjacentElement('afterend', row);
+    }
+  };
+  const insertBefore = (anchor, orderedRows) => {
+    if (!anchor || !anchor.parentNode) return;
+    for (const row of orderedRows) {
+      if (row) anchor.parentNode.insertBefore(row, anchor);
+    }
+  };
+
+  if (isFtx1) {
+    // FTX-1 has frequently-used Field/Optima controls that benefit from a
+    // top grouping; keep that layout model-scoped instead of changing all rigs.
+    insertAfter(modRow, [rows.rfGain, rows.txPower, rows.preamp, rows.antenna]);
+  } else {
+    // Restore the upstream-style generic ordering for every non-FTX profile.
+    insertBefore(filterRow, [rows.preamp, rows.rfGain, rows.txPower, rows.antenna]);
+  }
+}
+
 function rigApplyCapabilities(caps) {
-  rigCurrentCaps = caps || {};
+  caps = caps || {};
+  rigCurrentCaps = caps;
+  const isFtx1 = !!(caps.dnrLevel || caps.clarRx || caps.clarTx || caps.preampTarget);
+  if (rigLastFtx1Layout !== isFtx1) {
+    rigPlaceFtx1PriorityControls(isFtx1);
+    rigLastFtx1Layout = isFtx1;
+  }
+  rigPlaceMonitorNearCwControls(isFtx1);
+  rigPopulateAgcOptions(caps);
+  rigPopulatePowerChoices(caps);
   rigAtuBtn.style.display = caps.atu ? '' : 'none';
   rigNbBtn.style.display = caps.nb ? '' : 'none';
   rigPowerOnBtn.style.display = caps.power ? '' : 'none';
@@ -16540,6 +17750,18 @@ function rigApplyCapabilities(caps) {
   if (rigNrBtn)     rigNrBtn.style.display     = caps.nr     ? '' : 'none';
   if (rigAnfBtn)    rigAnfBtn.style.display    = caps.anf    ? '' : 'none';
   if (rigVoxBtn)    rigVoxBtn.style.display    = caps.vox    ? '' : 'none';
+  if (rigCompBtn) {
+    rigCompBtn.textContent = isFtx1 ? 'PROC' : 'Comp';
+    rigCompBtn.title = isFtx1 ? 'Speech Processor (PROC)' : 'Speech Compressor (TX)';
+  }
+  if (rigNrBtn) {
+    rigNrBtn.textContent = isFtx1 ? 'DNR' : 'NR';
+    rigNrBtn.title = isFtx1 ? 'Digital Noise Reduction' : 'Noise Reduction';
+  }
+  if (rigAnfBtn) {
+    rigAnfBtn.textContent = isFtx1 ? 'DNF' : 'ANF';
+    rigAnfBtn.title = isFtx1 ? 'Digital Notch Filter' : 'Auto Notch Filter';
+  }
   const anyModifier = caps.preamp || caps.att || caps.comp || caps.nr || caps.anf || caps.vox;
   const modRow = document.getElementById('rig-modifiers-row');
   if (modRow) modRow.style.display = anyModifier ? '' : 'none';
@@ -16552,7 +17774,7 @@ function rigApplyCapabilities(caps) {
     const el = document.getElementById(id);
     if (el) el.style.display = show ? '' : 'none';
   };
-  setRowDisplay('rig-nrlevel-row',  !!caps.nrLevel);
+  setRowDisplay('rig-nrlevel-row',  !!caps.nrLevel && !caps.dnrLevel);
   setRowDisplay('rig-nblevel-row',  !!caps.nbLevel);
   setRowDisplay('rig-voxlevel-row', !!caps.voxLevel);
   setRowDisplay('rig-monlevel-row', !!caps.monLevel);
@@ -16576,9 +17798,26 @@ function rigApplyCapabilities(caps) {
   setRowDisplay('rig-breakin-row',       !!caps.breakIn);
   setRowDisplay('rig-breakindelay-row',  !!caps.breakInDelay);
   setRowDisplay('rig-preamp-target-row', !!caps.preampTarget);
+  setRowDisplay('rig-antenna-port-row',  !!caps.antennaPort);
   // Clamp TX power slider to radio's min/max
   if (caps.minPower != null) rigTxPower.min = caps.minPower;
   if (caps.maxPower != null) rigTxPower.max = caps.maxPower;
+  rigTxPower.step = caps.powerStep != null ? caps.powerStep : 1;
+  if (rigTxPowerLabel) {
+    const powerValue = rigUsesPowerSelect() ? rigTxPowerSelect.value : rigTxPower.value;
+    rigTxPowerLabel.textContent = rigFormatPower(powerValue);
+  }
+  rigRefreshPreampLevelOptions();
+  if (rigNbLevel && caps.maxNbLevel != null) {
+    rigNbLevel.min = 0;
+    rigNbLevel.max = caps.maxNbLevel;
+    rigNbLevel.step = 1;
+  }
+  if (rigDnrLevel && caps.maxDnrLevel != null) {
+    rigDnrLevel.min = 0;
+    rigDnrLevel.max = caps.maxDnrLevel;
+    rigDnrLevel.step = 1;
+  }
 }
 
 function positionRigPopover() {
@@ -16717,6 +17956,7 @@ if (rigBreakInDelaySel) {
 // the radio always sees a coherent (target, level) pair.
 function _sendPreampTarget() {
   const target = (rigPreampTargetSel && rigPreampTargetSel.value) || 'hf50';
+  rigRefreshPreampLevelOptions();
   const level = parseInt((rigPreampLevelSel && rigPreampLevelSel.value) || '0', 10);
   // AMP2 is only valid on HF/50 — clamp away on VHF/UHF rather than
   // silently sending an out-of-range value.
@@ -16726,6 +17966,12 @@ function _sendPreampTarget() {
 }
 if (rigPreampTargetSel) rigPreampTargetSel.addEventListener('change', _sendPreampTarget);
 if (rigPreampLevelSel)  rigPreampLevelSel.addEventListener('change', _sendPreampTarget);
+if (rigAntennaPortSel) {
+  rigAntennaPortSel.addEventListener('change', () => {
+    const port = parseInt(rigAntennaPortSel.value, 10) || 1;
+    window.api.rigControl({ action: 'set-antenna-port', value: port });
+  });
+}
 
 // Slider handlers
 // Throttle rig control sliders to prevent flooding serial port
@@ -16745,14 +17991,24 @@ rigRfGain.addEventListener('input', () => {
 });
 
 rigTxPower.addEventListener('input', () => {
-  const val = parseInt(rigTxPower.value, 10);
-  rigTxPowerLabel.textContent = val + 'W';
+  const val = parseFloat(rigTxPower.value);
+  rigTxPowerLabel.textContent = rigFormatPower(val);
   throttledRigControl('set-tx-power', val);
 });
+if (rigTxPowerSelect) {
+  rigTxPowerSelect.addEventListener('change', () => {
+    const val = parseFloat(rigTxPowerSelect.value);
+    rigTxPowerLabel.textContent = rigFormatPower(val);
+    window.api.rigControl({ action: 'set-tx-power', value: val });
+  });
+}
 
 // Listen for rig state updates from main process
 window.api.onRigState((state) => {
   if (!state) return;
+  // Apply model capabilities before syncing values so Field-specific power
+  // decimals/limits and target-specific preamp labels are already in place.
+  if (state.capabilities) rigApplyCapabilities(state.capabilities);
   // Update NB button
   if (state.nb) {
     rigNbBtn.classList.add('active');
@@ -16813,24 +18069,37 @@ window.api.onRigState((state) => {
   }
   if (rigPreampTargetSel && state.preampTarget != null && document.activeElement !== rigPreampTargetSel) {
     rigPreampTargetSel.value = state.preampTarget;
+    rigRefreshPreampLevelOptions();
   }
   if (rigPreampLevelSel && state.preampLevel != null && document.activeElement !== rigPreampLevelSel) {
+    rigRefreshPreampLevelOptions();
     rigPreampLevelSel.value = String(state.preampLevel);
+  }
+  if (rigAntennaPortSel && state.antennaPort != null && document.activeElement !== rigAntennaPortSel) {
+    rigAntennaPortSel.value = String(state.antennaPort);
   }
   // Update sliders (only if user is not actively dragging)
   if (document.activeElement !== rigRfGain && state.rfGain != null) {
     rigRfGain.value = state.rfGain;
     rigRfGainLabel.textContent = state.rfGain;
   }
-  if (document.activeElement !== rigTxPower && state.txPower != null) {
-    rigTxPower.value = state.txPower;
-    rigTxPowerLabel.textContent = state.txPower + 'W';
+  if (state.txPower != null && document.activeElement !== rigTxPower && document.activeElement !== rigTxPowerSelect) {
+    if (rigUsesPowerSelect() && rigTxPowerSelect) {
+      const choices = Array.from(rigTxPowerSelect.options).map(o => parseFloat(o.value));
+      let best = choices[0], bestDist = Infinity;
+      for (const choice of choices) {
+        const dist = Math.abs(choice - Number(state.txPower));
+        if (dist < bestDist) { best = choice; bestDist = dist; }
+      }
+      if (best != null) rigTxPowerSelect.value = String(best);
+    } else {
+      rigTxPower.value = state.txPower;
+    }
+    rigTxPowerLabel.textContent = rigFormatPower(state.txPower);
   }
   // Update filter presets
   if (state.mode) rigCurrentMode = state.mode;
   rigBuildFilterPresets(state.mode || rigCurrentMode, state.filterWidth);
-  // Update capabilities (show/hide controls)
-  if (state.capabilities) rigApplyCapabilities(state.capabilities);
 });
 
 // Show/hide rig panel button based on CAT connection status
@@ -17648,9 +18917,286 @@ document.getElementById('welcome-start').addEventListener('click', async () => {
   }
 
   welcomeDialog.close();
+  _welcomeRemoteClose();
   // Reload prefs so the main UI reflects welcome choices
   loadPrefs();
 });
+
+// ─── Welcome → Connect to a Remote Shack (v1.9) ──────────────────────
+//
+// Three discovery surfaces in one place:
+//   1. mDNS list — auto-populates when the dialog opens, refreshes
+//      every 5s for as long as the dialog is visible. Covers LAN and
+//      same-Tailnet shacks that broadcast _potacat._tcp.
+//   2. POTACAT Cloud sign-in CTA — opens the existing Google OAuth
+//      flow. After sign-in lands, future welcome-screen renders
+//      pull cloud_devices and surface the shack picker. (Phase 1
+//      degrades gracefully: signing in here doesn't fail, it just
+//      doesn't yet auto-list cloud shacks because tasks #16/#17
+//      haven't shipped — the user can still paste a link.)
+//   3. Paste-link input — accepts a potacat://pair?... URL. Lets
+//      anyone (especially off-LAN Tailscale users and email
+//      recipients) pair without leaving the welcome screen.
+
+let _welcomeRemoteScanTimer = null;
+
+function _welcomeRemoteStatus(msg, kind) {
+  const el = document.getElementById('welcome-remote-status');
+  if (!el) return;
+  el.classList.remove('hidden', 'error', 'success');
+  if (kind === 'error') el.classList.add('error');
+  else if (kind === 'success') el.classList.add('success');
+  el.textContent = msg;
+}
+function _welcomeRemoteClearStatus() {
+  const el = document.getElementById('welcome-remote-status');
+  if (el) el.classList.add('hidden');
+}
+
+async function _welcomeRemoteScan() {
+  const listEl = document.getElementById('welcome-remote-list');
+  if (!listEl) return;
+  let shacks = [];
+  try { shacks = await window.api.discoverShacks(); } catch {}
+  // Don't overwrite a "Pairing…" / "Approving on shack…" status row
+  // mid-scan with a stale snapshot.
+  const pairingInProgress = listEl.querySelector('[data-pairing="true"]');
+  if (pairingInProgress) return;
+  if (!Array.isArray(shacks) || shacks.length === 0) {
+    listEl.innerHTML = '<li class="welcome-remote-empty">No shacks found on your network yet. If your shack is reachable only via Tailscale or the internet, use one of the options below.</li>';
+    return;
+  }
+  listEl.innerHTML = shacks.map((s) => {
+    const fpShort = s.fingerprint ? String(s.fingerprint).slice(0, 19) + '…' : '';
+    const rig = s.rigModel ? ' &middot; ' + _esc(s.rigModel) : '';
+    return '<li>'
+      + '<div class="wrl-info">'
+      +   '<div class="wrl-name">' + _esc(s.name) + '</div>'
+      +   '<div class="wrl-meta">' + _esc(s.host) + ':' + _esc(String(s.port)) + rig + (fpShort ? ' &middot; <code>' + _esc(fpShort) + '</code>' : '') + '</div>'
+      + '</div>'
+      + '<button type="button" data-host="' + _esc(s.host) + '" data-port="' + _esc(String(s.port)) + '" data-name="' + _esc(s.name) + '" data-fp="' + _esc(s.fingerprint || '') + '" data-rig="' + _esc(s.rigModel || '') + '" data-service="' + _esc(s.serviceName || '') + '">Connect</button>'
+      + '</li>';
+  }).join('');
+}
+
+async function _welcomeRemoteTapPair(btn) {
+  const target = {
+    host: btn.dataset.host,
+    port: Number(btn.dataset.port),
+    name: btn.dataset.name,
+    fingerprint: btn.dataset.fp,
+    rigModel: btn.dataset.rig,
+    serviceName: btn.dataset.service,
+    wssUrl: 'wss://' + btn.dataset.host + ':' + btn.dataset.port,
+  };
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = 'Approving…';
+  const li = btn.closest('li');
+  if (li) li.dataset.pairing = 'true';
+  _welcomeRemoteStatus(
+    'Connecting to ' + target.name + '… check the screen on that computer and click ' +
+    'Approve to allow this device.',
+    null
+  );
+  try {
+    const r = await window.api.pairRequestDiscovered(target);
+    if (r && r.error) {
+      _welcomeRemoteStatus('Could not pair: ' + r.error, 'error');
+    } else if (r && r.ok) {
+      _welcomeRemoteStatus('Paired with ' + (r.name || target.name) + '. Click Save to finish setup.', 'success');
+      // Activate immediately so the user lands in remote mode on Save.
+      try { await window.api.connectionTargetsActivate(r.targetId); } catch {}
+    }
+  } catch (err) {
+    _welcomeRemoteStatus('Pair failed: ' + (err.message || err), 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prev;
+    if (li) delete li.dataset.pairing;
+  }
+}
+
+async function _welcomeRemoteShowCloudShacks() {
+  _welcomeRemoteStatus('Loading your shacks…', null);
+  let r = null;
+  try { r = await window.api.cloudFindShacks(); }
+  catch (err) {
+    _welcomeRemoteStatus('Could not load shacks: ' + (err.message || err), 'error');
+    return;
+  }
+  if (r && r.error) {
+    _welcomeRemoteStatus(r.error, 'error');
+    return;
+  }
+  const shacks = (r && r.shacks) || [];
+  if (shacks.length === 0) {
+    _welcomeRemoteStatus(
+      'Signed in. No other shacks on your account yet — install POTACAT on the computer ' +
+      'with your radio and sign in there to register it. Until then, use the pair link path below.',
+      null
+    );
+    return;
+  }
+  // Inject a temporary panel below the status to show the cloud
+  // shacks list. Reuses the .welcome-remote-list styling.
+  const fmtAge = (iso) => {
+    if (!iso) return 'unknown';
+    const ago = Date.now() - new Date(iso).getTime();
+    if (ago < 60000) return 'just now';
+    if (ago < 3600000) return Math.floor(ago / 60000) + 'm ago';
+    if (ago < 86400000) return Math.floor(ago / 3600000) + 'h ago';
+    return Math.floor(ago / 86400000) + 'd ago';
+  };
+  const html = '<div style="margin-top:6px;">'
+    + '<div class="welcome-remote-discovered-header" style="margin-bottom:6px;">'
+    + '<span>Your shacks on this account</span></div>'
+    + '<ul class="welcome-remote-list">'
+    + shacks.map(s => {
+      const reach = [];
+      if (s.lan_host) reach.push('LAN');
+      if (s.ts_host) reach.push('Tailscale');
+      if (s.cloud_host) reach.push('Cloud');
+      const reachTxt = reach.length ? reach.join(' / ') : 'no hosts on file';
+      const rig = s.rig_model ? ' · ' + _esc(s.rig_model) : '';
+      return '<li>'
+        + '<div class="wrl-info">'
+        +   '<div class="wrl-name">' + _esc(s.name) + '</div>'
+        +   '<div class="wrl-meta">' + _esc(reachTxt) + rig + ' · seen ' + _esc(fmtAge(s.last_seen_at)) + '</div>'
+        + '</div>'
+        + '<button type="button" data-cloud-shack="' + _esc(s.device_id) + '" data-name="' + _esc(s.name) + '">Pair (1-click)</button>'
+        + '</li>';
+    }).join('')
+    + '</ul></div>';
+  const statusEl = document.getElementById('welcome-remote-status');
+  if (statusEl) {
+    statusEl.classList.remove('hidden', 'error');
+    statusEl.classList.add('success');
+    statusEl.innerHTML = '<div style="margin-bottom:6px;">✓ Signed in as ' + _esc((r && r.user && r.user.email) || 'POTACAT Cloud') + '.</div>' + html;
+    // Delegated click on the inline Pair buttons.
+    statusEl.querySelectorAll('button[data-cloud-shack]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const sid = btn.dataset.cloudShack;
+        const sname = btn.dataset.name;
+        btn.disabled = true;
+        const prev = btn.textContent;
+        btn.textContent = 'Pairing…';
+        try {
+          const p = await window.api.cloudPairShack(sid);
+          if (p && p.error) {
+            _welcomeRemoteStatus('Pair failed: ' + p.error, 'error');
+          } else if (p && p.ok) {
+            // Activate immediately and report success.
+            try { await window.api.connectionTargetsActivate(p.targetId); } catch {}
+            _welcomeRemoteStatus('✓ Paired with ' + (p.name || sname) + ' via ' + (p.leg || '?') + '. Click Save to finish setup.', 'success');
+          }
+        } catch (err) {
+          _welcomeRemoteStatus('Pair failed: ' + (err.message || err), 'error');
+        } finally {
+          btn.disabled = false;
+          btn.textContent = prev;
+        }
+      });
+    });
+  }
+}
+
+async function _welcomeRemotePasteLink() {
+  const input = document.getElementById('welcome-remote-paste-input');
+  if (!input) return;
+  const url = (input.value || '').trim();
+  if (!url) return;
+  if (!/^potacat:\/\/pair\?/i.test(url)) {
+    _welcomeRemoteStatus('That doesn\'t look like a POTACAT pair link. It should start with potacat://pair?', 'error');
+    return;
+  }
+  _welcomeRemoteStatus('Redeeming pair link…', null);
+  // The renderer can't dial the shack itself (no Node sockets). Hand
+  // off to main via the same protocol-URL path that handles email
+  // clicks — the URL flow goes through redeemPairLinkUrl, fires
+  // 'pair-link-redeemed' on success.
+  try {
+    // Open via OS so the protocol handler runs. This works because
+    // main is registered for potacat:// and single-instance — the
+    // URL routes back into our running process.
+    if (window.api && window.api.openExternal) {
+      window.api.openExternal(url);
+    } else {
+      // Fallback: assign location (rare path; openExternal should always be there).
+      location.href = url;
+    }
+  } catch (err) {
+    _welcomeRemoteStatus('Could not open the link: ' + (err.message || err), 'error');
+  }
+}
+
+// onPairLinkRedeemed is already wired globally above to alert() on
+// success. While the welcome dialog is open we hijack its surface
+// to show the result inline so the user doesn't get a modal alert
+// stacked on top of the welcome flow.
+let _welcomeRemoteResultPending = false;
+async function _welcomeRemoteOpen() {
+  _welcomeRemoteResultPending = true;
+  _welcomeRemoteScan();
+  if (_welcomeRemoteScanTimer) clearInterval(_welcomeRemoteScanTimer);
+  _welcomeRemoteScanTimer = setInterval(_welcomeRemoteScan, 5000);
+}
+function _welcomeRemoteClose() {
+  _welcomeRemoteResultPending = false;
+  if (_welcomeRemoteScanTimer) { clearInterval(_welcomeRemoteScanTimer); _welcomeRemoteScanTimer = null; }
+}
+
+(function _welcomeRemoteWire() {
+  const list = document.getElementById('welcome-remote-list');
+  if (list) list.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-host]');
+    if (btn) return _welcomeRemoteTapPair(btn);
+  });
+  const rescan = document.getElementById('welcome-remote-rescan');
+  if (rescan) rescan.addEventListener('click', () => {
+    const listEl = document.getElementById('welcome-remote-list');
+    if (listEl) listEl.innerHTML = '<li class="welcome-remote-scanning">Looking on the local network&hellip;</li>';
+    _welcomeRemoteScan();
+  });
+  const pasteBtn = document.getElementById('welcome-remote-paste-btn');
+  if (pasteBtn) pasteBtn.addEventListener('click', _welcomeRemotePasteLink);
+  const pasteInput = document.getElementById('welcome-remote-paste-input');
+  if (pasteInput) pasteInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); _welcomeRemotePasteLink(); }
+  });
+  const cloudBtn = document.getElementById('welcome-remote-cloud-btn');
+  if (cloudBtn) cloudBtn.addEventListener('click', async () => {
+    _welcomeRemoteStatus('Opening sign-in…', null);
+    try {
+      // First check if already signed in — skip the OAuth popup if so.
+      let st = null;
+      try { st = await window.api.cloudGetStatus(); } catch {}
+      if (!st || !st.loggedIn) {
+        const r = await window.api.cloudGoogleSignIn();
+        if (r && r.error) {
+          _welcomeRemoteStatus('Sign-in failed: ' + r.error, 'error');
+          return;
+        }
+      }
+      _welcomeRemoteShowCloudShacks();
+    } catch (err) {
+      _welcomeRemoteStatus('Sign-in failed: ' + (err.message || err), 'error');
+    }
+  });
+  // Suppress the global pair-link-redeemed alert while the welcome
+  // dialog is visible — show the result inline instead.
+  if (window.api && window.api.onPairLinkRedeemed) {
+    window.api.onPairLinkRedeemed((r) => {
+      const dlg = document.getElementById('welcome-dialog');
+      if (!_welcomeRemoteResultPending || !dlg || !dlg.open) return;
+      if (r && r.ok) {
+        _welcomeRemoteStatus('Paired with ' + (r.name || 'shack') + ' via ' + (r.leg || 'unknown') + '. Click Save to finish.', 'success');
+      } else if (r) {
+        _welcomeRemoteStatus('Pair link failed: ' + (r.error || 'unknown'), 'error');
+      }
+    });
+  }
+})();
 
 async function checkFirstRun(force = false) {
   const s = await window.api.getSettings();
@@ -17697,6 +19243,7 @@ async function checkFirstRun(force = false) {
       }
     }
     welcomeDialog.showModal();
+    _welcomeRemoteOpen();
   } else if (isNewVersion) {
     // Version changed — show "What's New" release notes, not the welcome screen.
     // Triple guard against re-showing on subsequent launches:
@@ -18058,46 +19605,17 @@ document.getElementById('activator-logbook-btn').addEventListener('click', () =>
   window.api.qsoPopoutOpen();
 });
 
-const activatorSettingsPanel = settingsDropdown.querySelector('.settings-dropdown-panel');
-
+// Activator-mode Settings button: opens the Settings dialog directly
+// (used to borrow the now-removed main-toolbar Settings dropdown
+// panel and float it over the activator UI). closeActivatorSettingsPanel
+// kept as a no-op for legacy call sites.
 function closeActivatorSettingsPanel() {
-  if (!activatorSettingsPanelOpen) return;
   activatorSettingsPanelOpen = false;
-  // Move panel back into its original parent and reset styles
-  settingsDropdown.appendChild(activatorSettingsPanel);
-  activatorSettingsPanel.style.display = '';
-  activatorSettingsPanel.style.position = '';
-  activatorSettingsPanel.style.top = '';
-  activatorSettingsPanel.style.right = '';
 }
 
 document.getElementById('activator-settings-btn').addEventListener('click', (e) => {
   e.stopPropagation();
-  // Close other open dropdowns
-  document.querySelectorAll('.multi-dropdown.open').forEach((d) => d.classList.remove('open'));
-
-  if (activatorSettingsPanelOpen) {
-    closeActivatorSettingsPanel();
-    return;
-  }
-
-  // Sync switches to current state
-  quickLightMode.checked = document.documentElement.getAttribute('data-theme') === 'light';
-  quickActivatorMode.checked = appMode === 'activator';
-
-  // Move panel to body so it's not blocked by hidden header ancestor
-  document.body.appendChild(activatorSettingsPanel);
-  const btnRect = e.currentTarget.getBoundingClientRect();
-  activatorSettingsPanel.style.display = 'block';
-  activatorSettingsPanel.style.position = 'fixed';
-  activatorSettingsPanel.style.top = (btnRect.bottom + 4) + 'px';
-  activatorSettingsPanel.style.right = (window.innerWidth - btnRect.right) + 'px';
-  activatorSettingsPanelOpen = true;
-});
-
-// Prevent clicks inside the settings panel from closing it via document click handler
-activatorSettingsPanel.addEventListener('click', (e) => {
-  if (activatorSettingsPanelOpen) e.stopPropagation();
+  openSettingsDialog();
 });
 
 activatorCatStatusEl.addEventListener('click', (e) => {

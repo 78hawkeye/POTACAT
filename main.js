@@ -183,6 +183,7 @@ const { WsjtxClient, extractCallsigns, encodeHeartbeat, encodeLoggedAdif, encode
 const { PskrClient } = require('./lib/pskreporter');
 const { Ft8Engine } = require('./lib/ft8-engine');
 const { RemoteServer } = require('./lib/remote-server');
+const { RemoteClient } = require('./lib/remote-client');
 // Linux-only ALSA bridge. On non-Linux, alsa.isAvailable() returns false
 // and every other call is a stable no-op — safe to require unconditionally.
 const alsa = require('./lib/alsa');
@@ -509,6 +510,7 @@ let spotsPopoutWin = null; // pop-out spots window (activator mode)
 let clusterPopoutWin = null; // pop-out DX cluster terminal window
 let propPopoutWin = null;    // pop-out propagation map window
 let pairPopoutWin = null;    // pop-out ECHOCAT pairing QR window
+let pairRequestPopoutWin = null; // tap-to-pair Approve/Deny popout
 let vfoPopoutWin = null;     // pop-out VFO window
 let conditionsPopoutWin = null; // pop-out Conditions (solar / propagation)
 let jtcatPopoutWin = null;   // pop-out JTCAT window
@@ -757,6 +759,16 @@ let pskrMapFlushTimer = null;  // throttle timer for PSKReporter Map -> renderer
 let keyer = null;          // IambicKeyer instance for CW MIDI keying
 let winKeyer = null;       // K1EL WinKeyer instance for hardware CW keying
 let remoteServer = null;   // RemoteServer instance for phone remote access
+// RemoteClient — this desktop acting as a client to ANOTHER POTACAT
+// shack (the desktop-to-desktop initiative). Distinct from
+// remoteServer; the two are mutually compatible (a desktop with a
+// rig could in theory be both a shack and a remote client at once,
+// though we don't surface that in the UI for Phase 1). Lifecycle:
+// instantiated when settings.activeTargetId points to a row in
+// settings.connectionTargets[]; torn down when the user clears
+// activeTargetId or removes the target row.
+let remoteClient = null;
+let _remoteClientLastStatus = null; // last status snapshot from shack — for re-broadcast on window create
 let cwKeyPort = null;      // Dedicated SerialPort for DTR CW keying (external USB-serial adapter)
 let _cwKeyPortEverOpened = false; // Becomes true after the first successful open this session — gates startup vs reconnect auto-open
 let remoteAudioWin = null; // hidden BrowserWindow for WebRTC audio bridge
@@ -830,6 +842,7 @@ let _currentBreakInState = false;
 let _currentBreakInDelay = 100; // ms
 let _currentPreampTarget = 'hf50';
 let _currentPreampLevel = 0;
+let _currentAntennaPort = 1;
 let _currentCwSidetoneState = true; // Flex default is sidetone ON; we mirror that.
 // WinKeyer-driven sidetone mute. Tracks whether the *WinKeyer activity*
 // path is currently holding the Flex sidetone off, plus the state we
@@ -907,6 +920,13 @@ function getRigCapabilities(rigType) {
     // Include power limits so UI can clamp sliders
     if (model.minPower != null) caps.minPower = model.minPower;
     if (model.maxPower != null) caps.maxPower = model.maxPower;
+    if (model.powerStep != null) caps.powerStep = model.powerStep;
+    if (model.powerDecimals != null) caps.powerDecimals = model.powerDecimals;
+    if (Array.isArray(model.powerChoices)) caps.powerChoices = model.powerChoices.slice();
+    if (model.maxNbLevel != null) caps.maxNbLevel = model.maxNbLevel;
+    if (model.maxDnrLevel != null) caps.maxDnrLevel = model.maxDnrLevel;
+    if (Array.isArray(model.agcModes)) caps.agcModes = model.agcModes.slice();
+    if (Array.isArray(model.preampTargets)) caps.preampTargets = model.preampTargets.slice();
     return caps;
   }
   // Fallback to generic per-type
@@ -1292,6 +1312,44 @@ function sendCatNb(on) {
   broadcastRigState();
 }
 
+function sendCatRfGain(val) { _currentRfGain = val; broadcastRigState(); }
+function sendCatNbLevel(val) { _currentNbLevel = val; _currentNbState = val > 0; broadcastRigState(); }
+function sendCatNr(on) { _currentNrState = on; broadcastRigState(); }
+function sendCatNrLevel(val) { _currentNrLevel = val; broadcastRigState(); }
+function sendCatDnrLevel(val) { _currentDnrLevel = val; _currentNrState = val > 0; broadcastRigState(); }
+function sendCatComp(on) { _currentCompState = on; broadcastRigState(); }
+function sendCatCompLevel(val) { _currentCompLevel = val; broadcastRigState(); }
+function sendCatAgc(mode) { _currentAgcMode = mode; broadcastRigState(); }
+function sendCatAnf(on) { _currentAnfState = on; broadcastRigState(); }
+function sendCatVox(on) { _currentVoxState = on; broadcastRigState(); }
+function sendCatVoxLevel(val) { _currentVoxLevel = val; broadcastRigState(); }
+function sendCatMon(on) { _currentMonState = on; broadcastRigState(); }
+function sendCatMonLevel(val) { _currentMonLevel = val; broadcastRigState(); }
+function sendCatMicGain(val) { _currentMicGain = val; broadcastRigState(); }
+function sendCatBreakIn(on) { _currentBreakInState = on; broadcastRigState(); }
+function sendCatAntennaPort(val) { _currentAntennaPort = val; broadcastRigState(); }
+
+function bindRigStateEvents(controller) {
+  if (!controller || controller._potacatRigStateEventsBound) return;
+  controller._potacatRigStateEventsBound = true;
+  controller.on('rfgain', sendCatRfGain);
+  controller.on('nbLevel', sendCatNbLevel);
+  controller.on('nr', sendCatNr);
+  controller.on('nrLevel', sendCatNrLevel);
+  controller.on('dnrLevel', sendCatDnrLevel);
+  controller.on('comp', sendCatComp);
+  controller.on('compLevel', sendCatCompLevel);
+  controller.on('agc', sendCatAgc);
+  controller.on('anf', sendCatAnf);
+  controller.on('vox', sendCatVox);
+  controller.on('voxLevel', sendCatVoxLevel);
+  controller.on('mon', sendCatMon);
+  controller.on('monLevel', sendCatMonLevel);
+  controller.on('micGain', sendCatMicGain);
+  controller.on('breakIn', sendCatBreakIn);
+  controller.on('antennaPort', sendCatAntennaPort);
+}
+
 function sendCatSmeter(val) {
   if (win && !win.isDestroyed()) win.webContents.send('cat-smeter', val);
   if (vfoPopoutWin && !vfoPopoutWin.isDestroyed()) vfoPopoutWin.webContents.send('cat-smeter', val);
@@ -1351,6 +1409,7 @@ function broadcastRigState() {
     breakInDelay: _currentBreakInDelay,
     preampTarget: _currentPreampTarget,
     preampLevel: _currentPreampLevel,
+    antennaPort: _currentAntennaPort,
     capabilities: caps,
   };
   if (win && !win.isDestroyed()) win.webContents.send('rig-state', state);
@@ -1774,6 +1833,262 @@ function sendN1mmRadioInfo() {
   });
 }
 
+// ─── Cloud device directory registration (v1.9 Path 1: auto-pair) ──
+//
+// When a desktop signs into POTACAT Cloud, it registers itself in the
+// cloud_devices directory so other signed-in desktops on the same
+// account can find it. This is the "magic" path: install POTACAT on a
+// new laptop, sign in, see your shacks. No QR, no email.
+//
+// Type is decided by remoteServer.running:
+//   - running  → this desktop has ECHOCAT enabled = it's a shack.
+//   - off      → this desktop is a remote control surface = it's a client.
+//
+// Heartbeats every 60s so signed-in laptops can sort the shack picker
+// by recency. Pauses heartbeat on Cloud sign-out; resumes on sign-in.
+
+let _cloudDeviceHeartbeatTimer = null;
+let _cloudDeviceLastType = null;
+
+async function ensureCloudDeviceRegistered() {
+  if (!cloudIpc) return;
+  const sync = cloudIpc.getCloudSync();
+  if (!sync || !settings.cloudAccessToken) return;
+  if (!settings.cloudDeviceId) {
+    settings.cloudDeviceId = require('crypto').randomUUID();
+    saveSettings(settings);
+  }
+  const type = (remoteServer && remoteServer.running) ? 'shack' : 'client';
+
+  let fingerprint = '';
+  if (type === 'shack' && remoteServer && remoteServer._tlsCertPem) {
+    try {
+      fingerprint = (new (require('crypto').X509Certificate)(remoteServer._tlsCertPem)).fingerprint256;
+    } catch {}
+  }
+  const altHosts = (remoteServer && typeof remoteServer.getAltHosts === 'function')
+    ? remoteServer.getAltHosts() : { tsHost: '', cloudHost: '' };
+
+  // Pick LAN host. Same logic as the pair-link generator.
+  let lanHost = '';
+  if (type === 'shack' && remoteServer && remoteServer.running) {
+    const ips = RemoteServer.getLocalIPs();
+    if (ips && ips.length > 0) {
+      lanHost = `wss://${ips[0].address}:${remoteServer._port || 7300}`;
+    }
+  }
+
+  const activeRig = (settings.rigs || []).find(r => r.id === settings.activeRigId);
+  const payload = {
+    deviceId: settings.cloudDeviceId,
+    type,
+    name: (require('os').hostname()) || 'POTACAT',
+    platform: 'desktop-' + process.platform,
+    fingerprint,
+    rigModel: activeRig?.model || '',
+    lanHost,
+    tsHost: altHosts.tsHost || '',
+    cloudHost: altHosts.cloudHost || '',
+  };
+
+  try {
+    await sync.registerDevice(payload);
+    sendCatLog(`[cloud-devices] registered as ${type} (${settings.cloudDeviceId})`);
+    _cloudDeviceLastType = type;
+  } catch (err) {
+    sendCatLog(`[cloud-devices] register failed: ${err.message || err}`);
+    return;
+  }
+
+  // Heartbeat — fires every 60s while signed in. Cheaper than a full
+  // re-register since it skips the upsert body. The full register is
+  // re-run only when the type flips (ECHOCAT toggled).
+  if (_cloudDeviceHeartbeatTimer) clearInterval(_cloudDeviceHeartbeatTimer);
+  _cloudDeviceHeartbeatTimer = setInterval(async () => {
+    try {
+      if (!settings.cloudAccessToken || !settings.cloudDeviceId) return;
+      const nowType = (remoteServer && remoteServer.running) ? 'shack' : 'client';
+      if (nowType !== _cloudDeviceLastType) {
+        // Type changed — re-register with the new shape.
+        ensureCloudDeviceRegistered();
+        return;
+      }
+      await sync.heartbeatDevice(settings.cloudDeviceId);
+    } catch (err) {
+      // Network blip or rotated token — quiet, the next heartbeat
+      // retries. Audible log only when it persists.
+      sendCatLog('[cloud-devices] heartbeat failed: ' + (err.message || err));
+    }
+  }, 60 * 1000);
+}
+
+function teardownCloudDeviceHeartbeat() {
+  if (_cloudDeviceHeartbeatTimer) {
+    clearInterval(_cloudDeviceHeartbeatTimer);
+    _cloudDeviceHeartbeatTimer = null;
+  }
+  _cloudDeviceLastType = null;
+}
+
+// ─── RemoteClient lifecycle (desktop-as-client to another shack) ──
+//
+// When settings.activeTargetId is set, we hold a RemoteClient open to
+// the corresponding row in settings.connectionTargets[]. The client's
+// events feed into the same renderer channels the local CAT
+// subsystem uses (cat-status, cat-frequency, cat-mode, cat-smeter), so
+// the rest of the renderer is oblivious — it sees a "rig," and the
+// rig happens to live on a different computer.
+//
+// The remote client is mutually exclusive with the LOCAL rig backend
+// (cat / smartSdr) — if a user switches from local rig to remote
+// shack, the local backends are quiesced; switching back re-engages
+// them.
+
+function isRemoteActive() {
+  return !!(remoteClient && remoteClient.state && remoteClient.state().authed);
+}
+
+function ensureRemoteClient() {
+  const id = settings && settings.activeTargetId;
+  if (!id) { tearDownRemoteClient(); return; }
+  const target = (settings.connectionTargets || []).find(t => t.id === id);
+  if (!target) {
+    sendCatLog(`[RemoteClient] activeTargetId ${id} has no matching connection target — clearing`);
+    settings.activeTargetId = null;
+    saveSettings(settings);
+    tearDownRemoteClient();
+    return;
+  }
+  // Re-instantiating against the same target is a no-op; we want
+  // idempotent ensureRemoteClient() so callers (settings save,
+  // activeTargetId IPC, window create) can call it freely.
+  if (remoteClient && remoteClient._target && remoteClient._target.id === target.id) {
+    return;
+  }
+  tearDownRemoteClient();
+  remoteClient = new RemoteClient(target, {
+    clientVersion: app.getVersion() || '',
+    clientPlatform: 'desktop-' + process.platform,
+  });
+  remoteClient.on('log', (msg) => sendCatLog(msg));
+  remoteClient.on('connecting', ({ leg, host }) => {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('remote-client-status', { state: 'connecting', leg, host });
+    }
+  });
+  remoteClient.on('connected', (info) => {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('remote-client-status', {
+        state: 'connected',
+        targetId: target.id,
+        name: target.name,
+        leg: remoteClient.state().leg,
+        expiresAt: info.expiresAt || null,
+        accountLinked: !!info.accountLinked,
+        trusted: !!info.trusted,
+      });
+      win.webContents.send('cat-status', { connected: true, mode: '', freq: 0 });
+    }
+    // Update lastConnectedAt + lastReachableLeg on the persisted row.
+    target.lastConnectedAt = Date.now();
+    target.lastReachableLeg = remoteClient.state().leg;
+    saveSettings(settings);
+  });
+  remoteClient.on('disconnected', ({ wasAuthed }) => {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('remote-client-status', { state: 'disconnected', wasAuthed });
+      if (wasAuthed) win.webContents.send('cat-status', { connected: false });
+    }
+  });
+  remoteClient.on('kicked', (info) => {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('remote-client-displaced', info);
+    }
+  });
+  remoteClient.on('auth-fail', ({ reason }) => {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('remote-client-status', { state: 'auth-fail', reason });
+    }
+    // 'expired' / 'revoked' — surface plainly. Re-pair flow not yet
+    // wired (task #13 will add the Re-pair button to the Remote
+    // Radios panel).
+  });
+  remoteClient.on('status', (snap) => {
+    _remoteClientLastStatus = snap;
+    if (!win || win.isDestroyed()) return;
+    // Forward shack status fields into the local cat-* channels so
+    // the renderer's existing handlers update transparently.
+    win.webContents.send('cat-status', {
+      connected: !!snap.catConnected,
+      mode: snap.mode || '',
+      freq: snap.freq || 0,
+      rigType: snap.rigType || 'remote',
+    });
+    if (typeof snap.freq === 'number' && snap.freq > 0) {
+      win.webContents.send('cat-frequency', snap.freq);
+    }
+    if (snap.mode) win.webContents.send('cat-mode', snap.mode);
+    if (typeof snap.smeter === 'number') win.webContents.send('cat-smeter', snap.smeter);
+    if (typeof snap.swr === 'number') win.webContents.send('cat-swr', snap.swr);
+    if (typeof snap.alc === 'number') win.webContents.send('cat-alc', snap.alc);
+    if (typeof snap.power === 'number') win.webContents.send('cat-power', snap.power);
+  });
+  remoteClient.on('spots', (data) => {
+    if (win && !win.isDestroyed()) win.webContents.send('spots', data);
+  });
+  remoteClient.on('tune-blocked', ({ reason }) => {
+    if (win && !win.isDestroyed()) win.webContents.send('tune-blocked', reason);
+  });
+  remoteClient.on('alt-hosts', ({ tsHost, cloudHost }) => {
+    // Persist refreshed alt hosts on the target row so reconnect
+    // attempts use the freshest values after a network change.
+    if (tsHost) target.tsHost = tsHost;
+    if (cloudHost) target.cloudHost = cloudHost;
+    saveSettings(settings);
+  });
+  // Architecture B (v1.9): host forwarded an auto-logged QSO to us
+  // (qso-attributed). Pre-stamp stationCallsign from our cached host
+  // call so the §97.119 ADIF row is correct, then run saveQsoRecord
+  // with origin:'forwarded-from-host' so the top-of-function guard
+  // skips re-forwarding and the QSO actually lands locally.
+  remoteClient.on('qso-attributed', (qso) => {
+    const enriched = Object.assign({}, qso);
+    if (target.stationCallsign && !enriched.stationCallsign) {
+      enriched.stationCallsign = target.stationCallsign;
+    }
+    saveQsoRecord(enriched, { origin: 'forwarded-from-host' })
+      .then(r => {
+        if (r && r.success) sendCatLog(`[architecture-b] forwarded-from-host QSO saved: ${enriched.callsign || '?'}`);
+        else sendCatLog(`[architecture-b] forwarded-from-host save failed: ${r && r.error || 'unknown'}`);
+      })
+      .catch(err => sendCatLog(`[architecture-b] forwarded-from-host save threw: ${err && err.message || err}`));
+  });
+  // Architecture B: host couldn't deliver a QSO we triggered. Push
+  // the verbose payload to the renderer so it can render the loud,
+  // dismiss-by-user modal with the QSO details. Casey's hard rule:
+  // never fall back to host-side logging — the operator must see
+  // the modal so they can write the QSO down by hand.
+  remoteClient.on('log-error', (payload) => {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('log-error', payload);
+    }
+    sendCatLog(`[architecture-b] log-error from host: reason=${payload.reason} call=${payload.qso && payload.qso.callsign || '?'}`);
+  });
+  remoteClient.connect();
+}
+
+function tearDownRemoteClient() {
+  if (!remoteClient) return;
+  try { remoteClient.close(); } catch {}
+  remoteClient.removeAllListeners();
+  remoteClient = null;
+  _remoteClientLastStatus = null;
+  if (win && !win.isDestroyed()) {
+    win.webContents.send('remote-client-status', { state: 'idle' });
+    win.webContents.send('cat-status', { connected: false });
+  }
+}
+
 let _connectCatPending = false;
 let _icomNetworkConnectRetryTimer = null;
 let _icomNetworkConnectRetryAttempts = 0;
@@ -1884,6 +2199,9 @@ async function connectCat() {
     }
     return; // prevent concurrent connectCat() calls
   }
+  // If we're in remote-client mode, the "CAT" is a shack on the other
+  // end of a WebSocket — skip the local connection chain entirely.
+  if (isRemoteActive()) return;
   _connectCatPending = true;
   const dataModSession = ++_icomNetworkDataModSession;
   try {
@@ -2226,6 +2544,8 @@ async function connectCat() {
     sendCatLog(`Connecting to ${model.brand || 'radio'} on ${target.path}`);
     transport.connect({ path: target.path, baudRate: target.baudRate || 9600, dtrOff: target.dtrOff, connectDelay: model.connectDelay });
   }
+
+  bindRigStateEvents(cat);
 
   // Apply user command overrides from settings (Kenwood/Yaesu codec)
   if (cat && settings.rigCommandOverrides) {
@@ -3362,7 +3682,53 @@ function cleanQrzName(raw) {
   return joined.toLowerCase().replace(/(^|[\s\-'])([a-z])/g, (_, sep, ch) => sep + ch.toUpperCase());
 }
 
-async function saveQsoRecord(qsoData) {
+// Architecture B (v1.9, Brief C): forward client-driven QSOs to the
+// active client iff the client is a Guest Pass session or a paired
+// POTACAT desktop. Mobile-paired-no-pass keeps existing behavior
+// (logs to host's ADIF + cloud journal under the host's account).
+function shouldForwardClientDriven() {
+  if (!remoteServer || typeof remoteServer.activeClientContext !== 'function') return false;
+  const ctx = remoteServer.activeClientContext();
+  if (!ctx) return false;
+  if (ctx.passSession) return true;
+  if (typeof ctx.platform === 'string' && ctx.platform.startsWith('desktop-')) return true;
+  return false;
+}
+
+async function saveQsoRecord(qsoData, opts) {
+  opts = opts || {};
+  const origin = opts.origin || 'local-manual';
+
+  // ─── Architecture B host-forward branch (gap #10, Brief C §2d) ──
+  // Client-driven origins (ws-log-qso, jtcat-engine) get evaluated
+  // for forwarding. Host-local origins (local-manual, wsjtx-bridge)
+  // and the 'forwarded-from-host' echo path always fall through to
+  // local logging. Casey's hard rule (2026-06-05): if forwarding
+  // can't deliver, the QSO is dropped from the host's perspective
+  // and log-error is sent so the operator can write it down by hand.
+  // Never fall back to writing the guest's QSO in the host's ADIF.
+  const isClientDriven = origin === 'ws-log-qso' || origin === 'jtcat-engine';
+  if (isClientDriven && shouldForwardClientDriven()) {
+    const ctx = remoteServer.activeClientContext();
+    const caps = (ctx && ctx.capabilities) || [];
+    const canReceive = caps.includes('qso-attributed');
+    if (!canReceive) {
+      remoteServer.sendLogError(qsoData, { reason: 'no-capability' });
+      sendCatLog(`[architecture-b] dropping QSO from ${origin}: client lacks qso-attributed capability (${qsoData.callsign || '?'})`);
+      return { success: false, error: 'client_capability_missing' };
+    }
+    try {
+      remoteServer.sendToClient({ type: 'qso-attributed', qso: qsoData });
+      sendCatLog(`[architecture-b] forwarded ${origin} QSO to client (${qsoData.callsign || '?'})`);
+      return { success: true, forwarded: true };
+    } catch (err) {
+      // Best-effort surface the loss; never fall back to local logging.
+      try { remoteServer.sendLogError(qsoData, { reason: 'forward-failed' }); } catch {}
+      sendCatLog(`[architecture-b] forward THREW from ${origin} — QSO dropped: ${err && err.message || err}`);
+      return { success: false, error: 'forward_failed' };
+    }
+  }
+
   // Duplicate-save guard — see _qsoSaveHistory comment above.
   const dedupKey = _qsoDedupKey(qsoData);
   const now = Date.now();
@@ -3390,6 +3756,18 @@ async function saveQsoRecord(qsoData) {
   // Inject operator callsign from settings
   if (settings.myCallsign && !qsoData.operator) {
     qsoData.operator = settings.myCallsign.toUpperCase();
+  }
+  // Inject station callsign from settings (ADIF STATION_CALLSIGN,
+  // §97.119 station ID). The field was silently blank in every row
+  // until 2026-06-05; LOTW + contest log validation both want it
+  // populated. Manual save path: stamp from settings.myCallsign.
+  // Host-forward path (Architecture B): the client's inbound
+  // 'qso-attributed' handler pre-stamps stationCallsign from its
+  // cached host fingerprint BEFORE calling saveQsoRecord, so this
+  // guard preserves that value via the !qsoData.stationCallsign
+  // check.
+  if (settings.myCallsign && !qsoData.stationCallsign) {
+    qsoData.stationCallsign = settings.myCallsign.toUpperCase();
   }
 
   // Auto-fill TX power from the live CAT reading (matches the TX Power slider)
@@ -3854,7 +4232,7 @@ function connectWsjtx() {
         for (let i = 0; i < parkRefs.length; i++) {
           const parkQso = { ...qsoData, mySig: 'POTA', mySigInfo: parkRefs[i].ref, myGridsquare: settings.grid || '' };
           allQsoData.push(parkQso);
-          await saveQsoRecord(parkQso);
+          await saveQsoRecord(parkQso, { origin: 'wsjtx-bridge' });
         }
         // Cross-program references (WWFF, LLOTA for same park)
         const crossRefs = (settings.activatorCrossRefs || []).filter(xr => xr && xr.ref);
@@ -3864,7 +4242,7 @@ function connectWsjtx() {
           else if (xr.program === 'WWFF') xrQso.myWwffRef = xr.ref;
           else if (xr.program === 'LLOTA') xrQso.myLlotaRef = xr.ref;
           allQsoData.push(xrQso);
-          await saveQsoRecord(xrQso);
+          await saveQsoRecord(xrQso, { origin: 'wsjtx-bridge' });
         }
         // Notify renderer so activator view gets the contact
         if (win && !win.isDestroyed()) {
@@ -3887,7 +4265,7 @@ function connectWsjtx() {
           });
         }
       } else {
-        await saveQsoRecord(qsoData);
+        await saveQsoRecord(qsoData, { origin: 'wsjtx-bridge' });
       }
     } catch (err) {
       console.error('Failed to log WSJT-X QSO:', err.message);
@@ -4213,7 +4591,7 @@ async function jtcatAutoLog(qso) {
       sendCatLog(`[JTCAT] Activation mode — logging to ${parkRefs.map(p => p.ref).join(', ')}`);
       for (let i = 0; i < parkRefs.length; i++) {
         const parkQso = { ...qsoData, mySig: 'POTA', mySigInfo: parkRefs[i].ref, myGridsquare: settings.grid || '' };
-        await saveQsoRecord(parkQso);
+        await saveQsoRecord(parkQso, { origin: 'jtcat-engine' });
       }
       // Cross-program refs (WWFF, LLOTA)
       const crossRefs = (settings.activatorCrossRefs || []).filter(xr => xr && xr.ref);
@@ -4222,10 +4600,10 @@ async function jtcatAutoLog(qso) {
         if (xr.program === 'SOTA') xrQso.mySotaRef = xr.ref;
         else if (xr.program === 'WWFF') xrQso.myWwffRef = xr.ref;
         else if (xr.program === 'LLOTA') xrQso.myLlotaRef = xr.ref;
-        await saveQsoRecord(xrQso);
+        await saveQsoRecord(xrQso, { origin: 'jtcat-engine' });
       }
     } else {
-      await saveQsoRecord(qsoData);
+      await saveQsoRecord(qsoData, { origin: 'jtcat-engine' });
     }
 
     console.log('[JTCAT] Auto-logged QSO:', q.call, 'OK');
@@ -7251,9 +7629,27 @@ function connectRemote() {
   // clients can show "POTACAT desktop 1.5.13" and decide whether to
   // suggest an update.
   try { remoteServer._serverVersion = String(getAppDisplayVersion() || ''); } catch {}
+  // Active rig model surfaced in the v1 server `hello` so POTACAT
+  // desktop clients (Remote Radios panel) can distinguish multiple
+  // paired shacks. Empty when no rig configured — falls back to
+  // "POTACAT" name + fingerprint in the UI. Refreshed on rig switch
+  // via the activeRigId change handler.
+  try {
+    const activeRig = (settings.rigs || []).find(r => r.id === settings.activeRigId);
+    remoteServer.setRigModel(activeRig?.model || '');
+  } catch {}
   // Hydrate paired-devices list from settings.json. The list survives
   // across desktop restarts; revoking from settings UI removes a device.
   try { remoteServer.setPairedDevices(settings.pairedDevices || []); } catch {}
+  // Persistent share-link store. Operator-created links (Settings →
+  // Remote Access → Share Access) outlive desktop restarts so a link
+  // emailed Monday still works after a Tuesday reboot. setPendingPairLinks
+  // drops any rows already past expiresAt so we don't accumulate stale
+  // rows for users who repeatedly create links and never revoke them.
+  try { remoteServer.setPendingPairLinks(settings.pendingPairLinks || []); } catch {}
+  // Tap-to-pair toggle. Default on; operator can flip off in
+  // Settings → ECHOCAT if they share their LAN with strangers.
+  try { remoteServer.setAllowPairRequests(settings.allowPairRequests !== false); } catch {}
   // When the server adds or revokes a device, persist the new list.
   remoteServer.on('paired-devices-changed', () => {
     try {
@@ -7266,7 +7662,51 @@ function connectRemote() {
       console.error('[Echo CAT] paired-devices persist failed:', err.message);
     }
   });
+
+  // Mirror the same pattern for share-link state. Persisting on every
+  // change keeps the Share Access UI honest (revokes stick across crash;
+  // a redeemed link's "used" state survives a restart so the operator
+  // can audit who consumed which link).
+  remoteServer.on('pending-pair-links-changed', () => {
+    try {
+      settings.pendingPairLinks = remoteServer.exportPendingPairLinks();
+      saveSettings(settings);
+      if (win && !win.isDestroyed()) {
+        win.webContents.send('pair-links-updated', remoteServer.listPendingPairLinks());
+      }
+    } catch (err) {
+      console.error('[Echo CAT] pending-pair-links persist failed:', err.message);
+    }
+  });
   if (settings.colorblindMode) remoteServer.setColorblindMode(true);
+
+  // Cloud-attested pair verification — fires when a laptop POSTs
+  // /api/pair-account with a cloud-issued pairToken. RemoteServer
+  // emits 'verify-pair-token'; we hit the cloud's
+  // /v1/devices/pair-tokens/verify endpoint with our shack's bearer
+  // JWT, then emit the result back. Token is bound by the cloud to
+  // OUR account, so a verify() success is a same-account attestation.
+  remoteServer.on('verify-pair-token', async ({ pairToken, shackDeviceId, fromIp }) => {
+    let resultPayload = { pairToken, ok: false, error: 'not signed in' };
+    if (!cloudIpc || !settings.cloudAccessToken) {
+      remoteServer.emit('verify-pair-token-result', resultPayload);
+      return;
+    }
+    try {
+      const sync = cloudIpc.getCloudSync();
+      const r = await sync.verifyPairToken(pairToken, shackDeviceId || settings.cloudDeviceId);
+      if (r && r.ok) {
+        resultPayload = { pairToken, ok: true, userId: r.userId, clientDeviceId: r.clientDeviceId };
+        sendCatLog(`[Pair-Account] cloud verify OK token=${pairToken.slice(0, 8)}… from=${fromIp}`);
+      } else {
+        resultPayload = { pairToken, ok: false, error: (r && r.error) || 'verify denied' };
+      }
+    } catch (err) {
+      resultPayload = { pairToken, ok: false, error: err.message || String(err) };
+      sendCatLog(`[Pair-Account] cloud verify FAILED ${err.message || err}`);
+    }
+    remoteServer.emit('verify-pair-token-result', resultPayload);
+  });
 
   // Surface ECHOCAT lifecycle events (server bind, request errors, client
   // connect/disconnect) into the Verbose log so users can tell whether
@@ -7705,6 +8145,7 @@ function connectRemote() {
     settings.cloudRefreshToken = result.refreshToken;
     settings.cloudUser = result.user;
     saveSettings(settings);
+    setImmediate(() => ensureCloudDeviceRegistered().catch(() => {}));
     return { success: true, user: result.user };
   });
 
@@ -7717,10 +8158,15 @@ function connectRemote() {
     settings.cloudRefreshToken = result.refreshToken;
     settings.cloudUser = result.user;
     saveSettings(settings);
+    // Auto-register this desktop in the cloud_devices directory on
+    // successful registration so the welcome screen's "find your
+    // shacks" flow has this device available immediately.
+    setImmediate(() => ensureCloudDeviceRegistered().catch(() => {}));
     return { success: true, user: result.user };
   });
 
   cloudBridge('cloud-logout', async () => {
+    teardownCloudDeviceHeartbeat();
     if (settings.cloudRefreshToken) {
       try {
         const sync = cloudIpc.getCloudSync();
@@ -7853,6 +8299,7 @@ function connectRemote() {
     settings.catTarget = rig.catTarget;
     settings.remoteAudioInput = rig.remoteAudioInput || '';
     settings.remoteAudioOutput = rig.remoteAudioOutput || '';
+    try { remoteServer.setRigModel(rig.model || ''); } catch {}
     _applyRigEqDefault(rig);
     // Per-rig CW key port
     if (rig.cwKeyPort !== undefined) {
@@ -8621,14 +9068,14 @@ function connectRemote() {
           for (let i = 0; i < parkRefs.length; i++) {
             const parkQso = { ...qsoData, mySig: 'POTA', mySigInfo: parkRefs[i].ref, myGridsquare: myGrid };
             if (i > 0) parkQso.skipLogbookForward = true;
-            const r = await saveQsoRecord(parkQso);
+            const r = await saveQsoRecord(parkQso, { origin: 'ws-log-qso' });
             if (r) Object.assign(result, r);
           }
         } else {
           qsoData.mySig = mySig;
           qsoData.mySigInfo = mySigInfo;
           qsoData.myGridsquare = myGrid;
-          const r = await saveQsoRecord(qsoData);
+          const r = await saveQsoRecord(qsoData, { origin: 'ws-log-qso' });
           if (r) Object.assign(result, r);
         }
         // Cross-program references (WWFF, LLOTA for same park)
@@ -8638,7 +9085,7 @@ function connectRemote() {
           if (xr.program === 'SOTA') xrQso.mySotaRef = xr.ref;
           else if (xr.program === 'WWFF') xrQso.myWwffRef = xr.ref;
           else if (xr.program === 'LLOTA') xrQso.myLlotaRef = xr.ref;
-          await saveQsoRecord(xrQso);
+          await saveQsoRecord(xrQso, { origin: 'ws-log-qso' });
         }
       } else if (settings.appMode === 'activator') {
         // Desktop is in activator mode but phone didn't send mySig — use desktop park refs
@@ -8647,7 +9094,7 @@ function connectRemote() {
           for (let i = 0; i < parkRefs.length; i++) {
             const parkQso = { ...qsoData, mySig: 'POTA', mySigInfo: parkRefs[i].ref, myGridsquare: myGrid };
             if (i > 0) parkQso.skipLogbookForward = true;
-            const r = await saveQsoRecord(parkQso);
+            const r = await saveQsoRecord(parkQso, { origin: 'ws-log-qso' });
             if (r) Object.assign(result, r);
           }
           // Cross-program references (WWFF, LLOTA for same park)
@@ -8657,14 +9104,14 @@ function connectRemote() {
             if (xr.program === 'SOTA') xrQso.mySotaRef = xr.ref;
             else if (xr.program === 'WWFF') xrQso.myWwffRef = xr.ref;
             else if (xr.program === 'LLOTA') xrQso.myLlotaRef = xr.ref;
-            await saveQsoRecord(xrQso);
+            await saveQsoRecord(xrQso, { origin: 'ws-log-qso' });
           }
         } else {
-          const r = await saveQsoRecord(qsoData);
+          const r = await saveQsoRecord(qsoData, { origin: 'ws-log-qso' });
           if (r) Object.assign(result, r);
         }
       } else {
-        const r = await saveQsoRecord(qsoData);
+        const r = await saveQsoRecord(qsoData, { origin: 'ws-log-qso' });
         if (r) Object.assign(result, r);
       }
 
@@ -8674,7 +9121,7 @@ function connectRemote() {
         if (!addlRef) continue;
         const addlQso = { ...qsoData, sigInfo: addlRef, respot: false, wwffRespot: false,
           llotaRespot: false, dxcRespot: false, respotComment: '', skipLogbookForward: true };
-        await saveQsoRecord(addlQso);
+        await saveQsoRecord(addlQso, { origin: 'ws-log-qso' });
       }
 
       // Track session contact and send enhanced log-ok
@@ -8704,7 +9151,7 @@ function connectRemote() {
         rstSent: contact.rstSent,
         rstRcvd: contact.rstRcvd,
         resposted: result.resposted || false,
-        respotError: result.respotError || result.wwffRespotError || result.llotaRespotError || result.dxcRespotError || '',
+        respotError: result.respotError || result.wwffRespotError || result.llotaRespotError || result.wwbotaRespotError || result.dxcRespotError || '',
       });
     } catch (err) {
       console.error('[Echo CAT] Log QSO error:', err.message);
@@ -9291,7 +9738,7 @@ function connectRemote() {
         comment: 'JTCAT FT8',
       };
 
-      const result = await saveQsoRecord(qsoData);
+      const result = await saveQsoRecord(qsoData, { origin: 'jtcat-engine' });
       console.log('[JTCAT Remote] QSO logged:', q.call, result.success ? 'OK' : result.error);
 
       // Broadcast updated worked QSOs so the phone's spot list updates
@@ -11979,6 +12426,16 @@ function createWindow() {
     if (settings.enableDxcc) {
       sendDxccData();
     }
+    // Remote-client mode: if settings.activeTargetId is set, the user
+    // wants this desktop to drive a shack on another machine. Connect
+    // now so the renderer sees the same "rig connected" state on
+    // startup that a local user would. ensureRemoteClient is
+    // idempotent so re-entering this path is safe.
+    if (settings.activeTargetId) {
+      try { ensureRemoteClient(); } catch (err) {
+        sendCatLog('[RemoteClient] startup failed: ' + (err.message || err));
+      }
+    }
     // Load worked callsigns from QSO log
     loadWorkedQsos();
     // Load worked parks from POTA CSV
@@ -13708,10 +14165,12 @@ if (!app.isDefaultProtocolClient('potacat')) {
 }
 
 function handleProtocolUrl(url) {
-  // potacat://tune/14074/USB -> tune to 14074 kHz USB
+  // potacat://tune/14074/USB         → tune to 14074 kHz USB
+  // potacat://pair?host=…&token=…&fp=… → redeem a desktop-to-desktop pair link
   try {
     const parsed = new URL(url);
-    if (parsed.hostname === 'tune' || parsed.pathname.startsWith('//tune')) {
+    const action = parsed.hostname || (parsed.pathname.match(/^\/?([^/]+)/) || [])[1] || '';
+    if (action === 'tune') {
       const parts = parsed.pathname.replace(/^\/+/, '').split('/');
       const segments = parts.filter(p => p && p.toLowerCase() !== 'tune');
       const freqKhz = segments[0];
@@ -13719,10 +14178,238 @@ function handleProtocolUrl(url) {
       if (freqKhz && !isNaN(parseFloat(freqKhz))) {
         tuneRadio(parseFloat(freqKhz), mode);
       }
+    } else if (action === 'pair') {
+      // Async — fire and forget. Result lands in the renderer via the
+      // connection-targets:added IPC event.
+      redeemPairLinkUrl(url).catch(err => {
+        console.error('[pair-link] redemption threw:', err);
+        sendCatLog('[pair-link] REJECTED: ' + (err.message || err));
+      });
     }
   } catch (err) {
     console.error('Failed to parse protocol URL:', url, err);
   }
+}
+
+/**
+ * Redeem a `potacat://pair?…` URL on the laptop side. This is the
+ * mirror of /api/pair on the shack side: parse the params, dial the
+ * shack's WSS host with fingerprint pinning, POST the token, persist
+ * the resulting deviceToken into settings.connectionTargets[]. The
+ * renderer is notified via 'connection-targets:added' (success) or
+ * 'connection-targets:error' (failure) so the user sees a result.
+ *
+ * Three dial legs in priority order: LAN (h=...) → Tailscale (tsHost)
+ * → Cloud Tunnel (cloudHost). Whichever responds first wins. The
+ * fingerprint pin applies to the self-signed/Tailscale legs only; the
+ * cloud leg uses standard CA validation against the CF edge cert.
+ */
+async function redeemPairLinkUrl(rawUrl) {
+  const u = new URL(rawUrl);
+  const params = u.searchParams;
+  const token = params.get('token') || params.get('t') || '';
+  if (!token) throw new Error('pair link missing token');
+
+  const lanHost = params.get('host') || params.get('h') || '';   // wss://ip:port
+  const tsHost = params.get('tsHost') || params.get('ts') || ''; // hostname
+  const cloudHost = params.get('cloudHost') || params.get('cloud') || ''; // hostname
+  const fingerprint = params.get('fp') || params.get('fingerprint') || '';
+  const friendly = params.get('name') || params.get('n') || 'Remote shack';
+  const expHint = params.get('exp') || '';
+
+  sendCatLog(`[pair-link] Redeeming token=${token.slice(0, 8)}… lan=${!!lanHost} ts=${!!tsHost} cloud=${!!cloudHost}`);
+
+  // Build the dial list. Order: LAN > Tailscale > Cloud (cloud last
+  // because cloud-only carries the most latency).
+  const candidates = [];
+  if (lanHost) candidates.push({ leg: 'lan', wssUrl: lanHost, pin: fingerprint });
+  if (tsHost) candidates.push({ leg: 'tailscale', wssUrl: `wss://${tsHost}:7300`, pin: fingerprint });
+  if (cloudHost) candidates.push({ leg: 'cloud', wssUrl: `wss://${cloudHost}`, pin: '' }); // CA-signed CF edge
+  if (candidates.length === 0) throw new Error('pair link has no host fields');
+
+  let lastErr = null;
+  for (const cand of candidates) {
+    try {
+      const result = await _doPairRedeem(cand.wssUrl, cand.pin, token);
+      // Success — persist a connection target row and notify the
+      // renderer. The Remote Radios panel (task #13) will pick this
+      // up via IPC; for now the user sees the new row on next reload.
+      if (!Array.isArray(settings.connectionTargets)) settings.connectionTargets = [];
+      const targetId = result.deviceId || ('ct_' + Date.now().toString(36));
+      const row = {
+        id: targetId,
+        name: friendly,
+        serviceName: friendly,
+        rigModel: '',
+        fingerprint: result.fingerprint || cand.pin || '',
+        deviceToken: result.deviceToken,
+        lanHost,
+        tsHost,
+        cloudHost,
+        pairedAt: Date.now(),
+        expiresAt: expHint ? Number(expHint) : null,
+        trust: 'guest',
+        lastConnectedAt: null,
+        lastReachableLeg: cand.leg,
+      };
+      // Replace prior row for the same deviceId so re-redeeming the
+      // same shack just refreshes the credentials.
+      settings.connectionTargets = settings.connectionTargets.filter(t => t.id !== targetId);
+      settings.connectionTargets.push(row);
+      saveSettings(settings);
+      sendCatLog(`[pair-link] OK via ${cand.leg}: ${friendly} stored (deviceId=${targetId})`);
+      if (win && !win.isDestroyed()) {
+        win.webContents.send('connection-targets-updated', settings.connectionTargets);
+        win.webContents.send('pair-link-redeemed', { ok: true, name: friendly, leg: cand.leg });
+      }
+      return;
+    } catch (err) {
+      lastErr = err;
+      sendCatLog(`[pair-link] ${cand.leg} leg failed: ${err.message || err}`);
+    }
+  }
+
+  if (win && !win.isDestroyed()) {
+    win.webContents.send('pair-link-redeemed', {
+      ok: false,
+      error: lastErr ? (lastErr.message || String(lastErr)) : 'all legs failed',
+    });
+  }
+  throw lastErr || new Error('all dial legs failed');
+}
+
+/**
+ * Low-level redemption against a single wss:// host. Pins the cert by
+ * SHA-256 fingerprint when one is provided (LAN / Tailscale legs);
+ * uses standard CA validation when pin is empty (cloud edge cert).
+ * 5-second timeout per attempt.
+ */
+/**
+ * Account-attested pair redemption. Mirrors _doPairRedeem but hits the
+ * /api/pair-account endpoint with a cloud-issued pairToken instead of
+ * the QR/share-link /api/pair endpoint. The shack verifies the token
+ * with the cloud, then mints an account-linked deviceToken (no expiry).
+ */
+function _doPairAccountRedeem(wssUrl, pinFingerprint, pairToken, shackDeviceId) {
+  return new Promise((resolve, reject) => {
+    let httpsUrl;
+    try { httpsUrl = new URL(wssUrl.replace(/^wss:/i, 'https:')); }
+    catch { return reject(new Error('invalid host URL: ' + wssUrl)); }
+    const https = require('https');
+    const os = require('os');
+    const payload = JSON.stringify({
+      pairToken,
+      shackDeviceId,
+      deviceName: os.hostname() + ' (POTACAT Desktop)',
+      devicePlatform: 'desktop-' + process.platform,
+    });
+    const req = https.request({
+      hostname: httpsUrl.hostname,
+      port: Number(httpsUrl.port) || 443,
+      path: '/api/pair-account',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 8000,
+      rejectUnauthorized: pinFingerprint ? false : true,
+    }, (res) => {
+      if (pinFingerprint) {
+        const cert = res.socket && res.socket.getPeerCertificate ? res.socket.getPeerCertificate() : null;
+        const got = ((cert && cert.fingerprint256) || '').toUpperCase().replace(/:/g, '');
+        const want = String(pinFingerprint).toUpperCase().replace(/:/g, '');
+        if (!got || got !== want) {
+          req.destroy();
+          return reject(new Error('TLS fingerprint mismatch'));
+        }
+      }
+      let body = '';
+      res.on('data', d => { body += d; if (body.length > 16 * 1024) req.destroy(); });
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          let errBody = body;
+          try { errBody = JSON.parse(body).error || errBody; } catch {}
+          return reject(new Error('HTTP ' + res.statusCode + ': ' + errBody));
+        }
+        try {
+          const parsed = JSON.parse(body);
+          if (!parsed.deviceToken) return reject(new Error('response missing deviceToken'));
+          resolve(parsed);
+        } catch (err) {
+          reject(new Error('invalid JSON response: ' + err.message));
+        }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout dialing ' + wssUrl)); });
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
+function _doPairRedeem(wssUrl, pinFingerprint, token) {
+  return new Promise((resolve, reject) => {
+    let httpsUrl;
+    try {
+      httpsUrl = new URL(wssUrl.replace(/^wss:/i, 'https:'));
+    } catch (err) {
+      return reject(new Error('invalid host URL: ' + wssUrl));
+    }
+    const https = require('https');
+    const os = require('os');
+    const payload = JSON.stringify({
+      pairingToken: token,
+      deviceName: os.hostname() + ' (POTACAT Desktop)',
+      devicePlatform: 'desktop-' + process.platform,
+    });
+    const req = https.request({
+      hostname: httpsUrl.hostname,
+      port: Number(httpsUrl.port) || 443,
+      path: '/api/pair',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 5000,
+      // Pinned: we accept any cert because we'll verify the fingerprint
+      // ourselves below. Unpinned legs (cloud): rely on standard CA chain.
+      rejectUnauthorized: pinFingerprint ? false : true,
+    }, (res) => {
+      // Fingerprint pin check on pinned legs. The shack's TLS cert is
+      // self-signed for LAN — only fingerprint comparison authenticates.
+      if (pinFingerprint) {
+        const cert = res.socket && res.socket.getPeerCertificate ? res.socket.getPeerCertificate() : null;
+        const got = (cert && (cert.fingerprint256 || '')).toUpperCase().replace(/:/g, '');
+        const want = pinFingerprint.toUpperCase().replace(/:/g, '');
+        if (!got || got !== want) {
+          req.destroy();
+          return reject(new Error('TLS fingerprint mismatch (got ' + (got || 'none').slice(0, 16) + '…, want ' + want.slice(0, 16) + '…)'));
+        }
+      }
+      let body = '';
+      res.on('data', d => { body += d; if (body.length > 16 * 1024) req.destroy(); });
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          let errBody = body;
+          try { errBody = JSON.parse(body).error || errBody; } catch {}
+          return reject(new Error('HTTP ' + res.statusCode + ': ' + errBody));
+        }
+        try {
+          const parsed = JSON.parse(body);
+          if (!parsed.deviceToken) return reject(new Error('response missing deviceToken'));
+          resolve(parsed);
+        } catch (err) {
+          reject(new Error('invalid JSON response: ' + err.message));
+        }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout dialing ' + wssUrl)); });
+    req.on('error', (err) => reject(err));
+    req.write(payload);
+    req.end();
+  });
 }
 
 // Single instance lock — second launch passes URL to running instance
@@ -13867,6 +14554,13 @@ app.whenReady().then(() => {
       },
     });
     cloudIpc.startBackgroundSync();
+
+    // Register this desktop in the cloud_devices directory so signed-in
+    // laptops on the same account can find it (and auto-pair without
+    // QR / email). Type = 'shack' if ECHOCAT is running (we're a host),
+    // else 'client' (we're a remote control surface). Heartbeats every
+    // 60s. Idempotent — re-runs on type change without churn.
+    ensureCloudDeviceRegistered();
   }
 
   // --- POTACAT Cloud tray indicator (#36) ---
@@ -13951,6 +14645,10 @@ app.whenReady().then(() => {
       if (remoteServer && typeof remoteServer.setTunnelExposed === 'function') {
         try { remoteServer.setTunnelExposed(!!state.enabled); } catch {}
       }
+      // Push the new cloudHost (or empty when off) to any connected
+      // phones via the auth-ok + alt-hosts payload. tsHost stays
+      // unchanged here but we recompute together for simplicity.
+      try { _refreshAltHosts(); } catch {}
     });
     cloudTunnel.loadFromDisk();
     if (cloudTunnel.getState().enabled) {
@@ -13960,6 +14658,33 @@ app.whenReady().then(() => {
   } catch (err) {
     sendCatLog('[cloud-tunnel] init failed: ' + (err.message || err));
   }
+
+  // Alternate-host fan-out (Part B of tap-to-pair + tsHost handoff).
+  // RemoteServer rides the resulting tsHost/cloudHost on every
+  // auth-ok and POST /api/pair* response, plus pushes an 'alt-hosts'
+  // typed message whenever they change. main.js is the source of
+  // truth — Tailscale state is read via lib/remote-server's
+  // tailscaleStatus() shell-out + lib/cloud-tunnel's getCloudHost().
+  // Recomputed at startup, on cloudTunnel 'change', and every 10 min.
+  function _refreshAltHosts() {
+    if (!remoteServer) return;
+    let tsHost = '';
+    try {
+      const { tailscaleStatus } = require('./lib/remote-server');
+      const ts = tailscaleStatus();
+      if (ts && ts.loggedIn && ts.hostname) {
+        const port = settings.remotePort || 7300;
+        tsHost = ts.hostname.replace(/\.$/, '') + ':' + port;
+      }
+    } catch (err) {
+      // Tailscale CLI not present is the common case — log debug only.
+      if (err && err.message) console.log('[alt-hosts] tailscale lookup:', err.message);
+    }
+    const cloudHost = (cloudTunnel && typeof cloudTunnel.getCloudHost === 'function') ? (cloudTunnel.getCloudHost() || '') : '';
+    try { remoteServer.setAltHosts({ tsHost, cloudHost }); } catch {}
+  }
+  _refreshAltHosts();
+  setInterval(_refreshAltHosts, 10 * 60 * 1000);
 
   ipcMain.handle('cloud-tunnel-get-state', () => {
     return cloudTunnel ? cloudTunnel.getState() : { enabled: false, status: 'off' };
@@ -14518,6 +15243,125 @@ app.whenReady().then(() => {
     });
   });
   ipcMain.on('pair-popout-close', () => { if (pairPopoutWin && !pairPopoutWin.isDestroyed()) pairPopoutWin.close(); });
+
+  // Tap-to-pair Approve/Deny popout. RemoteServer emits 'pair-request'
+  // when a phone POSTs /api/pair-request; this opens a small
+  // alwaysOnTop window with the device name + countdown + buttons.
+  // Also pulls the main window forward and fires an Electron
+  // notification as a fallback when POTACAT is minimized so the
+  // operator actually sees the request.
+  function _openPairRequestPopout(req) {
+    if (pairRequestPopoutWin && !pairRequestPopoutWin.isDestroyed()) {
+      pairRequestPopoutWin.focus();
+      pairRequestPopoutWin.webContents.send('pair-request', req);
+      return;
+    }
+    const isMac = process.platform === 'darwin';
+    pairRequestPopoutWin = new BrowserWindow({
+      width: 420,
+      height: 440,
+      title: 'POTACAT — Pair request',
+      show: false,
+      resizable: false,
+      alwaysOnTop: true,
+      ...(isMac ? { titleBarStyle: 'hiddenInset' } : { frame: false }),
+      icon: getIconPath(),
+      webPreferences: {
+        preload: path.join(__dirname, 'preload-pair-request-popout.js'),
+        contextIsolation: true,
+        nodeIntegration: false,
+      },
+    });
+    pairRequestPopoutWin.setMenuBarVisibility(false);
+    pairRequestPopoutWin.loadFile(path.join(__dirname, 'renderer', 'pair-request-popout.html'));
+    pairRequestPopoutWin.once('ready-to-show', () => {
+      if (!pairRequestPopoutWin || pairRequestPopoutWin.isDestroyed()) return;
+      pairRequestPopoutWin.show();
+      pairRequestPopoutWin.focus();
+      // Capture the fingerprint so the popout can show it.
+      let fingerprint = '';
+      try {
+        if (remoteServer && remoteServer._tlsCertPem) {
+          const x509 = new (require('crypto').X509Certificate)(remoteServer._tlsCertPem);
+          fingerprint = x509.fingerprint256 || '';
+        }
+      } catch {}
+      pairRequestPopoutWin.webContents.send('pair-request', { ...req, fingerprint });
+    });
+    pairRequestPopoutWin.on('closed', () => {
+      // If the popout was closed without Approve/Deny while a
+      // request is still pending, treat it as a Deny so the held
+      // HTTP response actually resolves.
+      if (remoteServer && req && req.requestId) {
+        try { remoteServer.denyPairRequest(req.requestId); } catch {}
+      }
+      pairRequestPopoutWin = null;
+    });
+    pairRequestPopoutWin.webContents.on('before-input-event', (_e, input) => {
+      if (input.key === 'F12' && input.type === 'keyDown') {
+        pairRequestPopoutWin.webContents.toggleDevTools();
+      }
+    });
+
+    // Bring the main window forward + system notification as a
+    // belt-and-suspenders for the minimized / tray case.
+    try {
+      if (win && !win.isDestroyed()) {
+        if (win.isMinimized()) win.restore();
+        win.show();
+      }
+    } catch {}
+    try {
+      const { Notification } = require('electron');
+      if (Notification.isSupported()) {
+        const note = new Notification({
+          title: 'POTACAT — Pair request',
+          body: (req.deviceName || 'A device') + ' wants to pair with this station.',
+          urgency: 'critical',
+        });
+        note.on('click', () => {
+          if (pairRequestPopoutWin && !pairRequestPopoutWin.isDestroyed()) pairRequestPopoutWin.focus();
+        });
+        note.show();
+      }
+    } catch {}
+  }
+
+  if (remoteServer) {
+    remoteServer.on('pair-request', (req) => _openPairRequestPopout(req));
+    // Note: pair-request-cancelled listener was here. Removed
+    // 2026-06-04 — the popout now stays open for the full 60-s
+    // window regardless of the phone-socket state so iOS's
+    // aggressive socket teardown doesn't close the operator's
+    // approval window before they can click. See remote-server.js
+    // `req.on('close')` comment for the full rationale.
+    remoteServer.on('pair-request-resolved', ({ requestId, approved, reason }) => {
+      if (pairRequestPopoutWin && !pairRequestPopoutWin.isDestroyed()) {
+        // 60-second timeout auto-resolved without the popout buttons
+        // being clicked — close the now-stale window.
+        if (reason === 'timeout') {
+          pairRequestPopoutWin.webContents.send('pair-request-expired', 'timeout');
+          setTimeout(() => {
+            if (pairRequestPopoutWin && !pairRequestPopoutWin.isDestroyed()) pairRequestPopoutWin.close();
+          }, 1500);
+        }
+      }
+    });
+  }
+
+  ipcMain.on('pair-request-approve', (_e, requestId) => {
+    if (remoteServer && typeof remoteServer.approvePairRequest === 'function') {
+      try { remoteServer.approvePairRequest(String(requestId || '')); } catch {}
+    }
+  });
+  ipcMain.on('pair-request-deny', (_e, requestId) => {
+    if (remoteServer && typeof remoteServer.denyPairRequest === 'function') {
+      try { remoteServer.denyPairRequest(String(requestId || '')); } catch {}
+    }
+  });
+  ipcMain.on('pair-request-close-window', () => {
+    if (pairRequestPopoutWin && !pairRequestPopoutWin.isDestroyed()) pairRequestPopoutWin.close();
+  });
   // Live theme relay — main window's light/dark toggle propagates
   // immediately to an open pair popout.
   ipcMain.on('pair-popout-theme', (_e, theme) => {
@@ -16624,7 +17468,15 @@ app.whenReady().then(() => {
       // Forward to ECHOCAT phone via WebSocket — kept for the browser ECHOCAT
       // path (Web Audio decoder); mobile ignores this and uses the WebRTC
       // track that the bridge above feeds.
+      //
+      // The WS path JSON.stringify's the message, which silently mangles
+      // a Float32Array into {"0":x,"1":y,…}. The Electron IPC paths above
+      // preserve TypedArrays via structured clone — only this branch needs
+      // an explicit Array.from. The HeapNumber pressure noted in the
+      // comment above only applies when ECHOCAT WS is connected AND a
+      // Kiwi/WebSDR is streaming, which is rare enough to accept the cost.
       if (remoteServer && remoteServer.hasClient && remoteServer.hasClient()) {
+        const pcmArr = Array.from(pcmFloat);
         if (_kiwiAudioCount === 10) sendCatLog(`[WebSDR] Streaming audio to ECHOCAT (${pcmArr.length} samples/packet)`);
         remoteServer.sendToClient({ type: 'kiwi-audio', pcm: pcmArr, sampleRate });
       }
@@ -16703,6 +17555,15 @@ app.whenReady().then(() => {
     markUserActive();
     if (_vfoLocked) {
       _e.sender.send('tune-blocked', 'VFO Locked — Unlock VFO to change frequency');
+      return;
+    }
+    // Remote-client mode: the "rig" is on another POTACAT desktop.
+    // Send the tune frame over ECHOCAT WS instead of touching the
+    // local CAT subsystem. Auto-tune-KiwiSDR is intentionally NOT
+    // applied here since KiwiSDR routing belongs to the shack, not
+    // the laptop.
+    if (isRemoteActive()) {
+      remoteClient.sendTune({ frequency, mode, bearing });
       return;
     }
     if (slicePort && smartSdr && smartSdr.connected) {
@@ -16909,7 +17770,11 @@ app.whenReady().then(() => {
       case 'set-agc': {
         if (flexNeedsApi) { _flexWarnOnce('AGC requires SmartSDR API — not connected'); break; }
         const mode = String(data.value || '').toLowerCase();
-        if (!['off', 'fast', 'med', 'slow'].includes(mode)) break;
+        const caps = getRigCapabilities(rigType);
+        const allowedAgcModes = Array.isArray(caps.agcModes) && caps.agcModes.length
+          ? caps.agcModes
+          : ['off', 'fast', 'med', 'slow'];
+        if (!allowedAgcModes.includes(mode)) break;
         if (flexSdr()) smartSdr.setAgc(0, mode);
         else if (cat && cat.connected && typeof cat.setAgc === 'function') {
           // Older Icom (706/7100/7200/9100) supports fast/slow only; the
@@ -16931,10 +17796,13 @@ app.whenReady().then(() => {
       }
       case 'set-nb-level': {
         if (flexNeedsApi) { _flexWarnOnce('NB level requires SmartSDR API — not connected'); break; }
-        const pct = Math.max(0, Math.min(100, Number(data.value) || 0));
-        if (flexSdr()) smartSdr.setNbLevel(0, pct);
-        else if (cat && cat.connected && typeof cat.setNbLevel === 'function') cat.setNbLevel(pct);
-        _currentNbLevel = pct;
+        const caps = getRigCapabilities(rigType);
+        const max = caps.maxNbLevel != null ? caps.maxNbLevel : 100;
+        const level = Math.max(0, Math.min(max, Number(data.value) || 0));
+        if (flexSdr()) smartSdr.setNbLevel(0, level);
+        else if (cat && cat.connected && typeof cat.setNbLevel === 'function') cat.setNbLevel(level);
+        _currentNbLevel = level;
+        _currentNbState = level > 0;
         broadcastRigState();
         break;
       }
@@ -17000,6 +17868,8 @@ app.whenReady().then(() => {
       // --- FTX-1-class advanced rig controls ---
       // No Flex equivalents — these are Yaesu-specific raw CAT only.
       case 'set-mic-gain': {
+        const caps = getRigCapabilities(rigType);
+        if (!caps.micGain) break;
         const pct = Math.max(0, Math.min(100, Number(data.value) || 0));
         if (cat && cat.connected && typeof cat.setMicGain === 'function') cat.setMicGain(pct);
         _currentMicGain = pct;
@@ -17007,6 +17877,8 @@ app.whenReady().then(() => {
         break;
       }
       case 'set-comp-level': {
+        const caps = getRigCapabilities(rigType);
+        if (!caps.compLevel) break;
         const pct = Math.max(0, Math.min(100, Number(data.value) || 0));
         if (cat && cat.connected && typeof cat.setCompLevel === 'function') cat.setCompLevel(pct);
         _currentCompLevel = pct;
@@ -17014,13 +17886,20 @@ app.whenReady().then(() => {
         break;
       }
       case 'set-dnr-level': {
-        const level = Math.max(1, Math.min(15, Number(data.value) || 1));
+        const caps = getRigCapabilities(rigType);
+        if (!caps.dnrLevel) break;
+        const max = caps.maxDnrLevel != null ? caps.maxDnrLevel : 15;
+        const min = caps.maxDnrLevel != null ? 0 : 1;
+        const level = Math.max(min, Math.min(max, Number(data.value) || 0));
         if (cat && cat.connected && typeof cat.setDnrLevel === 'function') cat.setDnrLevel(level);
         _currentDnrLevel = level;
+        _currentNrState = level > 0;
         broadcastRigState();
         break;
       }
       case 'set-clar-rx': {
+        const caps = getRigCapabilities(rigType);
+        if (!caps.clarRx) break;
         const on = !!data.value;
         if (cat && cat.connected && typeof cat.setClarRx === 'function') cat.setClarRx(on);
         _currentClarRxState = on;
@@ -17028,6 +17907,8 @@ app.whenReady().then(() => {
         break;
       }
       case 'set-clar-tx': {
+        const caps = getRigCapabilities(rigType);
+        if (!caps.clarTx) break;
         const on = !!data.value;
         if (cat && cat.connected && typeof cat.setClarTx === 'function') cat.setClarTx(on);
         _currentClarTxState = on;
@@ -17035,6 +17916,8 @@ app.whenReady().then(() => {
         break;
       }
       case 'set-clar-offset': {
+        const caps = getRigCapabilities(rigType);
+        if (!caps.clarOffset) break;
         const hz = Math.max(-9999, Math.min(9999, Math.round(Number(data.value) || 0)));
         if (cat && cat.connected && typeof cat.setClarOffset === 'function') cat.setClarOffset(hz);
         _currentClarOffset = hz;
@@ -17042,6 +17925,8 @@ app.whenReady().then(() => {
         break;
       }
       case 'set-break-in': {
+        const caps = getRigCapabilities(rigType);
+        if (!caps.breakIn) break;
         const on = !!data.value;
         if (cat && cat.connected && typeof cat.setBreakIn === 'function') cat.setBreakIn(on);
         _currentBreakInState = on;
@@ -17049,6 +17934,8 @@ app.whenReady().then(() => {
         break;
       }
       case 'set-break-in-delay': {
+        const caps = getRigCapabilities(rigType);
+        if (!caps.breakInDelay) break;
         const ms = Math.max(30, Math.min(3000, Number(data.value) || 100));
         if (cat && cat.connected && typeof cat.setBreakInDelay === 'function') cat.setBreakInDelay(ms);
         _currentBreakInDelay = ms;
@@ -17057,11 +17944,27 @@ app.whenReady().then(() => {
       }
       case 'set-preamp-target': {
         // value: { target: 'hf50'|'vhf'|'uhf', level: 0|1|2 }
+        const caps = getRigCapabilities(rigType);
+        if (!caps.preampTarget) break;
         const target = String((data.value && data.value.target) || data.target || 'hf50').toLowerCase();
-        const level = Math.max(0, Math.min(2, Number((data.value && data.value.level) ?? data.level ?? 0)));
+        const allowedTargets = Array.isArray(caps.preampTargets) && caps.preampTargets.length
+          ? caps.preampTargets
+          : ['hf50', 'vhf', 'uhf'];
+        if (!allowedTargets.includes(target)) break;
+        const maxPreampLevel = target === 'hf50' ? 2 : 1;
+        const level = Math.max(0, Math.min(maxPreampLevel, Number((data.value && data.value.level) ?? data.level ?? 0)));
         if (cat && cat.connected && typeof cat.setPreampTarget === 'function') cat.setPreampTarget(target, level);
         _currentPreampTarget = target;
         _currentPreampLevel = level;
+        broadcastRigState();
+        break;
+      }
+      case 'set-antenna-port': {
+        const caps = getRigCapabilities(rigType);
+        if (!caps.antennaPort) break;
+        const port = Math.max(1, Math.min(2, Math.round(Number(data.value) || 1)));
+        if (cat && cat.connected && typeof cat.setAntennaPort === 'function') cat.setAntennaPort(port);
+        _currentAntennaPort = port;
         broadcastRigState();
         break;
       }
@@ -17319,14 +18222,23 @@ app.whenReady().then(() => {
     // Opt-in override: opts.mode = 'lan' forces the legacy LAN+cloud
     // combo even when the tunnel is up (useful for testing on home WiFi).
     const cloudHost = cloudTunnel ? cloudTunnel.getCloudHost() : '';
+    // Tailscale fallback host. If the desktop is on a tailnet, embed
+    // it in the QR so a phone pairing today can connect over the
+    // tailnet tomorrow — without having to re-pair from a new
+    // network. Same cert pin (fingerprint) covers it.
+    const altHosts = (remoteServer && typeof remoteServer.getAltHosts === 'function')
+      ? remoteServer.getAltHosts() : { tsHost: '', cloudHost: '' };
+    const tsHost = altHosts.tsHost || '';
     const effectiveMode = (opts.mode === 'lan') ? 'lan' : (cloudHost ? 'cloud' : 'lan');
     const qrParamsObj = { token: pairingToken, name: hostname };
     if (effectiveMode === 'cloud') {
       qrParamsObj.cloudHost = cloudHost;
+      if (tsHost) qrParamsObj.tsHost = tsHost;
     } else {
       qrParamsObj.host = wsUrl;
       qrParamsObj.fp = fingerprint;
       if (cloudHost) qrParamsObj.cloudHost = cloudHost;
+      if (tsHost) qrParamsObj.tsHost = tsHost;
     }
     const qrParams = new URLSearchParams(qrParamsObj);
     const qrText = `potacat://pair?${qrParams.toString()}`;
@@ -17376,6 +18288,477 @@ app.whenReady().then(() => {
   ipcMain.handle('echocat-list-paired-devices', () => {
     if (!remoteServer) return [];
     return remoteServer.listPairedDevices();
+  });
+
+  // ─── Persistent share-link IPC (v1.9 Share Access dialog) ─────────────
+  //
+  // The renderer side (Settings → Remote Access) calls these from the
+  // Share Access dialog. Unlike echocat-create-pairing-qr which mints
+  // an in-memory token for in-person QR scans, these mint persistent
+  // tokens that survive a restart so the operator can email a link to
+  // their own laptop and redeem it later. See
+  // docs/remote-desktop-plan.md > "Share-link (QR + URL + email)".
+
+  ipcMain.handle('pair-link-create', async (_e, opts = {}) => {
+    if (!remoteServer || !remoteServer.running) {
+      return { error: 'ECHOCAT server is not running. Enable it in Settings first.' };
+    }
+    // Best-effort Tailscale cert nudge — same as the QR flow. If the
+    // operator hasn't issued a cert yet and is sharing a Tailscale-
+    // capable link, this gets them an LE cert before the recipient
+    // tries to pin a self-signed fingerprint.
+    try {
+      await ensureTailscaleCertReady((msg) => sendCatLog('[Pair-Link] ' + msg));
+    } catch (err) {
+      sendCatLog('[Pair-Link] Cert setup threw: ' + (err.message || err));
+    }
+    let row;
+    try {
+      row = remoteServer.createPairLink({
+        ttlMs: Number(opts.ttlMs) > 0 ? Number(opts.ttlMs) : (24 * 60 * 60 * 1000),
+        label: opts.label || '',
+        // 'owned' (default) → the paired device gets trusted:true,
+        // expiresAt:null (operator pairing their own laptop).
+        // 'guest' → standard sliding 180d, revokable any time.
+        trust: opts.trust === 'guest' ? 'guest' : 'owned',
+      });
+    } catch (err) {
+      sendCatLog('[Pair-Link] createPairLink failed: ' + (err.message || err));
+      return { error: 'Could not mint share link: ' + (err.message || 'unknown error') };
+    }
+
+    // Build the redemption URL. Same shape as the QR flow so the
+    // mobile + desktop redemption handlers stay path-uniform.
+    let fingerprint = '';
+    try {
+      if (remoteServer._tlsCertPem) {
+        const x509 = new (require('crypto').X509Certificate)(remoteServer._tlsCertPem);
+        fingerprint = x509.fingerprint256 || '';
+      }
+    } catch {}
+    const ips = RemoteServer.getLocalIPs();
+    let host = '127.0.0.1';
+    if (ips.length > 0) host = ips[0].tailscaleHostname || ips[0].address;
+    const port = remoteServer._port || 7300;
+    const wsUrl = `wss://${host}:${port}`;
+    const hostname = (() => { try { return require('os').hostname(); } catch { return 'POTACAT'; } })();
+    const altHosts = (typeof remoteServer.getAltHosts === 'function')
+      ? remoteServer.getAltHosts() : { tsHost: '', cloudHost: '' };
+    const tsHost = altHosts.tsHost || '';
+    const cloudHost = cloudTunnel ? cloudTunnel.getCloudHost() : '';
+    const qrParamsObj = { token: row.token, name: hostname, exp: String(row.expiresAt) };
+    qrParamsObj.host = wsUrl;
+    qrParamsObj.fp = fingerprint;
+    if (tsHost) qrParamsObj.tsHost = tsHost;
+    if (cloudHost) qrParamsObj.cloudHost = cloudHost;
+    const url = `potacat://pair?${new URLSearchParams(qrParamsObj).toString()}`;
+
+    // Optional QR for the same link — same dual-format dance as
+    // echocat-create-pairing-qr in case one renderer fails.
+    let qrSvg = '';
+    let qrDataUrl = '';
+    try {
+      const qrcode = require('qrcode');
+      try { qrSvg = await qrcode.toString(url, { type: 'svg', errorCorrectionLevel: 'M', margin: 2 }); } catch {}
+      try { qrDataUrl = await qrcode.toDataURL(url, { errorCorrectionLevel: 'M', width: 320, margin: 2 }); } catch {}
+    } catch {}
+
+    sendCatLog(`[Pair-Link] OK ttl=${Math.floor((row.expiresAt - row.createdAt) / 1000)}s label="${row.label || ''}" reach=lan${tsHost ? '+ts' : ''}${cloudHost ? '+cloud' : ''}`);
+    return {
+      token: row.token,
+      label: row.label,
+      createdAt: row.createdAt,
+      expiresAt: row.expiresAt,
+      url,
+      qrSvg,
+      qrDataUrl,
+      // Reachability disclosure for the Share Access dialog so the
+      // operator knows whether a coffee-shop laptop can use the link.
+      reachability: {
+        lan: !!wsUrl,
+        tailscale: !!tsHost,
+        cloud: !!cloudHost,
+      },
+      hostname,
+    };
+  });
+
+  ipcMain.handle('pair-link-list', () => {
+    if (!remoteServer) return [];
+    return remoteServer.listPendingPairLinks();
+  });
+
+  ipcMain.handle('pair-link-revoke', (_e, token) => {
+    if (!remoteServer) return { ok: false, reason: 'no server' };
+    const ok = remoteServer.revokePairLink(String(token || ''));
+    return { ok };
+  });
+
+  // ─── Laptop side: connectionTargets (paired shacks this desktop dials) ─
+  //
+  // Mirror of the shack's pairedDevices, but from the OTHER end: each
+  // row stores a deviceToken minted by some shack we redeemed a pair
+  // link against, plus its host/fingerprint/etc. Populated by
+  // redeemPairLinkUrl(); UI in the Remote Radios panel reads + edits
+  // this list. The deviceToken is sensitive — we never send it over
+  // the wire and never expose it back to the renderer.
+
+  ipcMain.handle('connection-targets-list', () => {
+    // Strip deviceToken before handing to the renderer — same hygiene
+    // pattern remoteServer.listPairedDevices uses for the shack side.
+    const list = Array.isArray(settings.connectionTargets) ? settings.connectionTargets : [];
+    return list.map(t => ({
+      id: t.id,
+      name: t.name,
+      serviceName: t.serviceName || t.name,
+      rigModel: t.rigModel || '',
+      fingerprint: t.fingerprint || '',
+      lanHost: t.lanHost || '',
+      tsHost: t.tsHost || '',
+      cloudHost: t.cloudHost || '',
+      pairedAt: t.pairedAt || null,
+      expiresAt: t.expiresAt || null,
+      trust: t.trust || 'guest',
+      lastConnectedAt: t.lastConnectedAt || null,
+      lastReachableLeg: t.lastReachableLeg || null,
+    }));
+  });
+
+  ipcMain.handle('connection-targets-rename', (_e, id, newName) => {
+    if (!Array.isArray(settings.connectionTargets)) return { ok: false };
+    const row = settings.connectionTargets.find(t => t.id === id);
+    if (!row) return { ok: false, reason: 'not-found' };
+    row.name = String(newName || '').trim().slice(0, 60) || row.name;
+    saveSettings(settings);
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('connection-targets-updated', settings.connectionTargets);
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle('connection-targets-remove', (_e, id) => {
+    if (!Array.isArray(settings.connectionTargets)) return { ok: false };
+    const before = settings.connectionTargets.length;
+    settings.connectionTargets = settings.connectionTargets.filter(t => t.id !== id);
+    if (settings.connectionTargets.length === before) return { ok: false, reason: 'not-found' };
+    if (settings.activeTargetId === id) {
+      settings.activeTargetId = null;
+      tearDownRemoteClient();
+    }
+    saveSettings(settings);
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('connection-targets-updated', settings.connectionTargets);
+    }
+    // Best-effort unpair against the shack — fire and forget, ignore
+    // failures (shack might be offline; row removed locally either way).
+    // TODO: wire DELETE /api/devices/{deviceId} when the shack side adds it.
+    return { ok: true };
+  });
+
+  // Activate a connection target — switches this desktop into
+  // remote-client mode against the given shack. Passing null clears
+  // activeTargetId and re-engages the local rig backend.
+  ipcMain.handle('connection-targets-activate', (_e, id) => {
+    const targets = Array.isArray(settings.connectionTargets) ? settings.connectionTargets : [];
+    if (id == null) {
+      // Switch back to local rig
+      settings.activeTargetId = null;
+      saveSettings(settings);
+      tearDownRemoteClient();
+      // Re-engage local CAT if a rig is configured.
+      try { connectCat(); } catch {}
+      if (win && !win.isDestroyed()) {
+        win.webContents.send('remote-client-status', { state: 'idle' });
+      }
+      return { ok: true };
+    }
+    const target = targets.find(t => t.id === id);
+    if (!target) return { ok: false, reason: 'not-found' };
+    if (settings.activeTargetId === id && isRemoteActive()) {
+      return { ok: true, alreadyActive: true };
+    }
+    settings.activeTargetId = id;
+    saveSettings(settings);
+    // Quiesce the local CAT subsystem so we don't fight the shack
+    // for the rig's serial port (it's the SHACK's local rig now).
+    try { if (cat) { cat.disconnect && cat.disconnect(); } } catch {}
+    ensureRemoteClient();
+    return { ok: true };
+  });
+
+  ipcMain.handle('connection-targets-get-status', () => {
+    if (!remoteClient) return { state: 'idle' };
+    const s = remoteClient.state();
+    return {
+      state: s.authed ? 'connected' : (s.readyState === 1 ? 'authing' : 'connecting'),
+      targetId: s.targetId,
+      name: s.name,
+      leg: s.leg,
+      lastError: s.lastError,
+    };
+  });
+
+  // mDNS discovery of nearby POTACAT shacks. Powers the welcome
+  // screen's "we found a shack on your network" path and the Remote
+  // Radios → "+ Add new" same-network add. Returns an array of
+  // {name, host, port, fingerprint, version, rigModel} parsed from
+  // the _potacat._tcp service's TXT record (published by every
+  // POTACAT instance with ECHOCAT enabled — see lib/remote-server.js
+  // _publishMdns). Uses a 3-second browse window: long enough to
+  // catch the typical announce on iOS NSNetServiceBrowser pacing,
+  // short enough to feel responsive in the welcome flow.
+  ipcMain.handle('discover-shacks', async () => {
+    let Bonjour;
+    try { Bonjour = require('bonjour-service').default; }
+    catch { return []; }
+    const bonjour = new Bonjour();
+    const found = new Map(); // host:port → record
+    const browser = bonjour.find({ type: 'potacat' });
+    browser.on('up', (svc) => {
+      try {
+        const txt = svc.txt || {};
+        const host = (svc.addresses && svc.addresses.find(a => /^\d+\.\d+\.\d+\.\d+$/.test(a))) || svc.referer?.address || '';
+        if (!host) return;
+        const key = host + ':' + svc.port;
+        // Self-skip: if our own ECHOCAT server is running and this
+        // record's fingerprint matches our cert, don't surface our
+        // own shack to ourselves. (Two POTACATs on one box is a
+        // valid testing setup but on first-launch the operator is
+        // pairing to a SEPARATE machine.)
+        if (remoteServer && remoteServer.running && remoteServer._tlsCertPem) {
+          try {
+            const ours = (new (require('crypto').X509Certificate)(remoteServer._tlsCertPem)).fingerprint256;
+            if (ours && txt.fingerprint && String(txt.fingerprint).toUpperCase().replace(/:/g, '') === String(ours).toUpperCase().replace(/:/g, '')) {
+              return;
+            }
+          } catch {}
+        }
+        found.set(key, {
+          name: txt.name || svc.name || 'POTACAT',
+          serviceName: svc.name || '',
+          host,
+          port: svc.port,
+          wssUrl: `wss://${host}:${svc.port}`,
+          fingerprint: txt.fingerprint || '',
+          version: txt.version || '',
+          rigModel: txt.rigModel || txt.rig || '',
+        });
+      } catch {}
+    });
+    await new Promise(r => setTimeout(r, 3000));
+    try { browser.stop && browser.stop(); } catch {}
+    try { bonjour.destroy(); } catch {}
+    return Array.from(found.values());
+  });
+
+  // Tap-to-pair against a discovered shack — the welcome screen and
+  // Remote Radios "+ Add new" both call this after the user picks
+  // a row from the mDNS list. Mirrors what the mobile app's pair-
+  // request flow does: POST /api/pair-request, then the shack pops
+  // an Approve modal on its own screen, then we receive the device
+  // token in the response (or a 403 if denied / timed out).
+  ipcMain.handle('pair-request-discovered', async (_e, target) => {
+    if (!target || !target.host || !target.port) return { error: 'invalid target' };
+    let res;
+    try {
+      res = await new Promise((resolve, reject) => {
+        const https = require('https');
+        const os = require('os');
+        const payload = JSON.stringify({
+          deviceName: os.hostname() + ' (POTACAT Desktop)',
+          devicePlatform: 'desktop-' + process.platform,
+          requestId: 'rq_' + Date.now().toString(36),
+        });
+        const req = https.request({
+          hostname: target.host,
+          port: target.port,
+          path: '/api/pair-request',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload),
+          },
+          rejectUnauthorized: false, // pin-verified below
+          timeout: 75000, // shack has 60s to approve + a buffer
+        }, (response) => {
+          // Fingerprint pin against the TXT-record fingerprint from
+          // mDNS. Same trust model the mobile app uses.
+          if (target.fingerprint) {
+            const cert = response.socket && response.socket.getPeerCertificate ? response.socket.getPeerCertificate() : null;
+            const got = ((cert && cert.fingerprint256) || '').toUpperCase().replace(/:/g, '');
+            const want = String(target.fingerprint).toUpperCase().replace(/:/g, '');
+            if (!got || got !== want) {
+              req.destroy();
+              return reject(new Error('fingerprint mismatch'));
+            }
+          }
+          let body = '';
+          response.on('data', d => { body += d; if (body.length > 16 * 1024) req.destroy(); });
+          response.on('end', () => {
+            try {
+              const parsed = JSON.parse(body);
+              resolve({ status: response.statusCode, body: parsed });
+            } catch (err) {
+              reject(new Error('invalid response body'));
+            }
+          });
+        });
+        req.on('timeout', () => { req.destroy(); reject(new Error('shack did not respond in time')); });
+        req.on('error', reject);
+        req.write(payload);
+        req.end();
+      });
+    } catch (err) {
+      return { error: err.message || String(err) };
+    }
+    if (res.status !== 200) {
+      return { error: res.body.message || res.body.error || ('HTTP ' + res.status) };
+    }
+    // Success — body has the same PairResponse shape /api/pair returns.
+    // Persist the connection target so the user lands in the Remote
+    // Radios panel with the shack already paired.
+    const dev = res.body;
+    if (!Array.isArray(settings.connectionTargets)) settings.connectionTargets = [];
+    const row = {
+      id: dev.deviceId || ('ct_' + Date.now().toString(36)),
+      name: target.name || 'Remote shack',
+      serviceName: target.serviceName || target.name || '',
+      rigModel: target.rigModel || '',
+      fingerprint: dev.fingerprint || target.fingerprint || '',
+      deviceToken: dev.deviceToken,
+      lanHost: target.wssUrl || '',
+      tsHost: dev.tsHost || '',
+      cloudHost: dev.cloudHost || '',
+      pairedAt: Date.now(),
+      expiresAt: null, // tap-to-pair via in-person Approve — server sets sliding 180d on its side
+      trust: 'guest',
+      lastConnectedAt: null,
+      lastReachableLeg: 'lan',
+    };
+    settings.connectionTargets = settings.connectionTargets.filter(t => t.id !== row.id);
+    settings.connectionTargets.push(row);
+    saveSettings(settings);
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('connection-targets-updated', settings.connectionTargets);
+    }
+    sendCatLog(`[Pair-Request] OK — ${row.name} stored as ${row.id}`);
+    return { ok: true, targetId: row.id, name: row.name };
+  });
+
+  // Operator-managed trust toggle on a paired device (v1.9). Flips the
+  // "no expiry" flag at the shack without involving the cloud — used
+  // by Tailscale-only operators who don't want to sign in.
+  ipcMain.handle('echocat-set-device-trusted', (_e, deviceId, trusted) => {
+    if (!remoteServer) return { ok: false };
+    const ok = remoteServer.setDeviceTrusted(String(deviceId || ''), !!trusted);
+    return { ok };
+  });
+
+  // ─── Cloud-attested pair flow (Path 1, v1.9) ───────────────────────
+  //
+  // The magic "sign in, see your shacks, one-click pair" path. Used by
+  // the welcome screen and the Remote Radios "+ Add new" flow.
+  //
+  // 1. cloud-find-shacks — ensures this desktop is registered as a
+  //    client in cloud_devices, then lists every shack on the same
+  //    account. Returns [{deviceId, name, rigModel, lastSeenAt, …}].
+  // 2. cloud-pair-shack — authorizePair to mint a pairToken, then
+  //    dial the shack and POST /api/pair-account with the token. The
+  //    shack verifies the token against cloud, mints a long-lived
+  //    deviceToken flagged accountLinked:true (no expiry), returns it.
+  //    Persisted into settings.connectionTargets[] as `trust: 'account'`.
+
+  ipcMain.handle('cloud-find-shacks', async () => {
+    if (!cloudIpc) return { error: 'Cloud not initialized' };
+    if (!settings.cloudAccessToken) return { error: 'Not signed in to POTACAT Cloud' };
+    const sync = cloudIpc.getCloudSync();
+    if (!sync) return { error: 'Cloud sync unavailable' };
+    // Ensure THIS desktop is registered first — without that, the
+    // /authorize step later would reject because the client_device_id
+    // isn't known to the cloud yet.
+    try { await ensureCloudDeviceRegistered(); }
+    catch (err) { return { error: 'Could not register this device: ' + (err.message || err) }; }
+    try {
+      const r = await sync.listDevices('shack');
+      const shacks = Array.isArray(r && r.devices) ? r.devices : [];
+      // Don't surface our own row if this desktop happens to be a shack.
+      const filtered = shacks.filter(s => s.device_id !== settings.cloudDeviceId);
+      return { ok: true, shacks: filtered };
+    } catch (err) {
+      return { error: err.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('cloud-pair-shack', async (_e, shackDeviceId) => {
+    if (!cloudIpc) return { error: 'Cloud not initialized' };
+    if (!settings.cloudAccessToken) return { error: 'Not signed in to POTACAT Cloud' };
+    const sync = cloudIpc.getCloudSync();
+    if (!sync) return { error: 'Cloud sync unavailable' };
+    if (!shackDeviceId) return { error: 'shackDeviceId required' };
+
+    // Mint a pairToken from the cloud. The cloud verifies same-account
+    // and binds the token to our clientDeviceId.
+    let authz;
+    try {
+      authz = await sync.authorizePair(shackDeviceId, {
+        clientDeviceId: settings.cloudDeviceId,
+        clientFingerprint: '', // laptops don't have a server cert; left blank
+      });
+    } catch (err) {
+      return { error: 'cloud authorize failed: ' + (err.message || err) };
+    }
+    if (!authz || !authz.pairToken || !authz.shack) {
+      return { error: 'cloud authorize returned no token' };
+    }
+
+    // Build a connection target from the shack metadata the cloud
+    // gave us, then dial it with the pairToken. Three legs as usual:
+    // LAN → Tailscale → Cloud Tunnel.
+    const shack = authz.shack;
+    const candidates = [];
+    if (shack.lanHost) candidates.push({ leg: 'lan', wssUrl: shack.lanHost, pin: shack.fingerprint });
+    if (shack.tsHost) candidates.push({ leg: 'tailscale', wssUrl: `wss://${shack.tsHost}:7300`, pin: shack.fingerprint });
+    if (shack.cloudHost) candidates.push({ leg: 'cloud', wssUrl: `wss://${shack.cloudHost}`, pin: '' });
+    if (candidates.length === 0) {
+      return { error: 'Shack has no reachable hosts on file. Ask it to come online once so it can update its hosts.' };
+    }
+
+    let lastErr = null;
+    for (const cand of candidates) {
+      try {
+        const result = await _doPairAccountRedeem(cand.wssUrl, cand.pin, authz.pairToken, shack.deviceId);
+        if (!Array.isArray(settings.connectionTargets)) settings.connectionTargets = [];
+        const row = {
+          id: result.deviceId || ('ct_' + Date.now().toString(36)),
+          name: shack.name || 'Remote shack',
+          serviceName: shack.name || '',
+          rigModel: shack.rigModel || '',
+          fingerprint: result.fingerprint || shack.fingerprint || '',
+          deviceToken: result.deviceToken,
+          lanHost: shack.lanHost || '',
+          tsHost: shack.tsHost || '',
+          cloudHost: shack.cloudHost || '',
+          pairedAt: Date.now(),
+          expiresAt: null,
+          trust: 'account',
+          accountLinked: true,
+          lastConnectedAt: Date.now(),
+          lastReachableLeg: cand.leg,
+        };
+        settings.connectionTargets = settings.connectionTargets.filter(t => t.id !== row.id);
+        settings.connectionTargets.push(row);
+        saveSettings(settings);
+        if (win && !win.isDestroyed()) {
+          win.webContents.send('connection-targets-updated', settings.connectionTargets);
+        }
+        sendCatLog(`[cloud-pair] OK via ${cand.leg}: ${shack.name} → ${row.id}`);
+        return { ok: true, targetId: row.id, leg: cand.leg, name: shack.name };
+      } catch (err) {
+        lastErr = err;
+        sendCatLog(`[cloud-pair] ${cand.leg} leg failed: ${err.message || err}`);
+      }
+    }
+    return { error: lastErr ? (lastErr.message || String(lastErr)) : 'all legs failed' };
   });
 
   // Multi-operator profiles — back the Settings → Summary → Operator
@@ -17934,6 +19317,12 @@ app.whenReady().then(() => {
       (has('remoteCwEnabled') && newSettings.remoteCwEnabled !== settings.remoteCwEnabled) ||
       (has('cwKeyPort') && newSettings.cwKeyPort !== settings.cwKeyPort);
 
+    // Tap-to-pair toggle is a live setting — no remoteServer
+    // restart needed, just push the new value through.
+    if (has('allowPairRequests') && newSettings.allowPairRequests !== settings.allowPairRequests) {
+      try { remoteServer.setAllowPairRequests(newSettings.allowPairRequests !== false); } catch {}
+    }
+
     const iconChanged = has('lightIcon') && newSettings.lightIcon !== settings.lightIcon;
 
     const cwKeyerChanged = (has('enableCwKeyer') && newSettings.enableCwKeyer !== settings.enableCwKeyer) ||
@@ -18065,6 +19454,7 @@ app.whenReady().then(() => {
     if (activeRigChanged) {
       const rig = (settings.rigs || []).find((r) => r && r.id === settings.activeRigId);
       if (rig) _applyRigEqDefault(rig);
+      try { remoteServer && remoteServer.setRigModel(rig?.model || ''); } catch {}
     }
 
     // Reconnect CW Spots if settings changed
@@ -18965,7 +20355,15 @@ app.whenReady().then(() => {
   ipcMain.handle('save-qso', async (_e, qsoData) => {
     markUserActive();
     try {
-      return await saveQsoRecord(qsoData);
+      // Architecture-B-correct as-is: when this desktop is in
+      // remote-client mode operating another shack's rig, manual
+      // banner-logger QSOs land in THIS desktop's adifLogPath + cloud
+      // journal via saveQsoRecord — which is exactly the desired
+      // attribution (gap #11 / investigation Q8.2). Don't add
+      // pass-context branching here; it would break the established
+      // behavior. Tagged 'local-manual' so the forwarding guard at
+      // the top of saveQsoRecord explicitly skips this path.
+      return await saveQsoRecord(qsoData, { origin: 'local-manual' });
     } catch (err) {
       return { success: false, error: err.message };
     }
@@ -19071,6 +20469,13 @@ app.whenReady().then(() => {
   ipcMain.on('connect-cat', (_e, target) => {
     settings.catTarget = target;
     saveSettings(settings);
+    // Don't touch local CAT in remote-client mode — the rig lives on
+    // the shack. The user must explicitly switch back via the Remote
+    // Radios panel before changing the local rig target.
+    if (isRemoteActive()) {
+      sendCatLog('[CAT] Skipping local CAT connect — running in remote-client mode');
+      return;
+    }
     if (!settings.enableWsjtx) connectCat();
     // Flex rigs ALSO need the FlexLib API client (smartSdr) — it's what
     // tuneRadio's Flex Direct branch (no SmartSDR-Win running) drives, plus
@@ -20274,6 +21679,11 @@ function gracefulCleanup() {
   try { disconnectFreedvReporter(); } catch {}
   try { disconnectRemote(); } catch {}
   try { disconnectKeyer(); } catch {}
+  // Stop the DTR CW-key port too. disconnectKeyer() handles WinKeyer but
+  // not the raw DTR-keyed serial port — missing this leaves an open
+  // handle that the OS may write to after we've torn down our refs,
+  // surfacing as "WriteFileEx invalid handle" on quit.
+  try { disconnectCwKeyPort(); } catch {}
   try { stopJtcat(); } catch {}
   try { stopSstv(); } catch {}
   try { stopSstvMulti(); } catch {}
@@ -20289,6 +21699,26 @@ function gracefulCleanup() {
 app.on('before-quit', gracefulCleanup);
 process.on('SIGINT', () => { gracefulCleanup(); process.exit(0); });
 process.on('SIGTERM', () => { gracefulCleanup(); process.exit(0); });
+
+// Suppress known-benign shutdown errors. The Windows serialport binding
+// surfaces "WriteFileEx invalid handle" and similar when a write
+// reaches the kernel after Node has already closed the underlying COM
+// port — a race between our explicit close and any callback-less write
+// that was already in flight (WinKeyer PTT-off, idle ping, CW key drop).
+// Letting these propagate as uncaughtException pops Electron's
+// "uncaught exception" dialog AFTER the user already clicked quit.
+// During / after cleanup, swallow them with a log line instead.
+process.on('uncaughtException', (err) => {
+  const msg = err && err.message ? err.message : String(err);
+  const benignShutdownErr = /WriteFileEx.*invalid handle|writing to COM port.*invalid handle|Port is not open|Port is closed/i.test(msg);
+  if (cleanupDone || benignShutdownErr) {
+    console.warn('[shutdown] swallowed:', msg);
+    return;
+  }
+  // Pre-shutdown unexpected error — preserve historical behavior
+  // (Electron will show its dialog) by rethrowing.
+  throw err;
+});
 
 app.on('window-all-closed', () => {
   if (HEADLESS) return; // keep running in headless mode
