@@ -4912,11 +4912,11 @@ async function _renderSummaryOperator() {
 }
 
 async function _renderOperatorSelects(fallbackCall) {
-  const selects = [
-    document.getElementById('summary-op-select'),
-    document.getElementById('top-op-select'),
-  ].filter(Boolean);
-  if (selects.length === 0) return;
+  const summarySelect = document.getElementById('summary-op-select');
+  const topSelect = document.getElementById('top-op-select');
+  const topSwitch = document.getElementById('top-op-switch') || (topSelect ? topSelect.closest('.top-operator-switch') : null);
+  const selects = [summarySelect, topSelect].filter(Boolean);
+  if (selects.length === 0 && !topSwitch) return;
   let activeCall = fallbackCall || '';
   let list = [];
   try {
@@ -4924,6 +4924,9 @@ async function _renderOperatorSelects(fallbackCall) {
     activeCall = (r && r.active) || activeCall;
     list = (r && Array.isArray(r.profiles)) ? r.profiles : [];
   } catch {}
+  // The top nav switcher is quick access only. Hide it for single-operator
+  // installs so it does not consume toolbar space unnecessarily.
+  if (topSwitch) topSwitch.classList.toggle('hidden', list.length <= 1);
   const esc = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   for (const selEl of selects) {
     if (list.length === 0) {
