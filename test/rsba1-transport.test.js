@@ -933,6 +933,223 @@ async function main() {
     });
   });
 
+  // ─── Voice TX streaming path ───────────────────────────────────────────────
+
+  await test('startVoiceTx throws if already active', async () => {
+    await withServer({}, async (server) => {
+      const transport = new RsBa1Transport({ log: () => {} });
+      const cp = waitFor(transport, 'connect', 1500);
+      const ap = waitFor(transport, 'audio-ready', 1500);
+      transport.connect({
+        host: '127.0.0.1',
+        controlPort: server.controlPort,
+        username: 'user',
+        password: 'pass',
+        enableRxAudio: true,
+        enableTxAudio: true,
+        timeoutMs: 1500,
+      });
+      await cp;
+      await ap;
+      assert.strictEqual(transport.txReady, true);
+      transport.startVoiceTx();
+      assert.ok(transport.voiceTxActive, 'voice TX should be active after startVoiceTx()');
+      assert.throws(() => transport.startVoiceTx(), /voice TX already active/);
+      transport.cancelTx(); // immediate teardown so we don't leak timers
+      transport.disconnect();
+    });
+  });
+
+  await test('sendTxAudio rejects while voice TX is active', async () => {
+    await withServer({}, async (server) => {
+      const transport = new RsBa1Transport({ log: () => {} });
+      const cp = waitFor(transport, 'connect', 1500);
+      const ap = waitFor(transport, 'audio-ready', 1500);
+      transport.connect({
+        host: '127.0.0.1',
+        controlPort: server.controlPort,
+        username: 'user',
+        password: 'pass',
+        enableRxAudio: true,
+        enableTxAudio: true,
+        timeoutMs: 1500,
+      });
+      await cp;
+      await ap;
+      transport.startVoiceTx();
+      await assert.rejects(
+        () => transport.sendTxAudio(new Float32Array([0.1]), { offsetMs: 0, inputSampleRate: 48000, tailSilenceMs: 0 }),
+        /voice TX is active/
+      );
+      transport.stopVoiceTx();
+      transport.disconnect();
+    });
+  });
+
+  await test('pushVoiceChunk is a no-op when voice TX is not active', async () => {
+    await withServer({}, async (server) => {
+      const transport = new RsBa1Transport({ log: () => {} });
+      const cp = waitFor(transport, 'connect', 1500);
+      const ap = waitFor(transport, 'audio-ready', 1500);
+      transport.connect({
+        host: '127.0.0.1',
+        controlPort: server.controlPort,
+        username: 'user',
+        password: 'pass',
+        enableRxAudio: true,
+        enableTxAudio: true,
+        timeoutMs: 1500,
+      });
+      await cp;
+      await ap;
+      // No startVoiceTx() — pushVoiceChunk should silently do nothing.
+      const chunksBefore = server.txAudioPackets.length;
+      const chunk = new Float32Array(960);
+      for (let i = 0; i < chunk.length; i++) chunk[i] = 0.3;
+      transport.pushVoiceChunk(chunk);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assert.strictEqual(server.txAudioPackets.length, chunksBefore, 'no TX packets when voice TX not active');
+      transport.disconnect();
+    });
+  });
+
+  await test('voice TX streams audio packets from ring buffer to server', async () => {
+    await withServer({}, async (server) => {
+      const transport = new RsBa1Transport({ log: () => {} });
+      const cp = waitFor(transport, 'connect', 1500);
+      const ap = waitFor(transport, 'audio-ready', 1500);
+      transport.connect({
+        host: '127.0.0.1',
+        controlPort: server.controlPort,
+        username: 'user',
+        password: 'pass',
+        enableRxAudio: true,
+        enableTxAudio: true,
+        txAudioSampleRate: 48000,
+        timeoutMs: 1500,
+      });
+      await cp;
+      await ap;
+
+      transport.startVoiceTx();
+      assert.ok(transport.voiceTxActive);
+
+      // Push two 20ms frames (960 samples each) — enough for two UDP packets.
+      const frame = new Float32Array(1920);
+      for (let i = 0; i < frame.length; i++) frame[i] = i % 2 ? 0.2 : -0.2;
+      transport.pushVoiceChunk(frame);
+
+      await waitUntil(() => server.txAudioPackets.length >= 2, 800, 'voice TX audio packets');
+      assert.ok(server.txAudioPackets.length >= 2, `expected >=2 TX packets, got ${server.txAudioPackets.length}`);
+
+      // Verify the packets are the LPCM16 type (ident high byte 0x00 or 0x02,
+      // low byte 0x80 = LPCM16 identifier set by wfview protocol).
+      for (const pkt of server.txAudioPackets) {
+        assert.strictEqual(pkt.ident & 0xff, 0x80, `unexpected audio ident 0x${pkt.ident.toString(16)}`);
+      }
+
+      transport.stopVoiceTx();
+      transport.disconnect();
+    });
+  });
+
+  await test('ring buffer underrun sends silence frames while PTT is held', async () => {
+    await withServer({}, async (server) => {
+      const transport = new RsBa1Transport({ log: () => {} });
+      const cp = waitFor(transport, 'connect', 1500);
+      const ap = waitFor(transport, 'audio-ready', 1500);
+      transport.connect({
+        host: '127.0.0.1',
+        controlPort: server.controlPort,
+        username: 'user',
+        password: 'pass',
+        enableRxAudio: true,
+        enableTxAudio: true,
+        timeoutMs: 1500,
+      });
+      await cp;
+      await ap;
+
+      // Start voice TX but push nothing — pump should send silence to keep
+      // the radio TX buffer from starving.
+      transport.startVoiceTx();
+      await waitUntil(() => server.txAudioPackets.length >= 1, 150, 'silence frame(s)');
+      assert.ok(server.txAudioPackets.length >= 1, 'silence frame(s) sent on underrun');
+
+      // The silence packets must have a non-zero data length (they're real LPCM16 frames).
+      for (const pkt of server.txAudioPackets) {
+        assert.ok(pkt.datalen > 0, 'silence packet has zero payload');
+      }
+
+      transport.stopVoiceTx();
+      transport.disconnect();
+    });
+  });
+
+  await test('stopVoiceTx drains buffer and clears voiceTxActive', async () => {
+    await withServer({}, async (server) => {
+      const transport = new RsBa1Transport({ log: () => {} });
+      const cp = waitFor(transport, 'connect', 1500);
+      const ap = waitFor(transport, 'audio-ready', 1500);
+      transport.connect({
+        host: '127.0.0.1',
+        controlPort: server.controlPort,
+        username: 'user',
+        password: 'pass',
+        enableRxAudio: true,
+        enableTxAudio: true,
+        timeoutMs: 1500,
+      });
+      await cp;
+      await ap;
+
+      transport.startVoiceTx();
+      // Push one frame so there is something to drain.
+      const frame = new Float32Array(960);
+      for (let i = 0; i < frame.length; i++) frame[i] = 0.1;
+      transport.pushVoiceChunk(frame);
+
+      // Release PTT — pump must drain the remaining frame then clear voiceTxActive.
+      // stopVoiceTx() only sets pttHeld=false; the pump clears voiceTxActive
+      // asynchronously once the buffer is empty (within one 20 ms frame window).
+      transport.stopVoiceTx();
+      await waitUntil(() => !transport.voiceTxActive, 300, 'voiceTxActive clears after drain');
+      transport.disconnect();
+    });
+  });
+
+  await test('cancelTx stops an active voice TX session immediately', async () => {
+    await withServer({}, async (server) => {
+      const transport = new RsBa1Transport({ log: () => {} });
+      const cp = waitFor(transport, 'connect', 1500);
+      const ap = waitFor(transport, 'audio-ready', 1500);
+      transport.connect({
+        host: '127.0.0.1',
+        controlPort: server.controlPort,
+        username: 'user',
+        password: 'pass',
+        enableRxAudio: true,
+        enableTxAudio: true,
+        timeoutMs: 1500,
+      });
+      await cp;
+      await ap;
+
+      transport.startVoiceTx();
+      const frame = new Float32Array(960);
+      for (let i = 0; i < frame.length; i++) frame[i] = 0.1;
+      transport.pushVoiceChunk(frame);
+
+      transport.cancelTx();
+      assert.strictEqual(transport.voiceTxActive, false, 'cancelTx must clear voiceTxActive immediately');
+      // A second cancelTx should be safe to call.
+      assert.doesNotThrow(() => transport.cancelTx());
+      transport.disconnect();
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+
   await test('retries CI-V OpenClose until the stream accepts data', async () => {
     await withServer({ username: 'alice', password: 'secret', requiredCivOpenCount: 3, frequencyHz: 18100000 }, async (server) => {
       const transport = new RsBa1Transport();
