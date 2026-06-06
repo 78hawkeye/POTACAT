@@ -603,6 +603,28 @@ Reasoning:
 
 Caution: future changes to this area should be tested with JTCAT decodes, waterfall delay after band changes, and RS-BA1 RX diagnostics. Do not judge by “less dropout” alone if the waterfall becomes delayed or decode timing gets stale.
 
+### RS-BA1 RX Stall Escalation Under Video / Network Load
+
+`v1.8.5.7` adds an escalation path for hard RS-BA1 audio stalls observed when the Mac was playing YouTube while POTACAT was serving ECHOCAT/JTCAT audio.
+
+Observed log pattern:
+
+- RX gaps grew from hundreds of milliseconds to multi-second stalls.
+- Missing packet requests often received no useful response.
+- Renderer audio backpressure appeared on `smartsdr-audio-frame` and/or `jtcat-vita49-audio`.
+- The audio-only RS-BA1 stream restart reported `audio stream ready`, but usable audio did not resume.
+- Manual reconnect recovered the radio session.
+
+Fix:
+
+- Keep audio-only recovery for normal transient stalls.
+- After `ICOM_NETWORK_RX_FULL_RECONNECT_AFTER_AUDIO_RESTARTS = 3` stalled audio-restart attempts, request a full CAT/RS-BA1 reconnect via `connectCat()`.
+- This mirrors the manual recovery path and avoids looping audio-only stream restarts forever.
+
+Key file:
+
+- `main.js` - `startIcomNetworkRxWatchdog()`
+
 ### mDNS Bind Crash After Upstream Merge
 
 After the upstream merge, local launch could crash on mDNS bind conflicts, especially around `bonjour-service` / `multicast-dns` on UDP 5353. The local fix catches/logs mDNS bind errors instead of letting them become fatal startup exceptions.
@@ -654,7 +676,7 @@ Regression guard:
 
 Current local deployed build after this cycle:
 
-- `v1.8.5.6`
+- `v1.8.5.7`
 - Branch: `codex/merge-upstream-v1.8.4`
 - GitHub fork: `78hawkeye/POTACAT`
 - Latest relevant commit before this note: `6ef024a Cleanly release RS-BA1 on operator switch`
