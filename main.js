@@ -1574,19 +1574,49 @@ function sendCatLog(msg) {
   if (win && !win.isDestroyed()) win.webContents.send('cat-log', line);
 }
 
+// Async diagnostic log writer — never blocks the event loop.
+// Messages are buffered in _diagQueue; a setImmediate-scheduled flush batches
+// all entries that accumulated during the current event-loop tick into a single
+// fs.promises.appendFile call (one write per tick per file). This prevents the
+// per-packet RX-SEQ/RX-SKIP-LATE storm (~200 entries/s during a recovery burst)
+// from stalling UDP processing via 600 synchronous syscalls/second.
+const _diagQueue = [];
+let _diagFlushPending = false;
+
 function appendDiagnosticLog(fileName, msg) {
-  try {
-    const dir = app.getPath('userData');
-    const file = path.join(dir, fileName);
-    const maxBytes = 2 * 1024 * 1024;
-    if (fs.existsSync(file) && fs.statSync(file).size > maxBytes) {
-      const rotated = file + '.old';
-      try { if (fs.existsSync(rotated)) fs.unlinkSync(rotated); } catch {}
-      try { fs.renameSync(file, rotated); } catch {}
+  _diagQueue.push({ fileName, msg, ts: new Date().toISOString() });
+  if (!_diagFlushPending) {
+    _diagFlushPending = true;
+    setImmediate(_flushDiagLog);
+  }
+}
+
+async function _flushDiagLog() {
+  _diagFlushPending = false;
+  if (!_diagQueue.length) return;
+  // Drain the full queue into per-file buckets.
+  const byFile = new Map();
+  while (_diagQueue.length > 0) {
+    const { fileName, msg, ts } = _diagQueue.shift();
+    let lines = byFile.get(fileName);
+    if (!lines) { lines = []; byFile.set(fileName, lines); }
+    lines.push(`[${ts}] ${msg}`);
+  }
+  for (const [fileName, lines] of byFile) {
+    try {
+      const dir = app.getPath('userData');
+      const file = path.join(dir, fileName);
+      const maxBytes = 2 * 1024 * 1024;
+      const stat = await fs.promises.stat(file).catch(() => null);
+      if (stat && stat.size > maxBytes) {
+        const rotated = file + '.old';
+        await fs.promises.unlink(rotated).catch(() => {});
+        await fs.promises.rename(file, rotated).catch(() => {});
+      }
+      await fs.promises.appendFile(file, lines.join('\n') + '\n');
+    } catch (err) {
+      try { console.log(`[diagnostic-log] ${fileName}: ${err.message || err}`); } catch {}
     }
-    fs.appendFileSync(file, `[${new Date().toISOString()}] ${msg}\n`);
-  } catch (err) {
-    try { console.log(`[diagnostic-log] ${fileName}: ${err.message || err}`); } catch {}
   }
 }
 
@@ -6273,6 +6303,10 @@ function resetIcomNetworkRxDiagnostics(reason = 'reset') {
     sampleRates: new Map(),
     stalled: false,
     stallStartMs: 0,
+    // Per-second throttle state for noisy per-packet log entries:
+    _seqLogLastMs: 0,
+    _seqLogCount: 0,
+    _skipLogLastMs: 0,
   };
   appendDiagnosticLog('rsba1-rx-diagnostics.log', `--- ${reason}; activeProfile=${settings && settings.activeProfile || ''}; audioSource=${settings && settings.audioSource || ''}; catTarget=${settings && settings.catTarget && settings.catTarget.type || ''} ---`);
 }
@@ -6518,10 +6552,24 @@ function noteIcomNetworkRxDiagnostics(frame, pcm, sampleRate, peak) {
     if (track.missingRecovered) d.missingRecovered++;
     if (track.duplicate) d.duplicates++;
     if (track.largeGap) d.largeGaps++;
+    // Throttle per-packet RX-SEQ entries to at most one log line per second.
+    // During a recovery burst, hundreds of consecutive packets all have
+    // missingAdded/recovered flags — logging each one individually was
+    // triggering ~200 appendFileSync calls/second that stalled the event loop
+    // and prevented UDP processing, creating a feedback loop that crashed the app.
+    // The counters above (seqGapEvents, missingAdded, etc.) accumulate correctly
+    // regardless; the RX-SUMMARY every 10s provides the aggregated view.
     if (track.missingAdded || track.missingRecovered || track.largeGap) {
-      const msg = `RX-SEQ frame=${_icomNetworkAudioFrameCount} seq=${frame.packetSeq ?? '-'} audioSeq=${frame.audioSeq ?? '-'} missingAdded=${track.missingAdded || 0} pending=${track.pendingMissing || 0} recovered=${track.missingRecovered ? 1 : 0} duplicate=${track.duplicate ? 1 : 0} largeGap=${track.largeGap ? 1 : 0} payload=${frame.payloadBytes ?? '-'} peak=${(peak || 0).toFixed(4)}`;
-      appendDiagnosticLog('rsba1-rx-diagnostics.log', msg);
-      if (track.missingAdded || track.largeGap) sendCatLog(`[Icom-Network-Audio] ${msg}`);
+      d._seqLogCount = (d._seqLogCount || 0) + 1;
+      const logThis = track.largeGap || !d._seqLogLastMs || now - d._seqLogLastMs >= 1000;
+      if (logThis) {
+        const skipped = d._seqLogCount - 1;
+        const msg = `RX-SEQ frame=${_icomNetworkAudioFrameCount} seq=${frame.packetSeq ?? '-'} audioSeq=${frame.audioSeq ?? '-'} missingAdded=${track.missingAdded || 0} pending=${track.pendingMissing || 0} recovered=${track.missingRecovered ? 1 : 0} duplicate=${track.duplicate ? 1 : 0} largeGap=${track.largeGap ? 1 : 0} payload=${frame.payloadBytes ?? '-'} peak=${(peak || 0).toFixed(4)}${skipped > 0 ? ` [+${skipped} similar suppressed]` : ''}`;
+        appendDiagnosticLog('rsba1-rx-diagnostics.log', msg);
+        if (track.missingAdded || track.largeGap) sendCatLog(`[Icom-Network-Audio] ${msg}`);
+        d._seqLogLastMs = now;
+        d._seqLogCount = 0;
+      }
     }
   }
 
@@ -6548,7 +6596,13 @@ function handleIcomNetworkAudioFrame(frame) {
   const track = frame.rxTrack || {};
 
   if (track.duplicate || track.missingRecovered) {
-    appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-SKIP-LATE frame=${_icomNetworkAudioFrameCount} seq=${frame.packetSeq ?? '-'} recovered=${track.missingRecovered ? 1 : 0} duplicate=${track.duplicate ? 1 : 0} payload=${frame.payloadBytes ?? '-'}`);
+    // Throttled — see RX-SEQ note above. One log line per second max.
+    const d = _icomNetworkRxDiag;
+    const now = Date.now();
+    if (d && (!d._skipLogLastMs || now - d._skipLogLastMs >= 1000)) {
+      appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-SKIP-LATE frame=${_icomNetworkAudioFrameCount} seq=${frame.packetSeq ?? '-'} recovered=${track.missingRecovered ? 1 : 0} duplicate=${track.duplicate ? 1 : 0} payload=${frame.payloadBytes ?? '-'}`);
+      d._skipLogLastMs = now;
+    }
     return;
   }
   if (track.largeGap) {
