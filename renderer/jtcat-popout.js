@@ -45,6 +45,7 @@ function _applyPopoutTheme(payload) {
   var transmitting = false;
   var jpTxFreqHz = 1500;
   var jpRxFreqHz = 1500;
+  var jpReplyOnClear = true;   // "Clr Rpl" toggle — answer on clear freq (default on)
   var myCallsign = '';
   var myGrid = '';
   var stations = {};   // callsign -> {marker, grid, lat, lon, lastSeen}
@@ -68,6 +69,8 @@ function _applyPopoutTheme(payload) {
   window.api.getSettings().then(function(s) {
     myCallsign = (s.myCallsign || '').toUpperCase();
     myGrid = (s.grid || '').toUpperCase().substring(0, 4);
+    jpReplyOnClear = s.jtcatReplyOnClear !== false; // default on
+    if (replyClearBtn) replyClearBtn.classList.toggle('active', jpReplyOnClear);
     applyUltracat(!!s.ultracat);
     if (maxAttemptsInput && typeof s.jtcatMaxQsoAttempts === 'number') {
       maxAttemptsInput.value = s.jtcatMaxQsoAttempts;
@@ -110,6 +113,14 @@ function _applyPopoutTheme(payload) {
   var maxAttemptsInput = document.getElementById('jp-max-attempts');
   var enableTxBtn = document.getElementById('jp-enable-tx');
   var haltTxBtn = document.getElementById('jp-halt-tx');
+  var replyClearBtn = document.getElementById('jp-reply-clear');
+  if (replyClearBtn) {
+    replyClearBtn.addEventListener('click', function() {
+      jpReplyOnClear = !jpReplyOnClear;
+      replyClearBtn.classList.toggle('active', jpReplyOnClear);
+      window.api.jtcatSetReplyOnClear(jpReplyOnClear);
+    });
+  }
   var tuneBtn = document.getElementById('jp-tune');
   var txMsgEl = document.getElementById('jp-tx-msg');
   var rxTxEl = document.getElementById('jp-rx-tx');
@@ -828,6 +839,13 @@ function _applyPopoutTheme(payload) {
     transmitting = data.state === 'tx';
     rxTxEl.textContent = transmitting ? 'TX' : 'RX';
     rxTxEl.style.color = transmitting ? '#e94560' : '';
+    // Keep the waterfall TX marker + label synced to the engine's ACTUAL TX
+    // freq. Main drives it for clear-freq replies + re-hops; without this the
+    // marker only tracked manual clicks and looked "stuck at 1500".
+    if (typeof data.txFreq === 'number' && data.txFreq > 0) {
+      jpTxFreqHz = data.txFreq;
+      if (txFreqLabel) txFreqLabel.textContent = 'TX: ' + jpTxFreqHz + ' Hz';
+    }
     // Highlight the TX waterfall pane in multi-slice mode
     if (multiActive) {
       document.querySelectorAll('.jp-wf-pane.wf-tx-active').forEach(function(el) { el.classList.remove('wf-tx-active'); });

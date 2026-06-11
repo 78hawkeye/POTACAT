@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld('api', {
   jtcatStartMulti: (slices) => ipcRenderer.send('jtcat-start-multi', slices),
   enumerateAudioDevices: () => navigator.mediaDevices.enumerateDevices().then(d => d.filter(x => x.kind === 'audioinput').map(x => ({ deviceId: x.deviceId, label: x.label }))),
   jtcatQuietFreq: (hz) => ipcRenderer.send('jtcat-quiet-freq', hz),
+  jtcatSetReplyOnClear: (on) => ipcRenderer.send('jtcat-set-reply-on-clear', on),
   jtcatSpectrum: (bins) => ipcRenderer.send('jtcat-spectrum', bins),
   // JTCAT events
   onJtcatDecode: (cb) => ipcRenderer.on('jtcat-decode', (_e, data) => cb(data)),

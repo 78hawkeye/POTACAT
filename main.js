@@ -4594,6 +4594,19 @@ let jtcatManager = null; // initialized on first startJtcat()
 let ft8Engine = null;    // alias for jtcatManager.engine (Phase 0 compatibility)
 let remoteJtcatQso = null;
 let jtcatQuietFreq = 1500; // auto-detected quiet TX frequency from FFT analysis
+
+// "Reply on clear freq" — when answering a CQ, transmit on the FFT-detected
+// quiet lane instead of zero-beating the caller. Re-hopping (in the retry loop)
+// is limited to the INITIAL reply call; once the exchange is engaged we hold so
+// the partner can track us. Hold TX Freq always wins (engine.setTxFreq no-ops
+// while held). Default ON.
+function jtcatReplyOnClearEnabled() {
+  return settings.jtcatReplyOnClear !== false;
+}
+function jtcatReplyTxFreq(callerDf) {
+  return jtcatReplyOnClearEnabled() ? jtcatQuietFreq : callerDf;
+}
+
 let _jtcatTxFailsafeTimer = null;
 let _jtcatIcomHardReleaseTimer = null;
 const JTCAT_MAX_CQ_RETRIES = 15;
@@ -5155,6 +5168,11 @@ function startJtcat(mode) {
           remoteJtcatQso.txRetries = 0; // they're still responding, keep trying
         } else {
           remoteJtcatQso.txRetries = (remoteJtcatQso.txRetries || 0) + 1;
+          // Re-hop only on the INITIAL reply call (spread our calls); hold once
+          // the exchange is engaged so the partner can track our report.
+          if (remoteJtcatQso.phase === 'reply' && jtcatReplyOnClearEnabled() && ft8Engine) {
+            ft8Engine.setTxFreq(jtcatQuietFreq);
+          }
         }
         const max = (remoteJtcatQso.phase === 'cq') ? JTCAT_MAX_CQ_RETRIES : jtcatMaxQsoRetries();
         if (remoteJtcatQso.txRetries >= max) {
@@ -5193,6 +5211,12 @@ function startJtcat(mode) {
           maxCq: JTCAT_MAX_CQ_RETRIES, maxQso: jtcatMaxQsoRetries(), runMode: inRunMode,
         });
         popoutJtcatQso.txRetries = outcome.retries;
+        // Re-hop only on the initial reply call (spread); hold once engaged.
+        if (outcome.action !== 'rearm' && outcome.action !== 'abort' &&
+            stoppedPhase === 'reply' && !popoutJtcatQso._heardThisCycle &&
+            jtcatReplyOnClearEnabled() && ft8Engine) {
+          ft8Engine.setTxFreq(jtcatQuietFreq);
+        }
         if (outcome.action === 'rearm') {
           // Abandon the stalled QSO and resume calling CQ.
           sendCatLog('[JTCAT] Full Auto CQ — ' + (stoppedCall || 'partner') + ' stalled, resuming CQ');
@@ -5270,7 +5294,7 @@ function startJtcat(mode) {
           };
 
           ft8Engine.setRxFreq(best.df);
-          ft8Engine.setTxFreq(best.df);
+          ft8Engine.setTxFreq(jtcatReplyTxFreq(best.df)); // clear-freq reply unless Hold/OFF
           ft8Engine._txEnabled = true;
           // Match their TX slot: they CQ on slot X, we reply on the opposite
           const theirSlot = best.slot || 'even';
@@ -10003,7 +10027,7 @@ function connectRemote() {
     }
     // Halt any active TX (e.g. CQ) so reply goes out on next boundary
     if (targetEngine._txActive) targetEngine.txComplete();
-    targetEngine.setTxFreq(df);
+    targetEngine.setTxFreq(jtcatReplyTxFreq(df)); // clear-freq reply unless Hold/OFF
     targetEngine.setRxFreq(df);
     // TX on opposite slot from the station we're replying to (use slot from decode data)
     const targetSlot = slot || targetEngine._lastRxSlot;
@@ -17964,7 +17988,7 @@ app.whenReady().then(() => {
     }
     // Halt any active TX (e.g. CQ) so reply goes out on next boundary
     if (replyEngine._txActive) replyEngine.txComplete();
-    replyEngine.setTxFreq(data.df || 1500);
+    replyEngine.setTxFreq(jtcatReplyTxFreq(data.df || 1500)); // clear-freq reply unless Hold/OFF
     replyEngine.setRxFreq(data.df || 1500);
     // TX on opposite slot from the station we're replying to
     const targetSlot = data.slot || replyEngine._lastRxSlot;
@@ -21913,6 +21937,12 @@ app.whenReady().then(() => {
               maxCq: JTCAT_MAX_CQ_RETRIES, maxQso: jtcatMaxQsoRetries(), runMode: inRunMode,
             });
             popoutJtcatQso.txRetries = outcome.retries;
+            // Re-hop only on the initial reply call (spread); hold once engaged.
+            if (outcome.action !== 'rearm' && outcome.action !== 'abort' &&
+                popoutJtcatQso.phase === 'reply' && !popoutJtcatQso._heardThisCycle &&
+                jtcatReplyOnClearEnabled()) {
+              engine.setTxFreq(jtcatQuietFreq);
+            }
             if (outcome.action === 'rearm') {
               if (stoppedCall) jtcatAutoCqWorkedSession.add(stoppedCall);
               rearmCq('popout');
@@ -21942,6 +21972,9 @@ app.whenReady().then(() => {
               remoteJtcatQso.txRetries = 0;
             } else {
               remoteJtcatQso.txRetries = (remoteJtcatQso.txRetries || 0) + 1;
+              if (remoteJtcatQso.phase === 'reply' && jtcatReplyOnClearEnabled()) {
+                engine.setTxFreq(jtcatQuietFreq); // spread initial reply calls only
+              }
               const max = (remoteJtcatQso.phase === 'cq') ? JTCAT_MAX_CQ_RETRIES : JTCAT_MAX_QSO_RETRIES;
               if (remoteJtcatQso.txRetries >= max) {
                 console.log('[JTCAT Multi] Remote TX retry limit — giving up');
@@ -22037,6 +22070,11 @@ app.whenReady().then(() => {
 
   ipcMain.on('jtcat-quiet-freq', (_e, hz) => {
     jtcatQuietFreq = hz;
+  });
+  ipcMain.on('jtcat-set-reply-on-clear', (_e, enabled) => {
+    settings.jtcatReplyOnClear = !!enabled;
+    saveSettings(settings);
+    sendCatLog('[JTCAT] Reply on clear freq: ' + (settings.jtcatReplyOnClear ? 'ON' : 'off'));
   });
   ipcMain.on('jtcat-spectrum', (_e, bins) => {
     if (remoteServer && remoteServer.hasClient()) remoteServer.broadcastJtcatSpectrum(bins);
