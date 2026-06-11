@@ -22297,6 +22297,28 @@ var jtcatRemoteActive = false; // true when phone is driving JTCAT
 var jtcatQuietFreq = 1500;     // auto-detected quiet TX frequency (Hz)
 var jtcatQuietFreqFrame = 0;   // frame counter for throttling quiet freq updates
 var jtcatSpectrumFrame = 0;    // frame counter for throttling spectrum IPC to ~10fps
+// Clear-freq detection: accumulate across the RX cycle, rotate the quietest lanes.
+var jtcatQuietAccum = null; var jtcatQuietCount = 0; var jtcatQuietLastFinalize = 0; var jtcatQuietRotIdx = 0;
+function jtcatPickQuietLanes(accum, binHz) {
+  var windowBins = Math.round(50 / binHz);
+  var startBin = Math.round(200 / binHz);
+  var endBin = Math.round(2800 / binHz);
+  var wins = [];
+  for (var b = startBin; b <= endBin - windowBins; b++) {
+    var e = 0;
+    for (var j = 0; j < windowBins; j++) e += accum[b + j];
+    wins.push({ c: b + (windowBins >> 1), e: e });
+  }
+  wins.sort(function (a, b) { return a.e - b.e; });
+  var picks = [];
+  for (var i = 0; i < wins.length && picks.length < 3; i++) {
+    var hz = Math.max(200, Math.min(2800, Math.round(wins[i].c * binHz / 10) * 10));
+    var ok = true;
+    for (var p = 0; p < picks.length; p++) { if (Math.abs(picks[p] - hz) < 60) { ok = false; break; } }
+    if (ok) picks.push(hz);
+  }
+  return picks;
+}
 
 // --- SmartSDR Direct: synthetic JTCAT audio stream ---
 // On "SmartSDR Direct" the JTCAT audio doesn't come from a Windows DAX
@@ -23874,27 +23896,24 @@ function jtcatWaterfallLoop() {
   waterfallCtx.fillRect(txX - 1, 0, 3, h);
   waterfallCtx.shadowBlur = 0;
 
-  // Auto-detect quietest TX frequency — analyze every ~30 frames (~0.5s)
-  jtcatQuietFreqFrame++;
-  if (jtcatQuietFreqFrame % 30 === 0) {
-    // Scan 200–2800 Hz in 50Hz windows (avoid edges)
-    var binHz = nyquist / freqData.length;
-    var windowBins = Math.round(50 / binHz); // ~8-9 bins per 50Hz window
-    var startBin = Math.round(200 / binHz);
-    var endBin = Math.round(2800 / binHz);
-    var bestEnergy = Infinity;
-    var bestBin = Math.round(1500 / binHz);
-    for (var b = startBin; b <= endBin - windowBins; b++) {
-      var energy = 0;
-      for (var j = 0; j < windowBins; j++) energy += freqData[b + j];
-      if (energy < bestEnergy) {
-        bestEnergy = energy;
-        bestBin = b + Math.floor(windowBins / 2);
-      }
+  // Clear-freq detection: average the spectrum across the RX cycle (skip our own
+  // TX) so the inter-cycle gap can't fool the picker, then rotate the quietest
+  // lanes so re-hops spread across genuinely-clear spots.
+  if (!jtcatIsTx) {
+    if (!jtcatQuietAccum || jtcatQuietAccum.length !== freqData.length) { jtcatQuietAccum = new Float32Array(freqData.length); jtcatQuietCount = 0; }
+    for (var qa = 0; qa < freqData.length; qa++) jtcatQuietAccum[qa] += freqData[qa];
+    jtcatQuietCount++;
+  }
+  var qNow = Date.now();
+  if (jtcatQuietAccum && jtcatQuietCount > 10 && qNow - jtcatQuietLastFinalize > 13000) {
+    jtcatQuietLastFinalize = qNow;
+    var picks = jtcatPickQuietLanes(jtcatQuietAccum, nyquist / freqData.length);
+    if (picks.length) {
+      jtcatQuietRotIdx = (jtcatQuietRotIdx + 1) % picks.length;
+      jtcatQuietFreq = picks[jtcatQuietRotIdx];
+      window.api.jtcatQuietFreq(jtcatQuietFreq);
     }
-    var quietHz = Math.round(bestBin * binHz / 10) * 10; // snap to 10Hz
-    jtcatQuietFreq = Math.max(200, Math.min(2800, quietHz));
-    window.api.jtcatQuietFreq(jtcatQuietFreq);
+    jtcatQuietAccum = null; jtcatQuietCount = 0;
   }
 
   // Send spectrum bins to main process for ECHOCAT/popout (~10fps)

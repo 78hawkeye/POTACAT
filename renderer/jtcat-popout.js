@@ -1638,6 +1638,28 @@ function _applyPopoutTheme(payload) {
   var popoutWaterfallAnim = null;
   var popoutQuietFreqFrame = 0;
   var popoutSpectrumFrame = 0;
+  // Clear-freq detection state (accumulate across the RX cycle, rotate lanes).
+  var jpQuietAccum = null; var jpQuietCount = 0; var jpQuietLastFinalize = 0; var jpQuietRotIdx = 0;
+  function jtcatPickQuietLanes(accum, binHz) {
+    var windowBins = Math.round(50 / binHz);
+    var startBin = Math.round(200 / binHz);
+    var endBin = Math.round(2800 / binHz);
+    var wins = [];
+    for (var b = startBin; b <= endBin - windowBins; b++) {
+      var e = 0;
+      for (var j = 0; j < windowBins; j++) e += accum[b + j];
+      wins.push({ c: b + (windowBins >> 1), e: e });
+    }
+    wins.sort(function (a, b) { return a.e - b.e; });
+    var picks = [];
+    for (var i = 0; i < wins.length && picks.length < 3; i++) {
+      var hz = Math.max(200, Math.min(2800, Math.round(wins[i].c * binHz / 10) * 10));
+      var ok = true;
+      for (var p = 0; p < picks.length; p++) { if (Math.abs(picks[p] - hz) < 60) { ok = false; break; } }
+      if (ok) picks.push(hz);
+    }
+    return picks;
+  }
 
   // --- SmartSDR Direct: synthetic audio stream for the pop-out waterfall ---
   // On "SmartSDR Direct" the pop-out's audio is VITA-49 dax_rx frames
@@ -1993,25 +2015,22 @@ function _applyPopoutTheme(payload) {
       jpWfCtx.fillRect(txX - 1, 0, 3, h);
       jpWfCtx.shadowBlur = 0;
 
-      // Auto-detect quietest TX frequency (~every 0.5s)
-      popoutQuietFreqFrame++;
-      if (popoutQuietFreqFrame % 30 === 0) {
-        var binHz = nyquist / freqData.length;
-        var windowBins = Math.round(50 / binHz);
-        var startBin = Math.round(200 / binHz);
-        var endBin = Math.round(2800 / binHz);
-        var bestEnergy = Infinity;
-        var bestBin = Math.round(1500 / binHz);
-        for (var b = startBin; b <= endBin - windowBins; b++) {
-          var energy = 0;
-          for (var j = 0; j < windowBins; j++) energy += freqData[b + j];
-          if (energy < bestEnergy) {
-            bestEnergy = energy;
-            bestBin = b + Math.floor(windowBins / 2);
-          }
+      // Clear-freq detection: average across the RX cycle (skip our TX), rotate
+      // the quietest lanes so re-hops spread across genuinely-clear spots.
+      if (!transmitting) {
+        if (!jpQuietAccum || jpQuietAccum.length !== freqData.length) { jpQuietAccum = new Float32Array(freqData.length); jpQuietCount = 0; }
+        for (var qa = 0; qa < freqData.length; qa++) jpQuietAccum[qa] += freqData[qa];
+        jpQuietCount++;
+      }
+      var qNow = Date.now();
+      if (jpQuietAccum && jpQuietCount > 10 && qNow - jpQuietLastFinalize > 13000) {
+        jpQuietLastFinalize = qNow;
+        var picks = jtcatPickQuietLanes(jpQuietAccum, nyquist / freqData.length);
+        if (picks.length) {
+          jpQuietRotIdx = (jpQuietRotIdx + 1) % picks.length;
+          window.api.jtcatQuietFreq(picks[jpQuietRotIdx]);
         }
-        var quietHz = Math.round(bestBin * binHz / 10) * 10;
-        window.api.jtcatQuietFreq(Math.max(200, Math.min(2800, quietHz)));
+        jpQuietAccum = null; jpQuietCount = 0;
       }
 
       // Send spectrum to main process for remote/ECHOCAT (~10fps)
