@@ -4939,13 +4939,19 @@ async function jtcatAutoLog(qso) {
 // decoder miss and the next cycle should pick it up. (K3SBP 2026-05-03.)
 const _jtcatStateMachine = require('./lib/jtcat-state-machine');
 
+// TEMP QSO-SEQUENCING DIAG (K3SBP 2026-06-11): file log to debug "partner
+// replies but QSO doesn't advance / times out as no-reply" on v1.8.7.
+function _qsoDiag(line) {
+  try { require('fs').appendFile('/tmp/potacat-qso-diag.log', `${new Date().toISOString()} ${line}\n`, () => {}); } catch {}
+}
+
 function advanceJtcatQso(q, results, setTxMsg, onDone) {
   // Thin wrapper around the extracted state machine — keeps the
   // engine + log dependencies injected so the unit tests in
   // test/jtcat-test.js can drive it without spinning the full app.
   return _jtcatStateMachine.advanceJtcatQso(q, results, setTxMsg, onDone, {
     engine: ft8Engine,
-    log: sendCatLog,
+    log: (m) => { sendCatLog(m); if (typeof m === 'string' && m.indexOf('[JTCAT QSO]') >= 0) _qsoDiag(m); },
   });
 }
 
@@ -4971,8 +4977,16 @@ function processRemoteJtcatQso(results) {
 }
 
 function processPopoutJtcatQso(results) {
-  if (!_autoSeqEnabled()) return;
+  if (!_autoSeqEnabled()) {
+    _qsoDiag(`POPOUT autoSeq=OFF phase=${popoutJtcatQso && popoutJtcatQso.phase} call=${popoutJtcatQso && popoutJtcatQso.call} — auto-advance SKIPPED`);
+    return;
+  }
   const qso = popoutJtcatQso; // capture reference — don't rely on global in callbacks
+  if (qso && qso.mode === 'reply') {
+    const mc = (qso.myCall || '').toUpperCase(), tc = (qso.call || '').toUpperCase();
+    const cand = (results || []).map(d => d.text).filter(t => t && (t.toUpperCase().indexOf(mc) >= 0 || (tc && t.toUpperCase().indexOf(tc) >= 0)));
+    _qsoDiag(`POPOUT-CYCLE phase=${qso.phase} call=${qso.call} txRetries=${qso.txRetries} txMsg="${qso.txMsg}" candidates=[${cand.join(' | ')}] totalDecodes=${(results || []).length}`);
+  }
   advanceJtcatQso(qso, results, async (msg) => {
     const txEng = jtcatManager ? jtcatManager.txEngine : ft8Engine;
     if (txEng) await txEng.setTxMessage(msg);
@@ -5080,6 +5094,7 @@ function startJtcat(mode) {
         }
         r.call = uc;
         r.newCall = !rosterWorkedCalls.has(uc);
+        r.newToday = !isCallWorkedToday(uc); // not yet worked in today's Zulu day
         r.watched = wlCalls.length > 0 && wlCalls.some(w => uc.indexOf(w) >= 0 || w.indexOf(uc) >= 0);
         // Extract grid from CQ messages (e.g. "CQ K1ABC FN42")
         // Maidenhead grids: longitude field A-R, latitude field A-J, then 2 digits
@@ -5219,7 +5234,16 @@ function startJtcat(mode) {
           .filter(d => {
             if (!d.call || d.call === myCall) return false;
             if (jtcatAutoCqWorkedSession.has(d.call)) return false;
-            if (workedQsos && workedQsos.has(d.call)) return false;
+            // Dupe rule depends on mode:
+            //  - All CQ: skip anyone already in the log (worked ever).
+            //  - POTA/SOTA: skip only stations already logged TODAY (UTC) — each
+            //    activator counts once per Zulu day, so prior-day contacts are
+            //    eligible again (same gate as the "T" New Today badge).
+            if (jtcatAutoCqMode === 'all') {
+              if (workedQsos && workedQsos.has(d.call)) return false;
+            } else if (isCallWorkedToday(d.call)) {
+              return false;
+            }
             return true;
           });
 
@@ -12367,6 +12391,29 @@ function buildRosterSets() {
   } catch (err) {
     console.error('Failed to build roster sets:', err.message);
   }
+}
+
+// Today's UTC (Zulu) date as YYYYMMDD — matches ADIF QSO_DATE format.
+function getZuluDateYMD() {
+  const now = new Date();
+  return now.getUTCFullYear().toString() +
+    String(now.getUTCMonth() + 1).padStart(2, '0') +
+    String(now.getUTCDate()).padStart(2, '0');
+}
+
+// True if `callUc` (UPPERCASE) is in the QSO log with today's Zulu date.
+// Powers the JTCAT "New Today" (T) badge and the per-day auto-CQ dupe gate.
+// Reads workedQsos (loaded from the ADIF log at startup, updated live on each
+// logged QSO). Today's date is computed fresh per call so UTC-midnight rollover
+// is automatic.
+function isCallWorkedToday(callUc) {
+  const list = workedQsos.get(callUc);
+  if (!list || list.length === 0) return false;
+  const today = getZuluDateYMD();
+  for (const e of list) {
+    if (String(e.date || '').replace(/[^0-9]/g, '').slice(0, 8) === today) return true;
+  }
+  return false;
 }
 
 // --- Worked parks tracking ---
@@ -21818,6 +21865,7 @@ app.whenReady().then(() => {
             }
             r.call = uc;
             r.newCall = !rosterWorkedCalls.has(uc);
+            r.newToday = !isCallWorkedToday(uc); // not yet worked in today's Zulu day
             r.watched = wlCalls.length > 0 && wlCalls.some(w => uc.indexOf(w) >= 0 || w.indexOf(uc) >= 0);
             const gm = (r.text || '').match(/\b([A-R]{2}\d{2})\s*$/i);
             if (gm && !(/^RR\d{2}$/i.test(gm[1]))) {

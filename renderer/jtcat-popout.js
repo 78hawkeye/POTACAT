@@ -579,6 +579,7 @@ function _applyPopoutTheme(payload) {
       if (d.newDxcc) badges += '<span class="jp-badge jp-badge-dxcc" title="New DXCC: ' + esc(d.entity || '') + '">D</span>';
       if (d.newGrid) badges += '<span class="jp-badge jp-badge-grid" title="New grid: ' + esc(d.grid || '') + '">G</span>';
       if (d.newCall) badges += '<span class="jp-badge jp-badge-call" title="New call: ' + esc(d.call || '') + '">C</span>';
+      if (d.newToday) badges += '<span class="jp-badge jp-badge-today" title="Not worked today (UTC): ' + esc(d.call || '') + '">T</span>';
       if (d.watched) badges += '<span class="jp-badge jp-badge-watch" title="Watchlist">W</span>';
       var entityStr = d.entity ? '<span class="jp-entity">' + esc(d.entity) + '</span>' : '';
 
