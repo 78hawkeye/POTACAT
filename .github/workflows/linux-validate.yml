@@ -15,12 +15,19 @@ on:
         description: "Short note about what's being validated (shows in run history)"
         required: false
         type: string
+      artifact_run_id:
+        description: "Reuse artifacts from a previous run id (skips the ~10 min build; smoke-only iteration)"
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   build-linux-validate:
+    if: inputs.artifact_run_id == ''
     # 22.04 (glibc 2.35) so validation matches the release runner — the
     # alsa_native addon needs to load on Raspberry Pi OS Bookworm
     # (glibc 2.36), which means it can only require symbols <= 2.35.
@@ -93,7 +100,7 @@ jobs:
           node -e "
             const a = require('./lib/alsa');
             console.log('alsa available:', a.isAvailable(), 'version:', a._alsaVersion(), 'platform:', a._platform());
-            const devs = a.getDevices();
+            const devs = a.listDevices();
             console.log('enumerated', devs.length, 'devices');
             const native = require('./lib/alsa_native/build/Release/alsa_native.node');
             const cap = native.openCapture('null', { rate: 48000, channels: 1, periodFrames: 1024, bufferFrames: 4096 });
@@ -133,3 +140,105 @@ jobs:
             dist/potacat-*.rpm
           if-no-files-found: error
           retention-days: 30
+
+  # ── Chromium sandbox smoke test (GitHub issue #37) ───────────────────
+  # Runs the freshly built artifacts on ubuntu-24.04 — the OS whose
+  # AppArmor userns restriction triggered the "chrome-sandbox must be
+  # setuid root" abort. Three scenarios:
+  #   1. deb on Ubuntu 24.04: AppArmor profile installed, chrome-sandbox
+  #      NOT setuid, app launches fully sandboxed (no fallback warning).
+  #   2. deb with unprivileged userns disabled entirely (hardened-Debian
+  #      simulation via kernel.unprivileged_userns_clone=0): app must
+  #      still launch, via the logged --no-sandbox fallback.
+  #   3. AppImage on Ubuntu 24.04 (no profile possible): app must still
+  #      launch, via the logged --no-sandbox fallback. Pre-fix builds
+  #      abort in seconds here.
+  # "Launches" = the --headless process is still alive when a 25s
+  # timeout kills it (exit 124) — the sandbox abort happens within the
+  # first seconds of Chromium startup.
+  sandbox-smoke:
+    needs: build-linux-validate
+    if: always() && (needs.build-linux-validate.result == 'success' || inputs.artifact_run_id != '')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: potacat-linux-validation
+          path: dist
+          # When artifact_run_id is set, pull from that prior run instead
+          # of this one (smoke-only iteration without the 10-min build).
+          run-id: ${{ inputs.artifact_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Install runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse2t64 xvfb libasound2t64
+
+      - name: Enable the Ubuntu 24.04 userns restriction
+        # GitHub runners may relax it for CI compatibility — force the
+        # stock-desktop value the bug reports come from.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+          sysctl kernel.unprivileged_userns_clone || true
+
+      - name: "Scenario 1: deb install — sandboxed, no setuid binary"
+        run: |
+          set -ex
+          sudo apt-get install -y ./dist/potacat_*.deb
+          # Resolve the installed executable (electron-builder names it
+          # after productName).
+          BIN=$(find /opt -maxdepth 2 -type f \( -name 'POTACAT' -o -name 'potacat' \) | head -1)
+          test -n "$BIN"
+          EXE=$(basename "$BIN")
+          echo "installed binary: $BIN"
+          # The AppArmor profile must be installed and the helper must NOT
+          # be setuid — this is the heart of issue #37.
+          test -f "/etc/apparmor.d/$EXE"
+          cat "/etc/apparmor.d/$EXE"
+          PERMS=$(stat -c '%a %U' "$(dirname "$BIN")/chrome-sandbox")
+          echo "chrome-sandbox: $PERMS"
+          [ "$PERMS" = "755 root" ]
+          test -z "$(find "$(dirname "$BIN")" -perm -4000)"
+          # Launch headless as the unprivileged runner user. Alive at the
+          # 25s kill (rc 124) = Chromium got past sandbox init.
+          rm -rf ~/.config/POTACAT
+          rc=0; timeout 25s xvfb-run -a "$BIN" --headless || rc=$?
+          # timeout kills xvfb-run but the Electron child survives (and
+          # shrugs off SIGTERM headless) — SIGKILL it or the next
+          # scenario hits EADDRINUSE on port 7300.
+          pkill -9 -f 'POTACAT' || true; pkill -9 -f 'potacat' || true; sleep 1
+          echo "exit code: $rc"
+          echo "--- startup.log ---"; cat ~/.config/POTACAT/startup.log || echo "(no startup.log — JS never ran)"
+          [ "$rc" = "124" ]
+          # Fully sandboxed — the fallback must NOT have fired.
+          ! grep -F '[sandbox] WARNING' ~/.config/POTACAT/startup.log
+
+      - name: "Scenario 2: deb with userns disabled (hardened-Debian sim)"
+        run: |
+          set -ex
+          sudo sysctl -w kernel.unprivileged_userns_clone=0
+          BIN=$(find /opt -maxdepth 2 -type f \( -name 'POTACAT' -o -name 'potacat' \) | head -1)
+          pkill -9 -f 'POTACAT' || true; pkill -9 -f 'potacat' || true; sleep 1
+          rm -rf ~/.config/POTACAT
+          rc=0; timeout 25s xvfb-run -a "$BIN" --headless || rc=$?
+          pkill -9 -f 'POTACAT' || true; pkill -9 -f 'potacat' || true; sleep 1
+          echo "exit code: $rc"
+          echo "--- startup.log ---"; cat ~/.config/POTACAT/startup.log || echo "(no startup.log — JS never ran)"
+          [ "$rc" = "124" ]
+          grep -F '[sandbox] WARNING' ~/.config/POTACAT/startup.log
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+
+      - name: "Scenario 3: AppImage on Ubuntu 24.04 — fallback fires"
+        run: |
+          set -ex
+          chmod +x dist/POTACAT-*.AppImage
+          pkill -9 -f 'POTACAT' || true; pkill -9 -f 'potacat' || true; sleep 1
+          rm -rf ~/.config/POTACAT
+          rc=0; timeout 25s xvfb-run -a dist/POTACAT-*.AppImage --headless || rc=$?
+          pkill -9 -f 'POTACAT' || true; pkill -9 -f 'potacat' || true; sleep 1
+          echo "exit code: $rc"
+          echo "--- startup.log ---"; cat ~/.config/POTACAT/startup.log || echo "(no startup.log — JS never ran)"
+          [ "$rc" = "124" ]
+          grep -F '[sandbox] WARNING' ~/.config/POTACAT/startup.log

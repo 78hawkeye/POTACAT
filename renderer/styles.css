@@ -2119,9 +2119,9 @@ dialog {
 /* ────────────────────────────────────────────────────────────────
    Sidebar layout — always-on as of 2026-06-08 (Casey: "I prefer this
    to ALWAYS be the case"). Used to be gated at ≥720px container width.
-   Tabs are a left rail; search pins above the content; the Save/Cancel
-   row sits under the scroll area on the right; the version/links
-   footer spans the full width.
+   Tabs are a left rail; search pins above the content; the pinned
+   footer bar (ECHOCAT promo + version/links + Save/Cancel) spans the
+   full width below both columns.
 
    .settings-tab-bar is set to `display: contents` so the tabs row
    and the search input can land in different grid cells without
@@ -2136,7 +2136,7 @@ dialog {
     "conn    conn"
     "tabs    search"
     "tabs    content"
-    "tabs    buttons";
+    "footer  footer";
   column-gap: 20px;
   row-gap: 4px;
 }
@@ -2182,20 +2182,14 @@ dialog {
   grid-area: content;
   min-height: 0;
 }
-.settings-shell > .dialog-buttons {
-  grid-area: buttons;
+/* Pinned bottom bar — spans both shell columns (grid-area: footer) so the
+   ECHOCAT promo, version/links cluster AND Save/Cancel stay visible on every
+   tab without scrolling (Casey 2026-06-12). */
+.settings-shell > .settings-footer {
+  grid-area: footer;
   margin-top: 8px;
 }
-/* Footer now lives at the bottom of the scroll area (scrolls with content) so
-   the Save/Cancel bar is the only pinned bottom element. margin-top:auto drops
-   it to the bottom of the viewport on short tabs; fieldsets don't compress. */
 .settings-scroll-area > fieldset { flex-shrink: 0; }
-.settings-scroll-area > .settings-footer {
-  flex-shrink: 0;
-  margin-top: auto;
-  padding-top: 10px;
-  border-top: 1px solid var(--border-secondary);
-}
 
 /* ────────────────────────────────────────────────────────────────
    At very wide widths (user dragged the dialog out on an ultrawide)
@@ -3520,6 +3514,120 @@ dialog {
   background: color-mix(in srgb, var(--accent-blue) 80%, #fff);
 }
 
+/* ECHOCAT browser web-access block — the free, no-app/no-cloud path,
+   promoted to the top of the ECHOCAT card. Tinted panel with a green
+   accent so it reads as "this one's free and ready" next to the
+   pair/cloud actions. Casey 2026-06-13. */
+.echo-web {
+  background: color-mix(in srgb, var(--source-pota, #4ecca3) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--source-pota, #4ecca3) 35%, transparent);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 0 4px; /* sits below the remote-access status line */
+}
+.echo-web-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.echo-web-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.echo-web-tag {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--source-pota, #4ecca3);
+  border: 1px solid color-mix(in srgb, var(--source-pota, #4ecca3) 50%, transparent);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+.echo-web-rowlabel {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin: 6px 0 2px;
+}
+.echo-web-rowlabel:first-of-type { margin-top: 0; }
+.echo-web-urlrow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.echo-web-urlrow + .echo-web-urlrow { margin-top: 4px; }
+.echo-web-url {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 13px;
+  color: var(--accent-blue);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-secondary);
+  border-radius: 4px;
+  padding: 4px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.echo-web-copy {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 4px 10px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-secondary);
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.echo-web-copy:hover { background: var(--bg-hover); }
+.echo-web-copy.primary {
+  background: var(--source-pota, #4ecca3);
+  color: #0a1a14;
+  border-color: var(--source-pota, #4ecca3);
+  font-weight: 600;
+}
+.echo-web-token {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.echo-web-token code,
+.echo-web-extra code {
+  font-family: ui-monospace, Consolas, monospace;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+.echo-web-extra {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  line-height: 1.6;
+}
+.echo-web-hint {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+.echo-web-hint code {
+  font-family: ui-monospace, Consolas, monospace;
+  color: var(--text-secondary);
+}
+.echo-web-empty {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
 /* ECHOCAT device list */
 .summary-device-list {
   display: flex;
@@ -3620,18 +3728,23 @@ dialog {
     margin-bottom: 6px;
     font-size: 12px;
   }
-  .settings-shell > .dialog-buttons {
-    position: sticky;
-    bottom: 0;
-    background: var(--bg-secondary);
-    padding: 6px 0 0;
-    border-top: 1px solid var(--border-secondary);
-    margin-top: 0;
-  }
-  .settings-scroll-area > .settings-footer {
+  /* The pinned footer bar eats vertical space on short screens — tighten
+     it so the content area keeps as much height as possible. */
+  .settings-shell > .settings-footer {
     font-size: 10px;
-    /* keep margin-top:auto from the base rule so the footer stays at the
-       bottom of the scroll area on short screens too */
+    padding-top: 6px;
+    margin-top: 4px;
+  }
+  .settings-echocat-title {
+    font-size: 10px;
+    margin-bottom: 4px;
+  }
+  .settings-echocat-badge-img-appstore {
+    height: 30px;
+  }
+  .settings-echocat-badge-img-play {
+    height: 45px;
+    margin: -8px 0;
   }
 }
 
@@ -3667,10 +3780,6 @@ dialog input, dialog select {
   gap: 8px;
   justify-content: flex-end;
   margin-top: 16px;
-}
-
-#settings-dialog .settings-shell > .dialog-buttons {
-  flex-shrink: 0;
 }
 
 /* CAT dialog */
@@ -4274,39 +4383,53 @@ tr.wl-group-2 td:last-child {
 }
 
 .settings-footer {
+  position: relative; /* anchor for the absolutely-positioned π easter egg */
   text-align: center;
-  margin-top: 16px;
   font-size: 12px;
   color: var(--text-tertiary);
   flex-shrink: 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-secondary);
 }
 
-/* Settings footer two-column layout. Left ~40%: ECHOCAT promo +
-   download badges. Right ~60%: existing version / coffee / links
-   cluster, right-aligned so the dialog edge anchors it. Casey
-   2026-06-08 ("badges to the left of the bottom bar"). */
+/* Footer bar layout: ECHOCAT promo + badges on the left (Casey
+   2026-06-08 "badges to the left of the bottom bar"), version /
+   coffee / links cluster in the middle, Save/Cancel on the right.
+   flex-wrap lets the clusters stack gracefully when the user drags
+   the dialog narrow instead of overflowing. */
 .settings-footer-cols {
-  display: grid;
-  grid-template-columns: 40% 60%;
-  column-gap: 16px;
+  display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
   text-align: left;
 }
 .settings-footer-left {
+  flex: 0 0 auto;
   text-align: left;
 }
 .settings-footer-right {
+  flex: 1 1 auto;
+  min-width: 260px;
   text-align: center;
 }
 .settings-footer-right .settings-links {
   justify-content: center;
 }
+.settings-footer-cols > .dialog-buttons {
+  flex: 0 0 auto;
+  margin-top: 0;
+  margin-left: auto;
+}
 
-/* ECHOCAT mobile-app promo — left column of the Settings footer.
-   Generic CSS-styled CTA buttons (black pill, two-line label) — not
-   the trademarked Apple/Google badge artwork. If you want to swap to
-   official badges later, see assets/README-app-badges.md for download
-   URLs and the markup change required. */
+/* ECHOCAT mobile-app promo — left cluster of the Settings footer bar.
+   Official Apple/Google badge artwork (provenance + brand-guideline
+   notes: assets/README-app-badges.md). Heights differ on purpose:
+   Google bakes its required clear space into the PNG (646×250 canvas,
+   564×168 visible box) while Apple's SVG is edge-to-edge — 60px vs
+   40px makes the two VISIBLE boxes the same height. The negative
+   vertical margin on the Play badge collapses that baked padding out
+   of the bar's layout height without cropping the artwork. */
 .settings-echocat-title {
   font-size: 12px;
   color: var(--text-secondary);
@@ -4320,46 +4443,54 @@ tr.wl-group-2 td:last-child {
   gap: 10px;
   flex-wrap: nowrap;
 }
-.settings-echocat-badge {
+.settings-echocat-badge-link {
+  position: relative;
   display: inline-flex;
-  flex-direction: column;
-  justify-content: center;
-  align-items: flex-start;
-  min-width: 150px;
-  padding: 6px 14px;
-  background: #000;
-  color: #fff;
-  border: 1px solid #333;
-  border-radius: 6px;
+  align-items: center;
   text-decoration: none;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  line-height: 1.1;
-  cursor: pointer;
-  transition: transform 0.1s, border-color 0.1s;
+  transition: transform 0.1s;
 }
-.settings-echocat-badge:hover {
+a.settings-echocat-badge-link:hover {
   transform: translateY(-1px);
-  border-color: #555;
   text-decoration: none;
 }
-.settings-echocat-badge-sub {
-  font-size: 9px;
-  opacity: 0.85;
-  letter-spacing: 0.3px;
+.settings-echocat-badge-img {
+  display: block;
+  width: auto;
 }
-.settings-echocat-badge-main {
-  font-size: 16px;
-  font-weight: 600;
-  letter-spacing: 0.2px;
+.settings-echocat-badge-img-appstore {
+  height: 40px;
+}
+.settings-echocat-badge-img-play {
+  height: 60px;
+  margin: -10px 0;
 }
 .settings-echocat-badge-disabled {
-  opacity: 0.55;
   cursor: default;
   pointer-events: none;
 }
-.settings-echocat-badge-disabled:hover {
-  transform: none;
-  border-color: #333;
+.settings-echocat-badge-disabled .settings-echocat-badge-img {
+  opacity: 0.45;
+}
+/* "Coming Soon" pill layered over the dimmed Play badge — separate
+   text box, not painted onto the artwork. Remove when Android ships
+   (see assets/README-app-badges.md for the markup swap). */
+.settings-echocat-badge-overlay {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.75);
+  border: 1px solid #555;
+  color: #fff;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  white-space: nowrap;
+  pointer-events: none;
 }
 
 .settings-version {

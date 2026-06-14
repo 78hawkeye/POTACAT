@@ -634,9 +634,14 @@ const setEnableSplit = document.getElementById('set-enable-split');
 const setEnableAtu = document.getElementById('set-enable-atu');
 const setEnableRotor = document.getElementById('set-enable-rotor');
 const rotorConfig = document.getElementById('rotor-config');
+const setRotorType = document.getElementById('set-rotor-type');
 const setRotorMode = document.getElementById('set-rotor-mode');
 const setRotorHost = document.getElementById('set-rotor-host');
 const setRotorPort = document.getElementById('set-rotor-port');
+const rotorPstConfig = document.getElementById('rotor-pst-config');
+const rotorEzConfig = document.getElementById('rotor-ez-config');
+const setRotorEzPort = document.getElementById('set-rotor-ez-port');
+const setRotorEzPortManual = document.getElementById('set-rotor-ez-port-manual');
 const setEnableAg = document.getElementById('set-enable-ag');
 const agConfig = document.getElementById('ag-config');
 const setAgHost = document.getElementById('set-ag-host');
@@ -3121,8 +3126,11 @@ async function saveBannerQso() {
     try {
       const parkData = await window.api.getPark(potaRef);
       if (parkData) {
-        const locParts = (parkData.locationDesc || '').split('-');
-        if (locParts.length >= 2) parkLocState = locParts.slice(1).join('-');
+        // Single-state park fills STATE directly; a multi-state park
+        // ("US-WI,US-MI") prompts — the activator is only in one (WG9I).
+        const states = parkStatesFromLocationLocal(parkData.locationDesc);
+        if (states.length === 1) parkLocState = states[0];
+        else if (states.length > 1) parkLocState = await promptParkState(potaRef, parkData.locationDesc);
         parkLocGrid = parkData.grid || '';
       }
     } catch {}
@@ -3883,10 +3891,49 @@ setEnablePskrMap.addEventListener('change', () => {
   pskrMapConfig.classList.toggle('hidden', !setEnablePskrMap.checked);
 });
 
-// PstRotator checkbox toggles rotor config visibility
+// Rotor checkbox toggles rotor config visibility
 setEnableRotor.addEventListener('change', () => {
   rotorConfig.classList.toggle('hidden', !setEnableRotor.checked);
+  if (setEnableRotor.checked) applyRotorTypeVisibility();
 });
+
+// Rotor type (PstRotator UDP vs Rotor-EZ serial) swaps the sub-config
+// blocks and lazily populates the COM-port picker — same pattern as the
+// rig editor's port dropdown.
+function applyRotorTypeVisibility() {
+  const isEz = setRotorType && setRotorType.value === 'rotorez';
+  if (rotorPstConfig) rotorPstConfig.classList.toggle('hidden', isEz);
+  if (rotorEzConfig) rotorEzConfig.classList.toggle('hidden', !isEz);
+  if (isEz) populateRotorEzPorts();
+}
+
+async function populateRotorEzPorts(savedPath) {
+  if (!setRotorEzPort) return;
+  const saved = savedPath !== undefined ? savedPath : (setRotorEzPort.dataset.saved || '');
+  let ports = [];
+  try { ports = await window.api.listPorts(); } catch { /* keep empty list */ }
+  setRotorEzPort.innerHTML = '';
+  const detectedPaths = new Set();
+  for (const p of ports) {
+    detectedPaths.add(p.path);
+    const opt = document.createElement('option');
+    opt.value = p.path;
+    opt.textContent = `${p.path} — ${p.friendlyName}`;
+    if (saved === p.path) opt.selected = true;
+    setRotorEzPort.appendChild(opt);
+  }
+  // Saved path not currently plugged in — keep it selectable so a save
+  // doesn't silently re-point the rotor to whatever enumerates first.
+  if (saved && !detectedPaths.has(saved)) {
+    const opt = document.createElement('option');
+    opt.value = saved;
+    opt.textContent = `${saved} — (not detected)`;
+    opt.selected = true;
+    setRotorEzPort.appendChild(opt);
+  }
+}
+
+if (setRotorType) setRotorType.addEventListener('change', applyRotorTypeVisibility);
 // Antenna Genius checkbox toggles config visibility
 setEnableAg.addEventListener('change', () => {
   agConfig.classList.toggle('hidden', !setEnableAg.checked);
@@ -6094,6 +6141,11 @@ if (window.api && window.api.onRemoteClientDisplaced) {
       chip.style.background = '#e94560';
       chip.style.color = '#fff';
       chip.title = 'Guest Pass session ended (' + (state.reason || 'expired') + ') — back on the local rig';
+    } else if (state.state === 'revoked') {
+      chip.textContent = '🔗 pairing revoked';
+      chip.style.background = '#e94560';
+      chip.style.color = '#fff';
+      chip.title = 'The shack operator revoked this desktop\'s pairing (' + (state.reason || 'revoked') + ') — back on the local rig';
     }
   };
   chip.addEventListener('click', _remoteRadiosOpen);
@@ -6104,6 +6156,9 @@ if (window.api && window.api.onRemoteClientDisplaced) {
     window.api.onRemoteClientStatus((s) => {
       if (s && s.state === 'pass-ended' && typeof showLogToast === 'function') {
         showLogToast('Guest Pass session ended (' + (s.reason || 'expired') + ') — switched back to your local rig.', { warn: true, duration: 8000 });
+      }
+      if (s && s.state === 'revoked' && typeof showLogToast === 'function') {
+        showLogToast('The shack operator revoked this desktop\'s pairing — switched back to your local rig.', { warn: true, duration: 8000 });
       }
     });
   }
@@ -6658,14 +6713,103 @@ async function _renderSummaryEchocat() {
   let tunnel = null;
   let tail = null;
   let devices = [];
+  let web = null;
   try { tunnel = await window.api.cloudTunnelGetState(); } catch {}
   try { tail = await window.api.echocatTailscaleStatus(); } catch {}
   try { devices = await window.api.echocatListPairedDevices(); } catch {}
-  const html = _buildEchocatCardHTML(tunnel, tail, devices);
+  // Browser web-access info — the free, no-app, no-cloud path. The
+  // server is always-on; we just need the LAN address(es) + token.
+  try {
+    const s = await window.api.getSettings();
+    const ips = await window.api.getLocalIPs();
+    const port = s.remotePort || 7300;
+    // Prefer real-LAN addresses for the browser-on-same-WiFi case;
+    // Tailscale (100.x) is the remote path the card's pill already
+    // covers, so it shouldn't headline the "open in a browser" block.
+    const lan = (ips || []).filter((ip) => !ip.tailscale);
+    const list = (lan.length ? lan : (ips || [])).map((ip) => ip.address);
+    // Tailscale URL for off-network browser access (the LAN IP only
+    // works at home). Prefer the MagicDNS hostname — the Tailscale-
+    // issued cert is valid for it, so no cert warning; fall back to the
+    // 100.x IP only when MagicDNS is off. Casey 2026-06-13.
+    let tailscaleUrl = '';
+    let tailscaleCertValid = false;
+    const tsHost = (tail && tail.installed && tail.loggedIn && tail.hostname) ? String(tail.hostname) : '';
+    if (tsHost) {
+      tailscaleUrl = 'https://' + tsHost + ':' + port;
+      tailscaleCertValid = true;
+    } else {
+      const tsIp = (ips || []).find((ip) => ip.tailscale);
+      if (tsIp) tailscaleUrl = 'https://' + tsIp.address + ':' + port;
+    }
+    web = {
+      addresses: list,
+      port,
+      token: (s.remoteRequireToken !== false) ? (s.remoteToken || '') : '',
+      tailscaleUrl,
+      tailscaleCertValid,
+    };
+  } catch {}
+  const html = _buildEchocatCardHTML(tunnel, tail, devices, web);
   for (const host of hosts) host.innerHTML = html;
 }
 
-function _buildEchocatCardHTML(tunnel, tail, devices) {
+// The free, no-app, no-cloud path: a browser on the same WiFi opens the
+// always-on ECHOCAT server directly. Promoted onto the card so it has
+// equal billing with Pair / Cloud instead of hiding in a collapsed
+// accordion (Casey 2026-06-13 — "make it available for users who don't
+// want to pay").
+function _buildEchocatWebHTML(web) {
+  if (!web || !Array.isArray(web.addresses) || web.addresses.length === 0) {
+    return '<div class="echo-web">'
+      + '<div class="echo-web-head"><span class="echo-web-title">Open in a browser</span>'
+      + '<span class="echo-web-tag">no app needed</span></div>'
+      + '<div class="echo-web-empty">No local network detected — connect this computer to your WiFi/LAN to get a browser link.</div>'
+      + '</div>';
+  }
+  const primary = 'https://' + web.addresses[0] + ':' + web.port;
+  const extras = web.addresses.slice(1).map((a) => 'https://' + a + ':' + web.port);
+  const hasTs = !!web.tailscaleUrl;
+  // One URL row: optional label, the url, a copy button.
+  const urlRow = (label, url, isPrimary) =>
+    (label ? '<div class="echo-web-rowlabel">' + label + '</div>' : '')
+    + '<div class="echo-web-urlrow">'
+    + '<code class="echo-web-url">' + _esc(url) + '</code>'
+    + '<button type="button" class="echo-web-copy' + (isPrimary ? ' primary' : '') + '" data-act="echo-copy-weburl" data-copy="' + _esc(url) + '" title="Copy link">Copy</button>'
+    + '</div>';
+  // When a Tailscale URL exists, label the two so users know which
+  // works where; the LAN one only works on the home network.
+  const lanBlock = urlRow(hasTs ? 'On your WiFi (home)' : '', primary, !hasTs);
+  const tsBlock = hasTs
+    ? urlRow('Away from home (Tailscale)', web.tailscaleUrl, true)
+      + (web.tailscaleCertValid
+        ? ''
+        : '<div class="echo-web-extra">MagicDNS is off — this uses your Tailscale IP, so you\'ll get a certificate warning. Turn on MagicDNS for a clean link.</div>')
+    : '';
+  const tokenLine = web.token
+    ? '<div class="echo-web-token">Token <code>' + _esc(web.token) + '</code>'
+      + '<button type="button" class="echo-web-copy" data-act="echo-copy-weburl" data-copy="' + _esc(web.token) + '" title="Copy token">Copy</button></div>'
+    : '';
+  const extrasLine = extras.length
+    ? '<div class="echo-web-extra">Other home addresses: ' + extras.map((u) => '<code>' + _esc(u) + '</code>').join(', ') + '</div>'
+    : '';
+  const hint = hasTs
+    ? 'Use the WiFi link at home; the Tailscale link works anywhere both devices are signed into your tailnet. Must be <code>https://</code>; accept the warning the first time.'
+    : 'Type it into any phone, tablet, or computer on your home WiFi. Must be <code>https://</code>; accept the security warning the first time.';
+  return '<div class="echo-web">'
+    + '<div class="echo-web-head">'
+    + '<span class="echo-web-title">Open in a browser</span>'
+    + '<span class="echo-web-tag">no app needed</span>'
+    + '</div>'
+    + lanBlock
+    + tsBlock
+    + tokenLine
+    + extrasLine
+    + '<div class="echo-web-hint">' + hint + '</div>'
+    + '</div>';
+}
+
+function _buildEchocatCardHTML(tunnel, tail, devices, web) {
   // Tunnel + Tailscale state. cloud-tunnel state lives on `.status`,
   // not `.state`. Possible values: off | provisioning | connecting |
   // live | reconnecting | error (see lib/cloud-tunnel.js).
@@ -6708,7 +6852,12 @@ function _buildEchocatCardHTML(tunnel, tail, devices) {
   const tunnelBtn = tunnelEffectivelyOn
     ? '<button type="button" data-act="tunnel-off">Turn off tunnel</button>'
     : '<button type="button" class="primary" data-act="tunnel-on">Turn on Cloud Tunnel</button>';
+  // Order (Casey 2026-06-13): the remote-access status line first
+  // ("Available remotely via POTACAT Cloud Tunnel" / "…local network
+  // only"), THEN the browser block (On your WiFi / Away from home),
+  // then devices + actions.
   const body = '<div class="summary-line">' + _esc(detail) + '</div>'
+    + _buildEchocatWebHTML(web)
     + '<div class="summary-sub" style="margin-top:6px;font-weight:600;">My devices</div>'
     + '<div class="summary-device-list">' + _summaryDeviceListHTML(devices) + '</div>'
     + '<div class="summary-card-actions">'
@@ -6879,6 +7028,16 @@ function _wireSummaryCardActionsOnce() {
       else if (act === 'echo-pair-device') _pairDeviceOpen();
       else if (act === 'echo-share') _shareRigOpen();
       else if (act === 'echo-diagnostics') _summaryTunnelDiagOpen();
+      else if (act === 'echo-copy-weburl') {
+        const val = btn.dataset.copy || '';
+        if (val) {
+          try { await navigator.clipboard.writeText(val); }
+          catch { try { window.api.copyToClipboard(val); } catch {} }
+          const prev = btn.textContent;
+          btn.textContent = 'Copied';
+          setTimeout(() => { btn.textContent = prev; }, 1400);
+        }
+      }
       else if (act === 'pota-connect') await window.api.potaSyncConnect();
       else if (act === 'pota-refresh') await window.api.potaSyncNow();
       else if (act === 'device-revoke') {
@@ -8690,6 +8849,59 @@ function showTuneArc(lat, lon, freq, source) {
       );
     }
   }
+}
+
+// POTA locationDesc → state codes. Parks spanning states list several
+// comma-separated designators ("US-WI,US-MI"); the old split('-') parse
+// wrote garbage like "WI,US-MI" into the log's STATE field (WG9I,
+// 2026-06-12). Mirror of parkStatesFromLocation in lib/pota.js (no
+// require() in the renderer) — keep the two in sync.
+function parkStatesFromLocationLocal(locationDesc) {
+  const out = [];
+  for (const part of String(locationDesc || '').split(',')) {
+    const seg = part.trim();
+    const dash = seg.indexOf('-');
+    const st = dash >= 0 ? seg.slice(dash + 1).trim() : '';
+    if (st && out.indexOf(st) < 0) out.push(st);
+  }
+  return out;
+}
+
+// Multi-state park: ask the operator which state the activator is in
+// before the QSO saves (WG9I's ask — "the user should probably be
+// prompted"). One button per location designator + Leave Blank; ESC =
+// blank. Resolves with the bare state code ('' for blank).
+function promptParkState(parkRef, locationDesc) {
+  return new Promise((resolve) => {
+    const dlg = document.getElementById('park-state-dialog');
+    if (!dlg || typeof dlg.showModal !== 'function') return resolve('');
+    const text = document.getElementById('park-state-text');
+    const opts = document.getElementById('park-state-options');
+    const blankBtn = document.getElementById('park-state-blank');
+    const designators = String(locationDesc || '').split(',').map(s => s.trim()).filter(Boolean);
+    text.textContent = parkRef + ' spans ' + designators.join(', ')
+      + ' — which state was the activator in? This fills the STATE field of your log entry.';
+    opts.innerHTML = '';
+    let settled = false;
+    const finish = (val) => {
+      if (settled) return;
+      settled = true;
+      try { dlg.close(); } catch { /* already closed */ }
+      resolve(val);
+    };
+    for (const d of designators) {
+      const dash = d.indexOf('-');
+      const st = dash >= 0 ? d.slice(dash + 1).trim() : d;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = d;
+      btn.addEventListener('click', () => finish(st));
+      opts.appendChild(btn);
+    }
+    blankBtn.onclick = () => finish('');
+    dlg.addEventListener('close', () => finish(''), { once: true });
+    dlg.showModal();
+  });
 }
 
 // Lightweight Maidenhead conversion for the renderer (no require of Node module)
@@ -11528,9 +11740,12 @@ logSaveBtn.addEventListener('click', async () => {
       try {
         const parkData = await window.api.getPark(potaRef);
         if (parkData) {
-          // locationDesc is e.g. "US-ME", "VE-ON" — extract state portion after dash
-          const locParts = (parkData.locationDesc || '').split('-');
-          if (locParts.length >= 2) parkLocState = locParts.slice(1).join('-');
+          // locationDesc is "US-ME", "VE-ON", or comma-separated for parks
+          // spanning states ("US-WI,US-MI") — single state fills STATE,
+          // multiple prompts the operator (WG9I).
+          const states = parkStatesFromLocationLocal(parkData.locationDesc);
+          if (states.length === 1) parkLocState = states[0];
+          else if (states.length > 1) parkLocState = await promptParkState(potaRef, parkData.locationDesc);
           parkLocGrid = parkData.grid || '';
         }
       } catch {}
@@ -12843,10 +13058,14 @@ async function openSettingsDialog(tab) {
   setTuneClick.checked = s.tuneClick === true;
   setEnableRotor.checked = s.enableRotor === true;
   if (s.enableRotor) rotorConfigured = true;
+  if (setRotorType) setRotorType.value = s.rotorType || 'pstrotator';
   if (setRotorMode) setRotorMode.value = s.rotorMode || 'auto';
   setRotorHost.value = s.rotorHost || '127.0.0.1';
   setRotorPort.value = s.rotorPort || 12040;
+  if (setRotorEzPort) setRotorEzPort.dataset.saved = s.rotorSerialPath || '';
+  if (setRotorEzPortManual) setRotorEzPortManual.value = '';
   rotorConfig.classList.toggle('hidden', !s.enableRotor);
+  if (s.enableRotor) applyRotorTypeVisibility(); // populates the EZ port list from dataset.saved
   setEnableAg.checked = s.enableAntennaGenius === true;
   setAgHost.value = s.agHost || '';
   setAgRadioPort.value = s.agRadioPort || '1';
@@ -13144,7 +13363,7 @@ async function openSettingsDialog(tab) {
     setSsbOverData.checked = !isFlexForSsb;
   }
   setRemoteCwEnabled.checked = !!s.remoteCwEnabled;
-  setRemoteStun.checked = !!s.remoteStun;
+  setRemoteStun.checked = s.remoteStun !== false; // default ON (needed for cloud/WebRTC audio)
   if (setAudioSource) {
     setAudioSource.value = ['smartsdr', 'icom-network'].includes(s.audioSource) ? s.audioSource : 'dax';
   }
@@ -13563,9 +13782,18 @@ settingsSave.addEventListener('click', async () => {
   const hideWorkedEnabled = setHideWorked.checked;
   const tuneClickEnabled = setTuneClick.checked;
   const rotorEnabledVal = setEnableRotor.checked;
+  const rotorTypeVal = setRotorType ? setRotorType.value : 'pstrotator';
   const rotorModeVal = setRotorMode ? setRotorMode.value : 'auto';
   const rotorHostVal = setRotorHost.value.trim() || '127.0.0.1';
   const rotorPortVal = parseInt(setRotorPort.value, 10) || 12040;
+  // Manual path wins over the dropdown (same precedence as the rig
+  // editor). Falls back to the loaded value (dataset.saved) so saving
+  // while the PstRotator type is selected — dropdown never populated —
+  // doesn't wipe a previously configured serial path.
+  const rotorSerialPathVal = (setRotorEzPortManual && setRotorEzPortManual.value.trim())
+    || (setRotorEzPort && setRotorEzPort.value)
+    || (setRotorEzPort && setRotorEzPort.dataset.saved)
+    || '';
   const agEnabled = setEnableAg.checked;
   const agHostVal = setAgHost.value.trim();
   const agRadioPortVal = parseInt(setAgRadioPort.value, 10) || 1;
@@ -13732,9 +13960,11 @@ settingsSave.addEventListener('click', async () => {
     hideWorked: hideWorkedEnabled,
     tuneClick: tuneClickEnabled,
     enableRotor: rotorEnabledVal,
+    rotorType: rotorTypeVal,
     rotorMode: rotorModeVal,
     rotorHost: rotorHostVal,
     rotorPort: rotorPortVal,
+    rotorSerialPath: rotorSerialPathVal,
     enableAntennaGenius: agEnabled,
     agHost: agHostVal,
     agRadioPort: agRadioPortVal,
@@ -23466,13 +23696,7 @@ function renderJtcatQsoTracker() {
   var phases = q.mode === 'cq' ? QSO_PHASES_CQ : QSO_PHASES_REPLY;
 
   // Header
-  if (q.phase === 'waiting') {
-    // Station we called started a QSO with someone else \u2014 POTACAT is
-    // holding our reply until they're free (their next CQ or sign-off).
-    jtcatQsoLabel.textContent = '\u23f8 ' + q.call + ' is working '
-      + (q.waitingPartner ? q.waitingPartner : 'another station')
-      + ' \u2014 waiting to reply';
-  } else if (q.mode === 'cq') {
+  if (q.mode === 'cq') {
     jtcatQsoLabel.textContent = q.call ? 'CQ \u2192 ' + q.call : 'Calling CQ...';
   } else {
     jtcatQsoLabel.textContent = 'Reply \u2192 ' + q.call;
@@ -23491,8 +23715,6 @@ function renderJtcatQsoTracker() {
   if (q.mode === 'reply' && q.phase === 'r+report') currentIdx = 2;
   if (q.mode === 'reply' && q.phase === '73') currentIdx = 4;
   if (q.mode === 'reply' && q.phase === 'done') currentIdx = 5;
-  // 'waiting' holds at the reply step \u2014 stuck before sending our reply.
-  if (q.phase === 'waiting') currentIdx = 0;
 
   var html = '';
   for (var i = 0; i < phases.length; i++) {

@@ -1,16 +1,46 @@
 // --- Startup timing instrumentation ---
-// `npm start --startup-timing` (or POTACAT_STARTUP_TIMING=1) prints a
-// `[startup] +Nms : <stage>` line at every checkpoint below. Helps
-// diagnose the "sometimes opens fast, sometimes 3-5s lag" symptom:
-// the slow run will have one stage that visibly jumps (typically AV
-// scan, native module load, or a network call at boot).
+// Every checkpoint below is ALWAYS appended to <userData>/startup.log
+// (truncated each launch) so a user whose app dies before the window
+// opens can just send us that file — no dev tools, no flags. Diagnosing
+// the macOS "launches and quits silently, no window, no dialog" reports
+// (v1.8.7, macOS 26) is exactly this scenario. `npm start --startup-timing`
+// (or POTACAT_STARTUP_TIMING=1) additionally prints the same lines to the
+// console for the original "variable boot lag" use case.
 const _startupTs = Date.now();
 const _startupTiming = process.argv.includes('--startup-timing') ||
   process.argv.includes('--startup-debug') ||
   process.env.POTACAT_STARTUP_TIMING === '1';
 let _lastStageTs = _startupTs;
+let _startupLogPath = null;   // resolved lazily — userData needs `app`
+let _startupLogFailed = false;
+function _appendStartupLog(line) {
+  if (_startupLogFailed) return;
+  try {
+    const fsx = require('fs');
+    if (!_startupLogPath) {
+      let dir;
+      try { dir = require('electron').app.getPath('userData'); }
+      catch { dir = require('os').tmpdir(); }
+      try { fsx.mkdirSync(dir, { recursive: true }); } catch {}
+      _startupLogPath = require('path').join(dir, 'startup.log');
+      // Fresh file per launch, with an identity header for bug reports.
+      const os = require('os');
+      let ver = '?';
+      try { ver = require('./package.json').version; } catch {}
+      fsx.writeFileSync(_startupLogPath,
+        `POTACAT v${ver} startup log -- ${new Date().toISOString()}\n` +
+        `platform=${process.platform} arch=${process.arch} os=${os.release()} ` +
+        `electron=${process.versions.electron} node=${process.versions.node} ` +
+        `packaged=${(() => { try { return require('electron').app.isPackaged; } catch { return '?'; } })()}\n` +
+        `argv=${JSON.stringify(process.argv.slice(1))}\n`);
+    }
+    // appendFileSync so the line survives an immediate crash/exit.
+    fsx.appendFileSync(_startupLogPath, line + '\n');
+  } catch {
+    _startupLogFailed = true; // disk/permissions trouble — never loop on it
+  }
+}
 function logStartupStage(name) {
-  if (!_startupTiming) return;
   const now = Date.now();
   const total = now - _startupTs;
   const delta = now - _lastStageTs;
@@ -18,7 +48,9 @@ function logStartupStage(name) {
   // Pad to align so the visual scan picks out the slow stage immediately.
   // ASCII-only: Windows cmd (CP437/850) mangles Greek delta and em-dash
   // into mojibake. Format reads as "total +Xms, delta +Yms".
-  console.error(`[startup] +${String(total).padStart(5, ' ')}ms (+${String(delta).padStart(5, ' ')}ms): ${name}`);
+  const line = `[startup] +${String(total).padStart(5, ' ')}ms (+${String(delta).padStart(5, ' ')}ms): ${name}`;
+  _appendStartupLog(line);
+  if (_startupTiming) console.error(line);
 }
 
 const { app, BrowserWindow, ipcMain, Menu, dialog, Notification, screen, nativeImage, clipboard } = require('electron');
@@ -70,6 +102,21 @@ app.setName('POTACAT');
 })();
 
 logStartupStage('electron + path + fs required');
+
+// Early fatal-error capture — anything that kills the app before the window
+// opens lands in startup.log with a stack, instead of vanishing (from Finder
+// there's no console). Log-only while the late shutdown handler (registered
+// near the bottom of this file) is active so its dialog/benign-swallow
+// semantics stay intact; before that point, log + exit so a module-load
+// failure can't leave a windowless zombie process.
+let _lateExceptionHandlerActive = false;
+process.on('uncaughtException', (err) => {
+  _appendStartupLog('[FATAL] uncaughtException: ' + (err && err.stack || err));
+  if (!_lateExceptionHandlerActive) process.exit(70);
+});
+process.on('unhandledRejection', (reason) => {
+  _appendStartupLog('[FATAL] unhandledRejection: ' + (reason && reason.stack || reason));
+});
 
 // --- Headless mode: POTACAT --headless ---
 // Runs the full app with a hidden window — no GUI shown.
@@ -171,8 +218,27 @@ process.stderr?.on('error', () => {});
 
 // Allow AudioContext to play without user gesture (required for JTCAT audio capture in Chromium 142+)
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
+// Linux sandbox compatibility (issue #37). The DECISION lives in the
+// launcher shell script (scripts/linux-launcher.sh, installed as the
+// app's entry point by scripts/linux-after-pack.js): on systems that
+// deny unprivileged user namespaces to this binary AND have no usable
+// setuid chrome-sandbox, Chromium aborts BEFORE this file ever runs —
+// proven in CI (no startup.log was created; appendSwitch here was
+// useless). The unit-tested decision matrix is lib/linux-sandbox.js.
+// All this file can and should do is make the active fallback visible
+// in startup.log for bug reports.
+if (process.platform === 'linux' &&
+    (process.argv.includes('--no-sandbox') || app.commandLine.hasSwitch('no-sandbox'))) {
+  _appendStartupLog(
+    '[sandbox] WARNING: running with --no-sandbox (launcher fallback or explicit flag) - ' +
+    'this system denies the user-namespace sandbox and has no setuid chrome-sandbox. ' +
+    'Better fixes: install the .deb (full Chromium sandbox via AppArmor profile, no setuid binary), ' +
+    'or opt in: sudo chown root:root chrome-sandbox && sudo chmod 4755 chrome-sandbox (next to the binary). ' +
+    'See https://github.com/Waffleslop/POTACAT/issues/37');
+}
 const { execFile, spawn } = require('child_process');
-const { fetchSpots: fetchPotaSpots } = require('./lib/pota');
+const { fetchSpots: fetchPotaSpots, parkStatesFromLocation } = require('./lib/pota');
 const { fetchSpots: fetchSotaSpots, fetchSummitCoordsBatch, summitCache, loadAssociations, getAssociationName, SotaUploader } = require('./lib/sota');
 const sotaUploader = new SotaUploader();
 const { CatClient, RigctldClient, CivClient, listSerialPorts } = require('./lib/cat');
@@ -1972,11 +2038,45 @@ async function restoreIcomNetworkDataMod(reason = 'disconnect') {
   }
 }
 
-// PstRotator UDP rotor control
+// Rotor control — two backends behind one sendRotorBearing() entry point:
+//   'pstrotator' (default) — fire-and-forget UDP XML to PstRotator
+//   'rotorez'              — direct serial to a Rotor-EZ / RotorCard /
+//                            Hy-Gain DCU-1 controller (lib/rotorez.js)
 const dgram = require('dgram');
+const { RotorEzClient } = require('./lib/rotorez');
 let rotorSocket = null;
+let rotorEz = null;
+
+// Create/destroy/re-point the Rotor-EZ serial client to match settings.
+// Called at startup, on save-settings (rotor keys), and lazily from
+// sendRotorBearing as a safety net. Connecting is async — doing it here
+// rather than on first QSY means the port is already open when the
+// first bearing goes out.
+function syncRotorEz() {
+  const want = !!settings.enableRotor
+    && settings.rotorType === 'rotorez'
+    && !!settings.rotorSerialPath;
+  if (!want) {
+    if (rotorEz) { rotorEz.disconnect(); rotorEz = null; }
+    return;
+  }
+  if (rotorEz && rotorEz._path === settings.rotorSerialPath) return; // already on this port
+  if (!rotorEz) {
+    rotorEz = new RotorEzClient();
+    rotorEz.on('log', (m) => sendCatLog(m));
+    rotorEz.on('settled', ({ bearing, target, arrived }) => {
+      sendCatLog(`Rotor-EZ settled at ${bearing}° (target ${target}°${arrived ? '' : ' — NOT reached'})`);
+    });
+  }
+  rotorEz.connect(settings.rotorSerialPath);
+}
 
 function sendRotorBearing(azimuth) {
+  if ((settings.rotorType || 'pstrotator') === 'rotorez') {
+    syncRotorEz();
+    if (rotorEz) rotorEz.rotate(azimuth); // RotorEzClient logs its own traffic
+    return;
+  }
   if (!rotorSocket) rotorSocket = dgram.createSocket('udp4');
   const host = settings.rotorHost || '127.0.0.1';
   const port = settings.rotorPort || 12040;
@@ -2292,6 +2392,23 @@ function ensureRemoteClient() {
     try { connectCat(); } catch {}
     if (win && !win.isDestroyed()) {
       win.webContents.send('remote-client-status', { state: 'pass-ended', reason });
+      win.webContents.send('connection-targets-updated', settings.connectionTargets);
+    }
+  });
+  // The shack operator revoked this desktop's pairing mid-session
+  // (`revoked` + close 4004 — see docs/echocat-protocol.md). The device
+  // token is gone, so fall back to the local rig and mark the target
+  // expired so Remote Radios shows it needs a re-pair. Same cleanup
+  // shape as pass-ended above. 2026-06-12.
+  remoteClient.on('revoked', ({ reason }) => {
+    sendCatLog(`[remote] pairing revoked by the shack operator: ${reason}`);
+    target.expiresAt = Date.now();
+    settings.activeTargetId = null;
+    saveSettings(settings);
+    tearDownRemoteClient();
+    try { connectCat(); } catch {}
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('remote-client-status', { state: 'revoked', reason });
       win.webContents.send('connection-targets-updated', settings.connectionTargets);
     }
   });
@@ -9744,8 +9861,11 @@ function connectRemote() {
       if (sig === 'POTA' && sigInfo) {
         const park = getParkDb(parksMap, sigInfo);
         if (park) {
-          const locParts = (park.locationDesc || '').split('-');
-          if (locParts.length >= 2) parkLocState = locParts.slice(1).join('-');
+          // Multi-state parks ("US-WI,US-MI") get NO state here — the
+          // activator is only in one of them and we can't prompt the
+          // phone operator mid-log (WG9I). Desktop log paths prompt.
+          const states = parkStatesFromLocation(park.locationDesc);
+          if (states.length === 1) parkLocState = states[0];
           parkLocGrid = park.grid || '';
         }
       }
@@ -10508,8 +10628,16 @@ function connectRemote() {
         remoteServer.forcePttRelease();
         handleRemotePtt(false);
       }
-      // Tell phone whether to use STUN before WebRTC negotiation begins
-      remoteServer.sendToClient({ type: 'stun-config', useStun: !!settings.remoteStun });
+      // Tell phone whether to use STUN before WebRTC negotiation begins.
+      // Default ON (only an explicit false disables it): STUN is required
+      // for any WebRTC audio that isn't a direct LAN/Tailscale path — with
+      // it off, a Cloud-Tunnel client gathers only host candidates and
+      // gets rig control but NO audio (K6RBJ 2026-06-13). STUN is additive
+      // (host candidates still win on LAN), so this can't regress a
+      // working direct connection. NOTE: STUN alone still won't traverse
+      // CGNAT/symmetric NAT (e.g. cellular) — that needs a TURN relay
+      // (see the cloud-audio-turn-relay work item).
+      remoteServer.sendToClient({ type: 'stun-config', useStun: settings.remoteStun !== false });
       // Phone requested audio — create or restart hidden audio window
       startRemoteAudio();
       return;
@@ -10888,7 +11016,7 @@ function _buildAudioBridgeConfig() {
   return {
     inputDeviceId:  settings.remoteAudioInput  || '',
     outputDeviceId: settings.remoteAudioOutput || '',
-    useStun:        !!settings.remoteStun,
+    useStun:        settings.remoteStun !== false, // default ON — see stun-config note above
     audioSource:    settings.audioSource || 'dax',
     daxTxDirect,
     // TX EQ + compressor — applied in the bridge renderer to mic audio
@@ -13214,6 +13342,9 @@ function createWindow() {
     }
     refreshSpots();
     fetchAllSolar();
+    // Open the Rotor-EZ serial port now (if configured) so the first
+    // auto-rotate doesn't race the async port open.
+    syncRotorEz();
     // Auto-send DXCC data if enabled and ADIF path is set
     if (settings.enableDxcc) {
       sendDxccData();
@@ -14654,6 +14785,32 @@ function tuneRadio(freqKhz, mode, brng, { clearXit } = {}) {
     resetIcomNetworkRxPacer(`CAT tune ${freqHz}Hz`);
   }
 
+  // QSY to a non-data mode while the FT8/FT4 engine is running stops
+  // the engine. Tuning a CW/SSB spot from the phone used to leave the
+  // engine decoding garbage on the new frequency and the mobile FT8
+  // tab stuck on "Stop" (Casey 2026-06-11). JTCAT's own QSYs
+  // (jtcat-set-band) tune with 'DIGU', which is in the data set, so
+  // they never trip this. Multi-remote slices don't set ft8Engine and
+  // are unaffected by a main-VFO QSY.
+  if (ft8Engine && mode) {
+    const mm = String(mode).toUpperCase();
+    const isDataish =
+      mm === 'FT8' || mm === 'FT4' || mm === 'FT2' ||
+      mm === 'DIGU' || mm === 'DIGL' ||
+      mm === 'PKTUSB' || mm === 'PKTLSB' ||
+      mm === 'DATA-USB' || mm === 'DATA-LSB' ||
+      mm === 'USB-D' || mm === 'LSB-D' ||
+      mm === 'RTTY' || mm === 'JS8' || mm.startsWith('PSK');
+    if (!isDataish) {
+      sendCatLog(`[JTCAT] QSY to ${mm} — stopping FT8/FT4 engine`);
+      stopJtcat();
+      if (win && !win.isDestroyed()) win.webContents.send('jtcat-stop-for-remote');
+      if (remoteServer && remoteServer.hasClient && remoteServer.hasClient()) {
+        remoteServer.broadcastJtcatStatus({ running: false });
+      }
+    }
+  }
+
   // Auto-tune KiwiSDR WebSDR to follow
   if (kiwiActive && kiwiClient && kiwiClient.connected && freqHz > 100000) {
     const fKhz = freqHz / 1000;
@@ -15347,6 +15504,10 @@ function _doPairRedeem(wssUrl, pinFingerprint, token) {
 // Single instance lock — second launch passes URL to running instance
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
+  // Silent-quit path — breadcrumb it so startup.log explains the "launches
+  // and immediately exits with no window" symptom when another instance
+  // (possibly a windowless/headless one) holds the lock.
+  _appendStartupLog('[quit] single-instance lock not acquired -- another POTACAT instance is running; quitting');
   app.quit();
 } else {
   app.on('second-instance', (_e, argv) => {
@@ -19592,7 +19753,13 @@ app.whenReady().then(() => {
     let Bonjour;
     try { Bonjour = require('bonjour-service').default; }
     catch { return []; }
-    const bonjour = new Bonjour();
+    // Error callback is mandatory: bonjour-service's default is
+    // `(err) => { throw err; }`, so an async 5353 bind error (macOS
+    // mDNSResponder, another scanner) would crash the whole app. Browsing
+    // is best-effort — log and return whatever was found.
+    const onMdnsError = (err) => sendCatLog('[discover-shacks] mDNS error: ' + (err && err.message || err));
+    const bonjour = new Bonjour(undefined, onMdnsError);
+    try { if (bonjour.server && bonjour.server.mdns) bonjour.server.mdns.on('error', onMdnsError); } catch {}
     const found = new Map(); // host:port → record
     const browser = bonjour.find({ type: 'potacat' });
     browser.on('up', (svc) => {
@@ -20677,6 +20844,11 @@ app.whenReady().then(() => {
       } else {
         disconnectPskrMap();
       }
+    }
+
+    // Open/close/re-point the Rotor-EZ serial client when its config changes
+    if (has('enableRotor') || has('rotorType') || has('rotorSerialPath')) {
+      syncRotorEz();
     }
 
     // Push updated settings to ECHOCAT phone
@@ -22787,6 +22959,11 @@ app.whenReady().then(() => {
   ipcMain.on('cw-cancel', () => {
     cancelAllCwSends();
   });
+}).catch((err) => {
+  // A rejection in the whenReady chain previously vanished (no dialog, no
+  // window — the renderer never opens). Capture it where users can find it.
+  _appendStartupLog('[FATAL] whenReady chain rejected: ' + (err && err.stack || err));
+  console.error('[startup] FATAL in whenReady chain:', err);
 });
 
 // --- Parks DB loader ---
@@ -22925,6 +23102,7 @@ process.on('SIGTERM', () => { gracefulCleanup(); process.exit(0); });
 // Letting these propagate as uncaughtException pops Electron's
 // "uncaught exception" dialog AFTER the user already clicked quit.
 // During / after cleanup, swallow them with a log line instead.
+_lateExceptionHandlerActive = true; // early startup.log handler goes log-only from here
 process.on('uncaughtException', (err) => {
   const msg = err && err.message ? err.message : String(err);
   const benignShutdownErr = /WriteFileEx.*invalid handle|writing to COM port.*invalid handle|Port is not open|Port is closed/i.test(msg);
@@ -22939,10 +23117,17 @@ process.on('uncaughtException', (err) => {
 
 app.on('window-all-closed', () => {
   if (HEADLESS) return; // keep running in headless mode
+  _appendStartupLog('[quit] window-all-closed -> app.quit()');
   // Fire-and-forget telemetry — don't await; delaying app.quit() causes SIGABRT on macOS
   const sessionSeconds = Math.round((Date.now() - sessionStartTime) / 1000);
   sendTelemetry(sessionSeconds);
 
   gracefulCleanup();
   app.quit();
+});
+
+// Final breadcrumb — if startup.log ends with this line the exit was an
+// orderly Electron quit; if it ends mid-stage, the process died there.
+app.on('quit', (_e, exitCode) => {
+  _appendStartupLog(`[quit] app quit event (exitCode=${exitCode})`);
 });

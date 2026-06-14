@@ -553,12 +553,15 @@
         const result = await window.api.cloudDownloadAdif();
         if (result.error) {
           alert('Download failed: ' + result.error);
+          // Account deleted / session unrecoverable — drop to the sign-in
+          // form (keep the stale-token sign-out link as the escape hatch).
+          if (result.needsSignIn) showLogin(true);
         } else if (!result.canceled) {
-          alert('Cloud log saved to: ' + result.filePath);
+          alert('Cloud backup saved to: ' + result.filePath);
         }
       } finally {
         downloadAdifBtn.disabled = false;
-        downloadAdifBtn.textContent = 'Download Cloud Log (ADIF)';
+        downloadAdifBtn.textContent = 'Download Cloud Backup (.adi)';
       }
     });
   }
@@ -693,6 +696,8 @@
   const ctEnableBtn = document.getElementById('cloud-tunnel-enable-btn');
   const ctDisableBtn = document.getElementById('cloud-tunnel-disable-btn');
   const ctError = document.getElementById('cloud-tunnel-error');
+  const ctDegraded = document.getElementById('cloud-tunnel-degraded');
+  const ctDegradedText = document.getElementById('cloud-tunnel-degraded-text');
 
   // ECHOCAT-tab banner mirrors the canonical Cloud-tab state. The
   // Manage button hands off to the existing 'open-settings-panel'
@@ -706,6 +711,10 @@
     let label, pillClass;
     if (!state.enabled) {
       label = 'LAN only'; pillClass = 'status disconnected';
+    } else if (state.degraded) {
+      // Nominally up but cloudflared can't refresh DNS — amber, not
+      // green: the tunnel is failing and the user needs to act.
+      label = 'DNS trouble'; pillClass = 'status connecting';
     } else if (state.status === 'live') {
       label = 'Live'; pillClass = 'status connected';
     } else if (state.status === 'error') {
@@ -721,8 +730,18 @@
     if (ctBannerHost) ctBannerHost.textContent = hostText ? 'https://' + hostText : '';
     if (ctEnableBtn) ctEnableBtn.classList.toggle('hidden', !!state.enabled);
     if (ctDisableBtn) ctDisableBtn.classList.toggle('hidden', !state.enabled);
+    if (ctDegraded) {
+      if (state.degraded) {
+        if (ctDegradedText) ctDegradedText.textContent = ' — ' + (state.degradedReason || 'The Cloud Tunnel is having DNS trouble.');
+        ctDegraded.classList.remove('hidden');
+      } else {
+        ctDegraded.classList.add('hidden');
+      }
+    }
     if (ctError) {
-      if (state.lastError) {
+      // Suppress the raw red error while the amber degraded notice is
+      // showing — the degraded hint is the actionable version.
+      if (state.lastError && !state.degraded) {
         ctError.textContent = state.lastError;
         ctError.classList.remove('hidden');
       } else {

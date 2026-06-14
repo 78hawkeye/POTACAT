@@ -1251,7 +1251,7 @@
                    in app.js continues to drive visibility. -->
               <label class="summary-quick-row hidden" id="quick-rotor-label">
                 <input type="checkbox" id="quick-rotor">
-                <span>PSTRotator</span>
+                <span>Rotor</span>
               </label>
               <!-- Vestigial divider element preserved for any code that
                    toggles it alongside the rotor label. -->
@@ -2046,22 +2046,40 @@
       <legend>Antenna</legend>
       <label class="checkbox-label"><input type="checkbox" id="set-show-bearing"> Show Beam Heading</label>
       <span class="help-text" style="margin-left:12px;display:block;">Compass bearing from your QTH to each spot</span>
-      <label class="checkbox-label"><input type="checkbox" id="set-enable-rotor"> PstRotator rotor control</label>
+      <label class="checkbox-label"><input type="checkbox" id="set-enable-rotor"> Rotor control (PstRotator / Rotor-EZ)</label>
       <div id="rotor-config" class="radio-sub hidden">
+        <label style="margin-bottom:4px;">Rotor:
+          <select id="set-rotor-type" style="width:220px;">
+            <option value="pstrotator">PstRotator (UDP)</option>
+            <option value="rotorez">Rotor-EZ / DCU-1 (serial)</option>
+          </select>
+        </label>
         <label style="margin-bottom:4px;">Rotate:
           <select id="set-rotor-mode" style="width:160px;">
             <option value="auto">Auto (rotate on every QSY)</option>
             <option value="manual">Manual (click bearing to rotate)</option>
           </select>
         </label>
-        <span class="help-text" style="font-size:12px;">Sends beam heading to PstRotator via UDP. In Manual mode, click the bearing value in the spot table to turn the antenna.</span>
-        <label>Host:
-          <input type="text" id="set-rotor-host" placeholder="127.0.0.1" value="127.0.0.1" style="width:140px;">
-        </label>
-        <label>Port:
-          <input type="number" id="set-rotor-port" value="12040" min="1" max="65535" style="width:80px;">
-        </label>
-        <span class="help-text" style="display:block;margin-top:4px;">Default port is 12040. Use 12042, 12044, 12046 for additional rotators.</span>
+        <span class="help-text" style="font-size:12px;">In Manual mode, click the bearing value in the spot table to turn the antenna.</span>
+        <div id="rotor-pst-config">
+          <span class="help-text" style="font-size:12px;">Sends beam heading to PstRotator via UDP.</span>
+          <label>Host:
+            <input type="text" id="set-rotor-host" placeholder="127.0.0.1" value="127.0.0.1" style="width:140px;">
+          </label>
+          <label>Port:
+            <input type="number" id="set-rotor-port" value="12040" min="1" max="65535" style="width:80px;">
+          </label>
+          <span class="help-text" style="display:block;margin-top:4px;">Default port is 12040. Use 12042, 12044, 12046 for additional rotators.</span>
+        </div>
+        <div id="rotor-ez-config" class="hidden">
+          <span class="help-text" style="font-size:12px;">Drives an Idiom Press / Ham Supply Rotor-EZ or RotorCard board — or a Hy-Gain DCU-1 — directly over its serial port (4800 8N1). The port can't be shared with the rig.</span>
+          <label>Serial port:
+            <select id="set-rotor-ez-port" style="width:240px;"></select>
+          </label>
+          <label>Manual port path (if not listed):
+            <input type="text" id="set-rotor-ez-port-manual" placeholder="COM9 or /dev/ttyUSB0" style="width:180px;">
+          </label>
+        </div>
       </div>
       <label class="checkbox-label"><input type="checkbox" id="set-enable-ag"> 4O3A Antenna Genius</label>
       <div id="ag-config" class="radio-sub hidden">
@@ -2729,7 +2747,7 @@
             <label class="checkbox-label" style="margin-top:6px;"><input type="checkbox" id="set-remote-stun"> Enable STUN (audio without VPN)</label>
             <span class="help-text" style="margin-left:12px;display:block;">Uses Google's public STUN server to discover your public IP, enabling WebRTC audio across the internet without a VPN. Only needed if you can't use Tailscale or both devices aren't on the same network.</span>
             <label class="checkbox-label" style="margin-top:8px;"><input type="checkbox" id="set-allow-pair-requests" checked> Allow tap-to-pair from the local network</label>
-            <span class="help-text" style="margin-left:12px;display:block;">When the POTACAT mobile app sees your desktop on the LAN, tapping the discovered card sends a pair request and pops an Approve/Deny window here. Turn off if you share a network with strangers (libraries, coffee shops). POTACAT Cloud Tunnel exposure always blocks tap-to-pair regardless of this switch.</span>
+            <span class="help-text" style="margin-left:12px;display:block;">When the POTACAT mobile app sees your desktop on the LAN, tapping the discovered card sends a pair request and pops an Approve/Deny window here. Works only for devices on your local network — requests arriving through the POTACAT Cloud Tunnel are always refused. Turn off if you share a network with strangers (libraries, coffee shops).</span>
           </div>
           <div>
             <label for="set-echocat-pair-host" style="font-size:12px;font-weight:600;display:block;margin-bottom:3px;">Pair host override</label>
@@ -2895,7 +2913,7 @@
     <!-- POTACAT Cloud — one-tap remote (CF tunnel) -->
     <fieldset id="cloud-tunnel-fieldset" class="source-toggles" data-settings-tab="cloud">
       <legend>POTACAT Tunnel (one-tap remote)</legend>
-      <p style="font-size:12px;color:var(--text-secondary);margin-bottom:8px;">Reach your radio from anywhere — no Tailscale, no port forwarding. POTACAT opens an outbound tunnel to Cloudflare; your phone connects over <code style="background:var(--bg-tertiary);padding:1px 4px;border-radius:2px;">https://&lt;callsign&gt;.cloud.potacat.com</code>.</p>
+      <p style="font-size:12px;color:var(--text-secondary);margin-bottom:8px;">Reach your radio from anywhere — no Tailscale, no port forwarding. POTACAT opens an outbound tunnel to Cloudflare; your phone connects over <code style="background:var(--bg-tertiary);padding:1px 4px;border-radius:2px;">https://&lt;callsign&gt;.potacat.com</code>.</p>
       <div id="cloud-tunnel-status-row" style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
         <span id="cloud-tunnel-status-pill" class="status disconnected">LAN only</span>
         <span id="cloud-tunnel-host" style="font-size:12px;color:var(--text-secondary);"></span>
@@ -2905,6 +2923,13 @@
         <button type="button" id="cloud-tunnel-disable-btn" class="btn hidden">Disable</button>
       </div>
       <p id="cloud-tunnel-error" class="help-text hidden" style="color:var(--accent-red);margin-top:6px;"></p>
+      <!-- DNS-degraded notice (tunnel-dns-degraded-notice). Amber, not red:
+           the tunnel is nominally up but cloudflared can't refresh DNS.
+           Text comes from state.degradedReason. -->
+      <div id="cloud-tunnel-degraded" class="hidden" style="margin-top:8px;padding:8px 10px;border-radius:6px;background:rgba(212,166,74,0.12);border-left:3px solid var(--source-sota);font-size:12px;line-height:1.5;color:var(--text-secondary);">
+        <strong style="color:var(--source-sota);">⚠ Cloud Tunnel DNS trouble</strong>
+        <span id="cloud-tunnel-degraded-text"></span>
+      </div>
     </fieldset>
 
     <fieldset class="source-toggles" data-settings-tab="cloud">
@@ -3015,7 +3040,8 @@
     <fieldset class="source-toggles" data-settings-tab="cloud">
       <legend>Backup &amp; Recovery</legend>
       <p style="font-size:12px;color:var(--text-secondary);margin-bottom:8px;">Your local ADIF file is always the primary copy. The cloud is an additional backup you can restore from at any time.</p>
-      <button type="button" id="cloud-download-adif" class="btn">Download Cloud Log (ADIF)</button>
+      <button type="button" id="cloud-download-adif" class="btn">Download Cloud Backup (.adi)</button>
+      <p class="help-text" style="margin-top:4px;">Downloads your full cloud logbook as an ADIF file. Works even if your subscription has lapsed.</p>
     </fieldset>
 
     <fieldset class="source-toggles" data-settings-tab="cloud">
@@ -3031,35 +3057,32 @@
       <legend>Sign Out</legend>
       <button type="button" id="cloud-signout-btn" class="btn">Sign Out of POTACAT Cloud</button>
     </fieldset>
-    <!-- Footer scrolls WITH the content (last child of the scroll area) so the
-         only pinned bottom element is the small Save/Cancel bar below — keeps
-         Save visible on every screen size without scrolling. K3SBP 2026-06-10. -->
-    <div class="settings-footer" style="position:relative;">
-      <!-- Two-column layout: ECHOCAT promo on the left (~40%), the
-           existing byline / coffee / links cluster on the right (~60%),
-           right-aligned so the dialog edge is the natural anchor.
-           Badge artwork is trademark Apple / Google — download from the
-           official sources (see assets/README-app-badges.md) and drop the
-           two files at:
-              assets/app-store-badge.svg
-              assets/google-play-badge.png
-           If a file is missing, the <img> alt text degrades to the
-           original two-line text label.
-           Casey 2026-06-08. -->
+    </div><!-- /.settings-scroll-area -->
+    <!-- Pinned bottom bar (grid-area: footer, spans both shell columns).
+         ECHOCAT promo + version/byline/links + Save/Cancel stay visible on
+         every tab without scrolling — Casey 2026-06-12 ("sticky in the same
+         bar as Report a Bug / Save / Cancel"). Reverts the 2026-06-10
+         scroll-with-content move.
+         Badge artwork is the official trademark Apple / Google art at
+         assets/app-store-badge.svg + assets/google-play-badge.png
+         (provenance + refresh instructions: assets/README-app-badges.md).
+         If a file goes missing, the <img> degrades to its alt text. -->
+    <div class="settings-footer">
       <div class="settings-footer-cols">
         <div class="settings-footer-left">
           <div class="settings-echocat-title">Download ECHOCAT on your phone and tablet</div>
           <div class="settings-echocat-badges">
-            <a class="settings-echocat-badge" data-external="1"
+            <a class="settings-echocat-badge-link" data-external="1"
                href="https://apps.apple.com/us/app/echocat-ham-radio-remote/id6766321194"
                aria-label="Download ECHOCAT on the App Store">
-              <span class="settings-echocat-badge-sub">Download on the</span>
-              <span class="settings-echocat-badge-main">App Store</span>
+              <img class="settings-echocat-badge-img settings-echocat-badge-img-appstore"
+                   src="../assets/app-store-badge.svg" alt="Download on the App Store">
             </a>
-            <span class="settings-echocat-badge settings-echocat-badge-disabled" aria-disabled="true"
+            <span class="settings-echocat-badge-link settings-echocat-badge-disabled" aria-disabled="true"
                   aria-label="ECHOCAT for Android coming soon">
-              <span class="settings-echocat-badge-sub">Coming Soon</span>
-              <span class="settings-echocat-badge-main">Google Play</span>
+              <img class="settings-echocat-badge-img settings-echocat-badge-img-play"
+                   src="../assets/google-play-badge.png" alt="Get it on Google Play">
+              <span class="settings-echocat-badge-overlay">Coming Soon</span>
             </span>
           </div>
         </div>
@@ -3080,15 +3103,26 @@
             <a href="#" id="check-update-link">Check for Updates</a>
           </div>
         </div>
+        <div class="dialog-buttons">
+          <button id="settings-save">Save</button>
+          <button id="settings-cancel">Cancel</button>
+        </div>
       </div>
       <span id="pi-access" class="pi-access">&pi;</span>
     </div>
-    </div><!-- /.settings-scroll-area -->
-    <div class="dialog-buttons">
-      <button id="settings-save">Save</button>
-      <button id="settings-cancel">Cancel</button>
-    </div>
     </div><!-- /.settings-shell -->
+  </dialog>
+
+  <!-- Multi-state park state picker — a POTA park can span several states
+       ("US-WI,US-MI"); the activator is only in one, so logging from such
+       a park asks which to put in the log's STATE field (WG9I). -->
+  <dialog id="park-state-dialog">
+    <h3>Which State?</h3>
+    <p id="park-state-text" class="help-text" style="margin-bottom:12px;max-width:420px;"></p>
+    <div id="park-state-options" class="dialog-buttons" style="justify-content:flex-start;flex-wrap:wrap;margin-top:0;"></div>
+    <div class="dialog-buttons">
+      <button type="button" id="park-state-blank">Leave Blank</button>
+    </div>
   </dialog>
 
   <!-- Cloud Tunnel diagnostics dialog -->
@@ -3341,6 +3375,12 @@
       Add another device — phone, tablet, laptop, or another POTACAT — to
       control this shack. Scan the QR on a phone or tablet, or copy the URL
       and open it in POTACAT on the other device.
+    </p>
+    <p class="help-text" style="margin-top:-4px;">
+      Other ways to pair: <b>tap-to-pair</b> (phone app finds this desktop on
+      your home Wi-Fi — an Approve window pops here; same network only), or
+      <b>Cloud account</b> (sign in to POTACAT Cloud on both devices and pick
+      this shack in the app — no QR, no popup).
     </p>
 
     <div class="pair-device-warning">

@@ -1,13 +1,17 @@
-# App Store badges — download instructions
+# App Store badges — provenance & refresh instructions
 
-The Settings footer references two badge images that **are not committed
-to this repo** because the artwork is trademarked by Apple and Google
-and must be downloaded directly from their developer portals under
-their respective marketing guidelines.
+`app-store-badge.svg` and `google-play-badge.png` are the **official,
+unmodified badge artwork** downloaded from Apple's and Google's badge
+generators (URLs below). They are committed to the repo (2026-06-12)
+because packaged releases are built by CI from a tag — un-committed
+assets would silently drop out of every shipped build. Using the
+badges to link to ECHOCAT's own store listing is exactly the use the
+Apple and Google marketing guidelines license; do not edit the files,
+recolor them, or use them for anything else.
 
-If the files are absent, the `<img>` tags in `renderer/index.html`
-gracefully degrade to alt text ("Download on the App Store" / "Coming
-Soon — Google Play").
+If a file is removed, the `<img>` tags in `renderer/index.html`
+gracefully degrade to alt text ("Download on the App Store" / "Get it
+on Google Play").
 
 ## Apple — App Store badge
 

@@ -1,6 +1,6 @@
 {
   "name": "potacat",
-  "version": "1.8.7",
+  "version": "1.8.12",
   "description": "Amateur radio spot aggregator with CAT control, QSO logging, and panadapter integration",
   "author": {
     "name": "Casey Stanton",
@@ -39,6 +39,7 @@
     "appId": "com.waffleslop.potacat",
     "productName": "POTACAT",
     "icon": "assets/icon.png",
+    "afterPack": "scripts/linux-after-pack.js",
     "files": [
       "main.js",
       "preload.js",
@@ -64,6 +65,8 @@
       "assets/icon-256.png",
       "assets/icon-light.png",
       "assets/cty.dat",
+      "assets/app-store-badge.svg",
+      "assets/google-play-badge.png",
       "data/**/*",
       "scripts/test-alsa.js",
       "scripts/launcher.js",
@@ -139,6 +142,12 @@
           "to": "cloudflared"
         }
       ]
+    },
+    "deb": {
+      "appArmorProfile": "build/linux-apparmor-profile"
+    },
+    "rpm": {
+      "appArmorProfile": "build/linux-apparmor-profile"
     },
     "protocols": [
       {

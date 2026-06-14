@@ -51,7 +51,7 @@ section('RemoteClient — pass-mode auth message');
     id: 'gp-otter-newt-mosaic-rooster', kind: 'pass', name: 'K3SBP (Guest Pass)',
     passCode: 'otter-newt-mosaic-rooster',
     passSessionId: 'a'.repeat(64),
-    cloudHost: 'k3sbp.cloud.potacat.com',
+    cloudHost: 'k3sbp.potacat.com',
   };
   const c = new RemoteClient(passTarget, { clientVersion: 'test' });
   c._ws = { readyState: 1, send: (s) => sent.push(JSON.parse(s)), close: () => {} };
@@ -68,7 +68,7 @@ section('RemoteClient — pass-mode auth message');
 section('RemoteClient — paired-target auth unchanged');
 {
   const sent = [];
-  const pairedTarget = { id: 'ct_x', name: 'Shack', deviceToken: 'DEV-TOKEN-123', cloudHost: 'x.cloud.potacat.com' };
+  const pairedTarget = { id: 'ct_x', name: 'Shack', deviceToken: 'DEV-TOKEN-123', cloudHost: 'x.potacat.com' };
   const c = new RemoteClient(pairedTarget, { clientVersion: 'test' });
   c._ws = { readyState: 1, send: (s) => sent.push(JSON.parse(s)), close: () => {} };
   c._handleMessage(JSON.stringify({ type: 'auth-mode', mode: 'token' }));
@@ -105,6 +105,28 @@ section('RemoteClient — pass-ended stops the session');
   eq(events.includes('pass-ended:expired'), true, 'pass-ended event emitted with reason');
   eq(events.includes('ws-closed'), true, 'socket closed');
   eq(c._closed, true, 'client marked closed — no reconnect loop against a dead pass');
+}
+
+// ---------------------------------------------------------------------
+section('RemoteServer — tap-to-pair LAN source classifier');
+{
+  // Pin for the tunnel-gate refinement: tunnel traffic reaches the desktop
+  // from LOOPBACK (cloudflared local proxy), so RFC1918 sources are genuine
+  // same-LAN peers and may tap-to-pair even while the tunnel is exposed.
+  const { RemoteServer } = require('../lib/remote-server');
+  const lan = (ip) => RemoteServer._isPrivateLanAddress(ip);
+  eq(lan('192.168.0.233'), true, '192.168/16 is LAN');
+  eq(lan('::ffff:192.168.1.5'), true, 'IPv6-mapped IPv4 unwrapped');
+  eq(lan('10.0.0.7'), true, '10/8 is LAN');
+  eq(lan('172.16.4.2'), true, '172.16/12 low edge');
+  eq(lan('172.31.255.1'), true, '172.16/12 high edge');
+  eq(lan('127.0.0.1'), false, 'loopback is NOT LAN (tunnel arrives here)');
+  eq(lan('::ffff:127.0.0.1'), false, 'mapped loopback blocked');
+  eq(lan('::1'), false, 'IPv6 loopback blocked');
+  eq(lan('100.104.53.76'), false, 'CGNAT/Tailscale excluded');
+  eq(lan('172.32.0.1'), false, 'just outside 172.16/12');
+  eq(lan('8.8.8.8'), false, 'public IP blocked');
+  eq(lan(''), false, 'empty blocked');
 }
 
 // ---------------------------------------------------------------------

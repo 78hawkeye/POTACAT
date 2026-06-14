@@ -66,8 +66,22 @@ Format: each row is `name — direction — purpose`. Directions:
 | `auth-ok` | S→C | Auth succeeded. Bundles initial feature flags and settings. Per-device-token auths also include `expiresAt` (epoch ms or `null` for no-expiry — trusted / account-linked devices), `accountLinked` (bool — pair came in via Cloud-attested flow), and `trusted` (bool — operator marked the device "my own"). Absent for the legacy single-shared-token path and Guest Pass auth. |
 | `auth-fail` | S→C | Auth rejected with `reason`. New reason in v1.9: `"expired"` — paired device's sliding 180-day token elapsed without a reconnect; client should route to the re-pair UI. |
 | `kicked` | S→C | Server bumped this client because another connected. Carries `byPlatform`, `byVersion`, `byHost` so the displaced client can render a friendly "another device took over" banner instead of a mystery disconnect. |
+| `revoked` | S→C | The shack operator revoked this device's pairing **while it was connected** (Settings → paired devices → Revoke). Carries `reason` (display string). Sent immediately before the server closes the socket with code `4004`. Unlike `kicked`, the device token no longer exists — the client must drop to its unpaired state and must **not** auto-reconnect (a reconnect gets a terminal `auth-fail`; the server can't distinguish revoked from never-paired once the record is deleted). Only the matching per-device pairing is kicked; legacy shared-token and Guest Pass sessions are unaffected (pass revocation has its own `pass-ended` flow). New 2026-06-12. |
 | `pong` | S→C | Reply to `ping` for connection health checks. |
 | `ping` | C→S | Latency / liveness probe. |
+
+#### WebSocket close codes
+
+Application close codes (mirrored in `CLOSE_CODES` in
+`lib/echocat-protocol.js` and mobile's `src/protocol/echocatProtocol.ts`
+— keep the two in sync):
+
+| Code | Name | Meaning |
+|---|---|---|
+| `4001` | `PROTOCOL_VERSION_UNSUPPORTED` | Peer's protocol major is too far ahead/behind to talk. |
+| `4002` | `HANDSHAKE_INVALID` | Malformed `hello`. |
+| `4003` | `AUTH_FAILED_TERMINAL` | Auth rejected and retrying won't help — stop reconnecting. |
+| `4004` | `AUTH_REVOKED` | Operator revoked this device's pairing mid-session. Preceded by a `revoked` message. Don't reconnect. Older clients that don't know `4004` ignore the `revoked` message, treat the close as generic, reconnect once, and land on a terminal `auth-fail` — degraded but safe. |
 
 ### Spots and sources
 
@@ -352,7 +366,7 @@ The mobile app scans it to bootstrap a paired-device record.
 | `token` | yes | One-time pairing token minted by `remoteServer.createPairingToken()`. Short-lived (5 min default; 60 min when shared via messaging). |
 | `fp` | yes | SHA-256 fingerprint of the desktop's TLS cert. The phone pins this for the LAN connection. |
 | `name` | yes | `os.hostname()` of the desktop — shown in the phone's paired-device list. |
-| `cloudHost` | **optional** *(added 2026-06-01 for POTACAT Cloud)* | The CF-tunneled hostname, e.g. `K3SBP.cloud.potacat.com`. Present only when the desktop has POTACAT Cloud enabled and the tunnel is provisioned (file `userData/cloud-tunnel.json` exists with `enabled:true`). Phone uses LAN first; falls back to `wss://<cloudHost>` over CA-signed TLS (skip pinning on this hostname only — LAN keeps pinning). Absent ⇒ LAN-only pairing. |
+| `cloudHost` | **optional** *(added 2026-06-01 for POTACAT Cloud)* | The CF-tunneled hostname, e.g. `k3sbp.potacat.com` (the pattern is `<callsign>.potacat.com`; always returned by the cloud /provision endpoint, never constructed client-side). Present only when the desktop has POTACAT Cloud enabled and the tunnel is provisioned (file `userData/cloud-tunnel.json` exists with `enabled:true`). Phone uses LAN first; falls back to `wss://<cloudHost>` over CA-signed TLS (skip pinning on this hostname only — LAN keeps pinning). Absent ⇒ LAN-only pairing. |
 
 Mobile parsing: treat `cloudHost` as optional and forward-compatible. New
 fields may appear in future builds — existing fields will never change
