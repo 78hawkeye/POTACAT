@@ -43,6 +43,32 @@ function getAppDisplayVersion() {
 // this override the WSJT-X confirm shows "potacat" in lowercase.
 // K3SBP 2026-05-25.
 app.setName('POTACAT');
+
+// --- Crash diagnostics: catch unhandled JS errors before they silently exit ---
+// Without this, an unhandled rejection or thrown error in main.js exits the
+// process cleanly — no crash report, no log entry, looks identical to Jetsam.
+// Writes to the same potacat-crash.log the heartbeat uses, then re-throws so
+// the default handler still propagates the exit code.
+(function installCrashDiagnostics() {
+  function _writeCrashEntry(tag, err) {
+    try {
+      const logPath = require('path').join(app.getPath('userData'), 'potacat-crash.log');
+      const line = `[${new Date().toISOString()}] ${tag}: ${err && (err.stack || err.message || String(err))}\n`;
+      require('fs').appendFileSync(logPath, line);
+    } catch (_) {}
+  }
+  process.on('uncaughtException', (err) => {
+    _writeCrashEntry('UNCAUGHT-EXCEPTION', err);
+    // Re-throw so Electron's default handler runs (may produce a crash report)
+    throw err;
+  });
+  process.on('unhandledRejection', (reason) => {
+    _writeCrashEntry('UNHANDLED-REJECTION', reason instanceof Error ? reason : new Error(String(reason)));
+    // unhandledRejection doesn't kill the process by default in older Node;
+    // log it and continue so we don't introduce new crashes.
+  });
+})();
+
 logStartupStage('electron + path + fs required');
 
 // --- Headless mode: POTACAT --headless ---
@@ -4952,19 +4978,13 @@ async function jtcatAutoLog(qso) {
 // decoder miss and the next cycle should pick it up. (K3SBP 2026-05-03.)
 const _jtcatStateMachine = require('./lib/jtcat-state-machine');
 
-// TEMP QSO-SEQUENCING DIAG (K3SBP 2026-06-11): file log to debug "partner
-// replies but QSO doesn't advance / times out as no-reply" on v1.8.7.
-function _qsoDiag(line) {
-  try { require('fs').appendFile('/tmp/potacat-qso-diag.log', `${new Date().toISOString()} ${line}\n`, () => {}); } catch {}
-}
-
 function advanceJtcatQso(q, results, setTxMsg, onDone) {
   // Thin wrapper around the extracted state machine — keeps the
   // engine + log dependencies injected so the unit tests in
   // test/jtcat-test.js can drive it without spinning the full app.
   return _jtcatStateMachine.advanceJtcatQso(q, results, setTxMsg, onDone, {
     engine: ft8Engine,
-    log: (m) => { sendCatLog(m); if (typeof m === 'string' && m.indexOf('[JTCAT QSO]') >= 0) _qsoDiag(m); },
+    log: (m) => { sendCatLog(m); },
   });
 }
 
@@ -4990,16 +5010,8 @@ function processRemoteJtcatQso(results) {
 }
 
 function processPopoutJtcatQso(results) {
-  if (!_autoSeqEnabled()) {
-    _qsoDiag(`POPOUT autoSeq=OFF phase=${popoutJtcatQso && popoutJtcatQso.phase} call=${popoutJtcatQso && popoutJtcatQso.call} — auto-advance SKIPPED`);
-    return;
-  }
+  if (!_autoSeqEnabled()) return;
   const qso = popoutJtcatQso; // capture reference — don't rely on global in callbacks
-  if (qso && qso.mode === 'reply') {
-    const mc = (qso.myCall || '').toUpperCase(), tc = (qso.call || '').toUpperCase();
-    const cand = (results || []).map(d => d.text).filter(t => t && (t.toUpperCase().indexOf(mc) >= 0 || (tc && t.toUpperCase().indexOf(tc) >= 0)));
-    _qsoDiag(`POPOUT-CYCLE phase=${qso.phase} call=${qso.call} txRetries=${qso.txRetries} txMsg="${qso.txMsg}" candidates=[${cand.join(' | ')}] totalDecodes=${(results || []).length}`);
-  }
   advanceJtcatQso(qso, results, async (msg) => {
     const txEng = jtcatManager ? jtcatManager.txEngine : ft8Engine;
     if (txEng) await txEng.setTxMessage(msg);
@@ -10592,7 +10604,21 @@ function connectRemote() {
     sendCatLog(`[WebSDR] ECHOCAT QSY: ${fKhz} kHz ${m.toUpperCase()}`);
   });
   remoteServer.on('save-settings', (partial) => {
-    Object.assign(settings, partial);
+    // Protect local identity and rig config — the phone cannot have
+    // authoritative values for these. If the phone echoed empty callsign
+    // or a wrong grid from an auth-ok it received, blindly applying the
+    // partial would clobber the operator's identity on every reconnect.
+    const PHONE_READONLY = new Set([
+      'myCallsign', 'grid', 'rigs', 'activeRigId', 'catTarget',
+      'qrzUsername', 'qrzPassword', 'qrzApiKey', 'qrzLogbook', 'qrzFullName', 'enableQrz',
+      'logbookType', 'logbookHost', 'logbookPort', 'sendToLogbook',
+      'adifLogPath', 'potaParksPath',
+    ]);
+    const safe = {};
+    for (const [k, v] of Object.entries(partial)) {
+      if (!PHONE_READONLY.has(k)) safe[k] = v;
+    }
+    Object.assign(settings, safe);
     saveSettings(settings);
   });
 }
@@ -22850,6 +22876,42 @@ function gracefulCleanup() {
   try { if (cloudTunnel) cloudTunnel.shutdown(); } catch {}
   killRigctld();
 }
+
+// Memory heartbeat — logs heap/ext/rss + per-process breakdown every 30s.
+// Writes to potacat-crash.log so we can correlate memory growth with decoder/audio activity.
+(function startMemHeartbeat() {
+  const _hbLog = require('path').join(app.getPath('userData'), 'potacat-crash.log');
+  const _hbFs  = require('fs');
+  const _hbStart = Date.now();
+  function _hbWrite(line) {
+    _hbFs.appendFile(_hbLog, `[${new Date().toISOString()}] ${line}\n`, () => {});
+  }
+  function _hbTick() {
+    try {
+      const m = process.memoryUsage();
+      const up = Math.round((Date.now() - _hbStart) / 1000);
+      _hbWrite(`HEARTBEAT: pid=${process.pid} uptime=${up}s | heap=${(m.heapUsed/1e6).toFixed(1)}MB rss=${(m.rss/1e6).toFixed(1)}MB ext=${(m.external/1e6).toFixed(1)}MB ab=${(m.arrayBuffers/1e6).toFixed(1)}MB`);
+      // Worker memory (FT8 decode worker)
+      if (ft8Engine && ft8Engine._worker) {
+        try {
+          const wm = ft8Engine._worker.process ? ft8Engine._worker.process.memoryUsage() : null;
+          if (wm) _hbWrite(`WORKER-MEM: pid=${process.pid} uptime=${up}s | heap=${(wm.heapUsed/1e6).toFixed(1)}MB ext=${(wm.external/1e6).toFixed(1)}MB ab=${Math.round(wm.arrayBuffers/1e6)}MB | heap=${(m.heapUsed/1e6).toFixed(1)}MB rss=${(m.rss/1e6).toFixed(1)}MB ext=${(m.external/1e6).toFixed(1)}MB ab=${(m.arrayBuffers/1e6).toFixed(1)}MB`);
+        } catch {}
+      }
+      // Per-process breakdown via app.getAppMetrics()
+      try {
+        const metrics = app.getAppMetrics();
+        const parts = metrics.map(p => {
+          const label = p.type === 'Browser' ? 'Browser' : p.type === 'GPU' ? 'GPU' : p.type === 'Utility' ? `Utility(${p.name||'?'})` : 'Tab';
+          return `${label}=${Math.round(p.memory.workingSetSize/1024)}MB`;
+        });
+        _hbWrite(`PROC-MEM: pid=${process.pid} uptime=${up}s | ${parts.join(' ')} | heap=${(m.heapUsed/1e6).toFixed(1)}MB rss=${(m.rss/1e6).toFixed(1)}MB ext=${(m.external/1e6).toFixed(1)}MB ab=${(m.arrayBuffers/1e6).toFixed(1)}MB`);
+      } catch {}
+    } catch {}
+  }
+  setInterval(_hbTick, 30000);
+  _hbTick();
+})();
 
 app.on('before-quit', gracefulCleanup);
 process.on('SIGINT', () => { gracefulCleanup(); process.exit(0); });
