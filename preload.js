@@ -22,6 +22,11 @@ contextBridge.exposeInMainWorld('api', {
   onExternalAtuComplete: (cb) => ipcRenderer.on('external-atu-complete', () => cb()),
   externalAtuCancel: () => ipcRenderer.send('external-atu-cancel'),
   rotateTo: (azimuth) => ipcRenderer.send('rotate-to', azimuth),
+  // Scan on/off sync with ECHOCAT mobile (scan-state-sync-desktop)
+  scanStateChanged: (scanning) => ipcRenderer.send('scan-state-changed', scanning),
+  scanControlSend: (action) => ipcRenderer.send('scan-control-send', action),
+  onRemoteScanControl: (cb) => ipcRenderer.on('remote-scan-control', (_e, d) => cb(d)),
+  onRemotePeerScanState: (cb) => ipcRenderer.on('remote-peer-scan-state', (_e, d) => cb(d)),
   refresh: () => ipcRenderer.send('refresh'),
   getSdrDirectory: () => ipcRenderer.invoke('get-sdr-directory'),
   getContests: () => ipcRenderer.invoke('get-contests'),
@@ -54,6 +59,12 @@ contextBridge.exposeInMainWorld('api', {
   // Pass null to switch back to the local rig.
   connectionTargetsActivate: (id) => ipcRenderer.invoke('connection-targets-activate', id),
   connectionTargetsGetStatus: () => ipcRenderer.invoke('connection-targets-get-status'),
+  // Remote-shack audio (desktop-as-client answerer; remote-desktop Phase 2).
+  // Start/stop listening to the remote rig's audio (and sending mic for PTT);
+  // remoteClientAudioPtt toggles the mic + keys the shack during transmit.
+  remoteClientAudioStart: () => ipcRenderer.invoke('remote-client-audio-start'),
+  remoteClientAudioStop: () => ipcRenderer.invoke('remote-client-audio-stop'),
+  remoteClientAudioPtt: (on) => ipcRenderer.send('remote-client-audio-ptt', on),
   // mDNS discovery of nearby POTACAT shacks for welcome-screen "we
   // found a shack on your network" and Remote-Radios "+ Add new"
   // same-LAN add. Returns [{name, host, port, fingerprint, rigModel, …}].
@@ -387,6 +398,8 @@ contextBridge.exposeInMainWorld('api', {
   jtcatSetAudioLatencyMs: (payload) => ipcRenderer.send('jtcat-set-audio-latency-ms', payload),
   onJtcatAudioLatency: (cb) => ipcRenderer.on('jtcat-audio-latency', (_e, data) => cb(data)),
   jtcatSetHoldTxFreq: (enabled) => ipcRenderer.send('jtcat-set-hold-tx-freq', !!enabled),
+  jtcatSetLateStartTx: (enabled) => ipcRenderer.send('jtcat-set-late-start-tx', !!enabled),
+  jtcatSetApDecode: (enabled) => ipcRenderer.send('jtcat-set-ap-decode', !!enabled),
   jtcatSetTxGain: (level) => ipcRenderer.send('jtcat-set-tx-gain', level),
   jtcatEnableTx: (enabled) => ipcRenderer.send('jtcat-enable-tx', enabled),
   jtcatHaltTx: () => ipcRenderer.send('jtcat-halt-tx'),

@@ -152,6 +152,8 @@ for the history.
 | `set-dist-unit` | C→S | mi vs km. |
 | `set-refresh-interval` | C→S | Spot refresh cadence. |
 | `scan-step` | C→S | Skip / unskip / next during a scan. |
+| `scan-state` | ↔ | Scan on/off STATE sync. Field: `scanning` (boolean). Each side announces when ITS own scan engine turns on/off; the receiver mirrors it as the peer's state. On mutual exclusion (one rig) a side that sees the peer's `scanning:true` stops its own engine. Re-sent to a (re)connecting client so a mid-scan reconnect shows the in-progress scan. |
+| `scan-control` | ↔ | Ask the peer to change ITS scan. Field: `action` (string): `"stop"` (the reported use-case) or `"start"` (optional; uses that side's own filters). Gated like other rig C→S (authenticated active client). NOTE: supersedes the older, unused `scan:state`/`scan:control` (colon) registrations. |
 | `rig-control` | C→S | Generic raw-CAT passthrough button (Settings → Rig table). |
 | `rig-blocked` | S→C | Rig switch denied (club mode etc.). |
 | `rigs` | S→C | List of configured rigs and the active one. |
@@ -347,6 +349,30 @@ the broader `status` message; no dedicated S→C envelope today.)
 | `colorblind-mode` | S→C | Server says colorblind mode is on (affects accent colors). |
 | `cluster-state` | S→C | DX-cluster connection state for the cluster badge. |
 | `qrz-names` | S→C | `{CALLSIGN: 'First Last'}` map after a batch QRZ lookup — drives the spot-row Name column. |
+
+### Diagnostics (Unified Bug Report)
+
+Canonical contract: `status/brief-bug-report-{desktop,mobile}.md`.
+
+| Message | Dir | Purpose |
+|---|---|---|
+| `request-diagnostic` | ↔ | "Report a Bug" on either side asks the other for a diagnostic snapshot. Fields: `requestId` (string, echoed in the reply), `redact` (optional bool — when true the reply is safe to paste into a PUBLIC report). |
+| `diagnostic-snapshot` | ↔ | Reply carrying the SAME `requestId`. Fields: `source` (`"desktop"`/`"mobile"`), `appVersion`, `platform` (object `{os, osVersion, deviceModel}`), `timestamp` (ISO 8601 string), `sections` (object — see below), and `error` (string, present instead of `sections` on refusal/failure). |
+
+Both types are **bidirectional** (`Dir.BOTH`) — either side can be requester
+or responder. `sections` is an untyped any-bag so it can evolve in lockstep
+with the mobile `BugReportAssembler` without a protocol-version bump. Desktop
+sections: `account`, `connection`, `pairedDevices`, `rig`, `tailscale`,
+`cloudTunnel`, `logLines` (`string[]`); mobile adds `network` and omits the
+desktop-only ones. Every field except `requestId` is optional: a refused or
+failed gather returns `error` and no `sections` so the requester never sits
+on its 5s timeout. When `redact:true`, the responder masks email, IPs (to
+/24, loopback preserved), and JWT/Bearer/long-token strings in `logLines`.
+Both sides advertise `diagnostic-snapshot` in their `hello.capabilities` so
+the requester short-circuits to NOT REACHABLE against an old peer instead of
+waiting on the timeout. **Security deviation (desktop):** a Guest Pass
+session is refused (`error: "not-authorized"`) rather than handed the host's
+diagnostics.
 
 ### Pairing (new in v1, see Phase 0 plan)
 

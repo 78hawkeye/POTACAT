@@ -1149,7 +1149,6 @@ async function main() {
   });
 
   // ────────────────────────────────────────────────────────────────────────────
-
   await test('retries CI-V OpenClose until the stream accepts data', async () => {
     await withServer({ username: 'alice', password: 'secret', requiredCivOpenCount: 3, frequencyHz: 18100000 }, async (server) => {
       const transport = new RsBa1Transport();

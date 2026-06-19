@@ -96,6 +96,7 @@ let enableWwff = false;
 let enableLlota = false;
 let enableWwbota = true;
 let enableTiles = false;
+let enableGma = false; // GMA (Global Mountain Activity) — opt-in, default off
 let enableDxcc = false;
 let enableCluster = false;
 let enableCwSpots = false;
@@ -538,6 +539,7 @@ let radioFreqKhz = null;
 let radioMode = null;
 
 let scanning = false;
+let remoteScanning = false; // ECHOCAT mobile's scan engine is running (scan-state-sync-desktop)
 let scanTimer = null;
 let scanIndex = 0;
 let scanSkipped = new Set(); // "callsign\tfrequency" keys to skip
@@ -561,6 +563,7 @@ const spotsDropdown = document.getElementById('spots-dropdown');
 const spotsBtn = document.getElementById('spots-btn');
 const spotsPota = document.getElementById('spots-pota');
 const spotsSota = document.getElementById('spots-sota');
+const spotsGma = document.getElementById('spots-gma');
 const spotsWwff = document.getElementById('spots-wwff');
 const spotsLlota = document.getElementById('spots-llota');
 const spotsWwbota = document.getElementById('spots-wwbota');
@@ -613,6 +616,7 @@ const setWwbotaRespotTemplate = document.getElementById('set-wwbota-respot-templ
 const setDxRespotTemplate = document.getElementById('set-dx-respot-template');
 const setEnablePota = document.getElementById('set-enable-pota');
 const setEnableSota = document.getElementById('set-enable-sota');
+const setEnableGma = document.getElementById('set-enable-gma');
 const setEnableWwff = document.getElementById('set-enable-wwff');
 const setEnableLlota = document.getElementById('set-enable-llota');
 const setEnableWwbota = document.getElementById('set-enable-wwbota');
@@ -1100,6 +1104,7 @@ const setAudioSource = document.getElementById('set-audio-source');
 const setSstvGalleryPath = document.getElementById('set-sstv-gallery-path');
 const sstvGalleryBrowseBtn = document.getElementById('sstv-gallery-browse-btn');
 const sstvGalleryResetBtn = document.getElementById('sstv-gallery-reset-btn');
+const setFlexOnboardSpeaker = document.getElementById('set-flex-onboard-speaker');
 const setTxEqEnabled = document.getElementById('set-tx-eq-enabled');
 const setTxEqPreset = document.getElementById('set-tx-eq-preset');
 const setTxEqPresetRow = document.getElementById('set-tx-eq-preset-row');
@@ -1496,6 +1501,7 @@ async function loadPrefs() {
   enableLlota = settings.enableLlota === true; // default false
   enableWwbota = settings.enableWwbota !== false; // default true (Casey 2026-06-01)
   enableTiles = settings.enableTiles !== false; // default true (Tiles is fresh — show new users)
+  enableGma = settings.enableGma === true; // default false (opt-in)
   enableDxcc = settings.enableDxcc === true;  // default false
   enableCluster = settings.enableCluster === true; // default false
   enableCwSpots = settings.enableCwSpots === true; // default false
@@ -3142,7 +3148,16 @@ async function saveBannerQso() {
   try {
     for (let ci = 0; ci < callsigns.length; ci++) {
       const cs = callsigns[ci];
-      const qrzInfo = qrzData.get(cs.split('/')[0]);
+      // Resolve the operator name reliably before building the record. A bare
+      // cache read raced the on-screen lookup (and missed on case-mismatch:
+      // the cache is keyed uppercase) so the ADIF <NAME> was written empty
+      // even when the name showed on screen. Cache-first, awaited fallback.
+      const blBareCall = cs.split('/')[0].toUpperCase();
+      let qrzInfo = qrzData.get(blBareCall);
+      if (!qrzInfo) {
+        try { qrzInfo = await window.api.qrzLookup(cs); } catch {}
+        if (qrzInfo) qrzData.set(blBareCall, qrzInfo);
+      }
       const qsoData = {
         callsign: cs,
         frequency: String(freqKhz),
@@ -3619,6 +3634,31 @@ function renderClusterNodeList(nodes) {
     hostEl.textContent = node.host + ':' + node.port;
     info.appendChild(nameEl);
     info.appendChild(hostEl);
+
+    // Per-node login callsign override. Cluster nodes accept one connection
+    // per callsign, so an op feeding a node from another logger under their
+    // base call logs POTACAT in under an SSID (e.g. WG9I-2) here to run both.
+    // Blank = use My Callsign. (WG9I 2026-06-13.)
+    const myCall = ((document.getElementById('set-my-callsign') || {}).value || '').trim().toUpperCase();
+    const loginRow = document.createElement('div');
+    loginRow.className = 'node-item-login';
+    loginRow.style.cssText = 'font-size:11px;margin-top:3px;display:flex;align-items:center;gap:4px;';
+    const loginLabel = document.createElement('span');
+    loginLabel.textContent = 'Login as:';
+    const loginInput = document.createElement('input');
+    loginInput.type = 'text';
+    loginInput.maxLength = 12;
+    loginInput.value = node.loginCall || '';
+    loginInput.placeholder = myCall || 'My Callsign';
+    loginInput.style.cssText = 'width:110px;font-size:11px;padding:1px 4px;';
+    loginInput.title = 'Log in to this node under a different callsign (e.g. ' +
+      (myCall ? myCall + '-2' : 'WG9I-2') + ') so POTACAT does not collide with another app feeding the same node under your base call. Blank = My Callsign.';
+    loginInput.addEventListener('input', () => {
+      node.loginCall = loginInput.value.trim().toUpperCase();
+    });
+    loginRow.appendChild(loginLabel);
+    loginRow.appendChild(loginInput);
+    info.appendChild(loginRow);
 
     const dot = document.createElement('span');
     dot.className = 'node-status-dot';
@@ -4101,6 +4141,7 @@ setSmartSdrMaxSpots.addEventListener('change', () => {
 if (setAudioSource) {
   setAudioSource.addEventListener('change', () => {
     window.api.saveSettings({ audioSource: setAudioSource.value });
+    syncRigAudioDeviceBypass();
   });
 }
 
@@ -6175,6 +6216,50 @@ if (window.api && window.api.onRemoteClientDisplaced) {
       }
     });
   }
+  // Phase 2 audio leg: bring up the rig-audio answerer (listen to the remote
+  // rig; mic stays muted until PTT) when connected to a remote shack, tear it
+  // down on drop, and gate the voice push-to-talk button on that same state.
+  // The shack mints TURN creds and offers; the hidden answerer window plays
+  // the audio. Idempotent — start/stop fire only on a real connected→not edge.
+  if (window.api && window.api.onRemoteClientStatus && window.api.remoteClientAudioStart) {
+    const pttBtn = document.getElementById('remote-ptt-btn');
+    const ptt = (typeof RemotePttController === 'function')
+      ? new RemotePttController({
+          sendPtt: (on) => { try { window.api.remoteClientAudioPtt(on); } catch (e) {} },
+          onChange: (keyed) => {
+            if (!pttBtn) return;
+            pttBtn.textContent = keyed ? '🔴 ON AIR' : '🎙 HOLD TO TALK';
+            pttBtn.style.background = keyed ? '#ff2d55' : '#e94560';
+          },
+        })
+      : null;
+    // Press-and-hold (mouse + touch). Release on pointerup / pointerleave /
+    // pointercancel / window blur so a dragged-off, interrupted, or alt-tabbed
+    // press can NEVER leave the remote rig stuck keyed. No keyboard PTT — an
+    // explicit hold is the only way to transmit (no accidental TX).
+    if (pttBtn && ptt) {
+      const down = (e) => { e.preventDefault(); ptt.down(); };
+      const up = () => { ptt.up(); };
+      pttBtn.addEventListener('pointerdown', down);
+      pttBtn.addEventListener('pointerup', up);
+      pttBtn.addEventListener('pointerleave', up);
+      pttBtn.addEventListener('pointercancel', up);
+      window.addEventListener('blur', up);
+    }
+    let _racOn = false;
+    window.api.onRemoteClientStatus((s) => {
+      const connected = !!(s && s.state === 'connected');
+      if (connected && !_racOn) {
+        _racOn = true;
+        window.api.remoteClientAudioStart().catch(() => {});
+      } else if (!connected && _racOn) {
+        _racOn = false;
+        try { window.api.remoteClientAudioStop(); } catch (e) {}
+      }
+      if (ptt) ptt.setActive(connected); // force-releases TX if we just dropped
+      if (pttBtn) pttBtn.classList.toggle('hidden', !connected);
+    });
+  }
   // Hydrate on load.
   if (window.api && window.api.connectionTargetsGetStatus) {
     window.api.connectionTargetsGetStatus().then(setChip).catch(() => {});
@@ -7325,6 +7410,27 @@ async function populateRigAudioDevices(restoreIn, restoreOut) {
   } catch (e) {
     console.warn('Could not enumerate audio devices:', e.message);
   }
+  syncRigAudioDeviceBypass();
+}
+
+// When the audio source streams straight to/from the radio (SmartSDR Direct,
+// Icom Network) there is no soundcard in the path, so HIDE the device pickers
+// entirely and show a one-line reassurance. Earlier this greyed them out, but
+// a disabled-but-visible control invites users to "fix" it by switching the
+// audio source — which silently drops them off the direct path and kills TX
+// (K3SBP 2026-06-17 broke his own Flex TX exactly this way). Nothing to
+// configure here = nothing to break.
+function syncRigAudioDeviceBypass() {
+  const src = setAudioSource ? setAudioSource.value : 'dax';
+  const bypassed = (src === 'smartsdr' || src === 'icom-network');
+  const hint = document.getElementById('rig-audio-devices-hint');
+  const note = document.getElementById('rig-audio-devices-bypass');
+  const inLabel = rigRemoteAudioInput ? rigRemoteAudioInput.closest('label') : null;
+  const outLabel = rigRemoteAudioOutput ? rigRemoteAudioOutput.closest('label') : null;
+  if (inLabel) inLabel.style.display = bypassed ? 'none' : '';
+  if (outLabel) outLabel.style.display = bypassed ? 'none' : 'block';
+  if (hint) hint.style.display = bypassed ? 'none' : 'block';
+  if (note) note.style.display = bypassed ? 'block' : 'none';
 }
 
 async function updateRemoteAudioSummary(audioInId, audioOutId) {
@@ -7952,6 +8058,7 @@ function getFiltered() {
       (s.source === 'llota' && !enableLlota) ||
       (s.source === 'wwbota' && !enableWwbota) ||
       (s.source === 'tiles' && !enableTiles) ||
+      (s.source === 'gma' && !enableGma) ||
       (s.source === 'dxc' && !enableCluster) ||
       (s.source === 'cwspots' && !enableCwSpots) ||
       (s.source === 'rbn' && !enableRbn) ||
@@ -8433,19 +8540,19 @@ L.Icon.Default.mergeOptions({
 // --- Colorblind-safe dual palettes ---
 const SOURCE_COLORS_NORMAL = {
   pota: '#4ecca3', sota: '#f0a500', wwff: '#26a69a',
-  llota: '#42a5f5', tiles: '#ab47bc', dxc: '#e040fb', cwspots: '#ffd740', rbn: '#00bcd4', pskr: '#ff6b6b', freedv: '#00e5ff'
+  llota: '#42a5f5', tiles: '#ab47bc', gma: '#a98467', dxc: '#e040fb', cwspots: '#ffd740', rbn: '#00bcd4', pskr: '#ff6b6b', freedv: '#00e5ff'
 };
 const SOURCE_COLORS_CB = {
   pota: '#4fc3f7', sota: '#ffb300', wwff: '#29b6f6',
-  llota: '#42a5f5', tiles: '#ce93d8', dxc: '#e040fb', cwspots: '#ffd740', rbn: '#81d4fa', pskr: '#ffa726', freedv: '#00e5ff'
+  llota: '#42a5f5', tiles: '#ce93d8', gma: '#bcaaa4', dxc: '#e040fb', cwspots: '#ffd740', rbn: '#81d4fa', pskr: '#ffa726', freedv: '#00e5ff'
 };
 const SOURCE_STROKES_NORMAL = {
   pota: '#3ba882', sota: '#c47f00', wwff: '#1b7a71',
-  llota: '#1e88e5', tiles: '#7b1fa2', dxc: '#ab00d9', cwspots: '#c6a700', rbn: '#0097a7', pskr: '#d84343', freedv: '#00acc1'
+  llota: '#1e88e5', tiles: '#7b1fa2', gma: '#7a5e4a', dxc: '#ab00d9', cwspots: '#c6a700', rbn: '#0097a7', pskr: '#d84343', freedv: '#00acc1'
 };
 const SOURCE_STROKES_CB = {
   pota: '#2196f3', sota: '#e6a200', wwff: '#0288d1',
-  llota: '#1e88e5', tiles: '#9c27b0', dxc: '#ab00d9', cwspots: '#c6a700', rbn: '#4fc3f7', pskr: '#e68a00', freedv: '#00acc1'
+  llota: '#1e88e5', tiles: '#9c27b0', gma: '#8d7b6f', dxc: '#ab00d9', cwspots: '#c6a700', rbn: '#4fc3f7', pskr: '#e68a00', freedv: '#00acc1'
 };
 const RBN_BAND_COLORS_NORMAL = {
   '160m': '#ff4444', '80m': '#ff8c00', '60m': '#ffd700', '40m': '#4ecca3',
@@ -8519,11 +8626,11 @@ function applyColorblindMode(enabled) {
 // WCAG AA high-contrast source palettes
 const SOURCE_COLORS_WCAG = {
   pota: '#5ed8ad', sota: '#f0a500', wwff: '#3cc4b8',
-  llota: '#42a5f5', tiles: '#ce93d8', dxc: '#e87fff', cwspots: '#ffe066', rbn: '#00bcd4', pskr: '#ff9090', freedv: '#00e5ff'
+  llota: '#42a5f5', tiles: '#ce93d8', gma: '#c8a98f', dxc: '#e87fff', cwspots: '#ffe066', rbn: '#00bcd4', pskr: '#ff9090', freedv: '#00e5ff'
 };
 const SOURCE_STROKES_WCAG = {
   pota: '#42b88a', sota: '#c47f00', wwff: '#2a9e92',
-  llota: '#1e88e5', tiles: '#9c27b0', dxc: '#c040e0', cwspots: '#c6a700', rbn: '#0097a7', pskr: '#d06060', freedv: '#00acc1'
+  llota: '#1e88e5', tiles: '#9c27b0', gma: '#8a6f5a', dxc: '#c040e0', cwspots: '#c6a700', rbn: '#0097a7', pskr: '#d06060', freedv: '#00acc1'
 };
 
 function applyWcagMode(enabled) {
@@ -9009,7 +9116,7 @@ const PRIVILEGE_RANGES = {
 
 const SOURCE_LABELS = {
   pota: 'POTA', sota: 'SOTA', dxc: 'DX', cwspots: 'CW',
-  rbn: 'RBN', wwff: 'WWFF', llota: 'LLOTA', tiles: 'Tiles', pskr: 'FreeDV', net: 'NET',
+  rbn: 'RBN', wwff: 'WWFF', llota: 'LLOTA', tiles: 'Tiles', gma: 'GMA', pskr: 'FreeDV', net: 'NET',
 };
 const CW_DIGI_MODES = new Set(['CW', 'FT8', 'FT4', 'FT2', 'RTTY', 'DIGI', 'JS8', 'PSK31', 'PSK']);
 const PHONE_MODES = new Set(['SSB', 'USB', 'LSB', 'FM', 'AM']);
@@ -9177,9 +9284,32 @@ function getScanList() {
   return filtered.filter((s) => s.source !== 'net' && !scanSkipped.has(skipKey(s)) && (!isWorkedSpot(s) || scanForceUnskipped.has(skipKey(s))));
 }
 
+// Notify main (→ ECHOCAT mobile) of a real scan on↔off transition. Fired only
+// on actual state changes so the mutual-exclusion stop can't feedback-loop.
+// (scan-state-sync-desktop)
+function notifyScanState(on) {
+  try { if (window.api && window.api.scanStateChanged) window.api.scanStateChanged(!!on); } catch {}
+}
+
+// Reflect the peer (mobile) scan in the desktop Scan button when we aren't
+// locally scanning, so the desktop shows "Stop" while the phone scans.
+function reflectScanButton() {
+  if (scanning) return; // a local scan owns the button label via start/stopScan
+  if (remoteScanning) {
+    scanBtn.textContent = 'Stop';
+    scanBtn.title = 'Mobile is scanning — press to stop it';
+    scanBtn.classList.add('scan-active');
+  } else {
+    scanBtn.textContent = 'Scan';
+    scanBtn.title = 'Scan through spots';
+    scanBtn.classList.remove('scan-active');
+  }
+}
+
 function startScan() {
   const list = getScanList();
   if (list.length === 0) return;
+  const wasScanning = scanning;
   scanning = true;
   scanVisitedFreqs.clear();
   // Resume from the spot matching the radio's current frequency, or start at 0
@@ -9191,10 +9321,12 @@ function startScan() {
   scanBtn.textContent = 'Stop';
   scanBtn.title = 'Press Stop or Spacebar to stop scanning';
   scanBtn.classList.add('scan-active');
+  if (!wasScanning) notifyScanState(true);
   scanStep();
 }
 
 function stopScan() {
+  const wasScanning = scanning;
   scanning = false;
   if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
   scanVisitedFreqs.clear();
@@ -9206,6 +9338,8 @@ function stopScan() {
   scanBtn.textContent = 'Scan';
   scanBtn.title = 'Scan through spots';
   scanBtn.classList.remove('scan-active');
+  if (wasScanning) notifyScanState(false);
+  reflectScanButton(); // re-show "Stop" if the phone is still scanning
   render();
 }
 
@@ -9262,8 +9396,30 @@ function scanStep() {
 }
 
 scanBtn.addEventListener('click', () => {
-  if (scanning) { stopScan(); } else { startScan(); }
+  // Button routing mirrors mobile: stop our own scan first; else if only the
+  // phone is scanning, ask it to stop; else start a local scan.
+  if (scanning) { stopScan(); }
+  else if (remoteScanning) { try { window.api.scanControlSend('stop'); } catch {} }
+  else { startScan(); }
 });
+
+// --- ECHOCAT scan-state sync (scan-state-sync-desktop) ---
+// Inbound: mobile asks the desktop to start/stop its scan.
+if (window.api && window.api.onRemoteScanControl) {
+  window.api.onRemoteScanControl(({ action } = {}) => {
+    if (action === 'stop') stopScan();
+    else if (action === 'start') startScan();
+  });
+}
+// Inbound: mobile announced its own scan turned on/off. Mutual exclusion (one
+// rig): if the phone started scanning, stop ours. Always reflect it in the button.
+if (window.api && window.api.onRemotePeerScanState) {
+  window.api.onRemotePeerScanState(({ scanning: peerScanning } = {}) => {
+    remoteScanning = !!peerScanning;
+    if (remoteScanning && scanning) stopScan(); // stopScan() also calls reflectScanButton()
+    else reflectScanButton();
+  });
+}
 
 document.addEventListener('keydown', (e) => {
   // Don't intercept F-keys that are part of a modifier combo — those are
@@ -9423,7 +9579,7 @@ document.addEventListener('keydown', (e) => {
 
 // --- Quick Re-spot (Ctrl+R) ---
 // SOURCE_COLORS is now managed by SOURCE_COLORS_ACTIVE (see colorblind palettes above)
-const RESPOT_NAMES = { pota: 'POTA', wwff: 'WWFF', llota: 'LLOTA', dxc: 'DX Cluster' };
+const RESPOT_NAMES = { pota: 'POTA', wwff: 'WWFF', llota: 'LLOTA', gma: 'GMA', dxc: 'DX Cluster' };
 
 function getRespotTargets(s) {
   const targets = [];
@@ -9436,6 +9592,8 @@ function getRespotTargets(s) {
     targets.push('llota');
   } else if (s.source === 'wwbota' && s.reference) {
     targets.push('wwbota');
+  } else if (s.source === 'gma' && s.reference) {
+    targets.push('gma');
   } else if (clusterConnected) {
     targets.push('dxc');
   }
@@ -9474,6 +9632,7 @@ async function openQuickRespot() {
   else if (s.source === 'wwff') refText = 'WWFF: ' + s.reference + (s.parkName ? ' \u2014 ' + s.parkName : '');
   else if (s.source === 'llota') refText = 'LLOTA: ' + s.reference + (s.parkName ? ' \u2014 ' + s.parkName : '');
   else if (s.source === 'wwbota') refText = 'WWBOTA: ' + (s.wwbotaRefsLabel || s.reference) + (s.parkName ? ' \u2014 ' + s.parkName : '');
+  else if (s.source === 'gma') refText = 'GMA: ' + s.reference + (s.parkName ? ' \u2014 ' + s.parkName : '');
   else if (s.source === 'dxc') refText = s.callsign + (s.locationDesc ? ' \u2014 ' + s.locationDesc : '');
   document.getElementById('respot-ref').textContent = refText;
 
@@ -9533,6 +9692,8 @@ document.getElementById('respot-send').addEventListener('click', async () => {
     llotaReference: s.source === 'llota' ? s.reference : '',
     wwbotaRespot: targets.includes('wwbota'),
     wwbotaReference: s.source === 'wwbota' ? s.reference : '',
+    gmaRespot: targets.includes('gma'),
+    gmaReference: s.source === 'gma' ? s.reference : '',
     dxcRespot: targets.includes('dxc'),
   };
 
@@ -10920,6 +11081,7 @@ function render() {
       if (s.source === 'wwff') tr.classList.add('spot-wwff');
       if (s.source === 'llota') tr.classList.add('spot-llota');
       if (s.source === 'wwbota') tr.classList.add('spot-wwbota');
+      if (s.source === 'gma') tr.classList.add('spot-gma');
       if (s.source === 'pskr') tr.classList.add('spot-pskr');
       if (s.source === 'net') tr.classList.add('spot-net');
       // Watchlist group — color the whole row when the activator's call
@@ -12187,6 +12349,7 @@ function syncSpotsPanel() {
   spotsLlota.checked = enableLlota;
   if (spotsWwbota) spotsWwbota.checked = enableWwbota;
   if (spotsTiles) spotsTiles.checked = enableTiles;
+  if (spotsGma) spotsGma.checked = enableGma;
   spotsCluster.checked = enableCluster;
   spotsCwSpots.checked = enableCwSpots;
   spotsRbn.checked = enableRbn;
@@ -12232,6 +12395,7 @@ document.querySelector('.spots-dropdown-panel').addEventListener('change', async
   enableLlota = spotsLlota.checked;
   enableWwbota = spotsWwbota ? spotsWwbota.checked : enableWwbota;
   enableTiles = spotsTiles ? spotsTiles.checked : enableTiles;
+  enableGma = spotsGma ? spotsGma.checked : enableGma;
   enableCluster = spotsCluster.checked;
   enableCwSpots = spotsCwSpots.checked;
   enableRbn = spotsRbn.checked;
@@ -12283,6 +12447,7 @@ document.querySelector('.spots-dropdown-panel').addEventListener('change', async
   setEnableLlota.checked = enableLlota;
   if (setEnableWwbota) setEnableWwbota.checked = enableWwbota;
   if (setEnableTiles) setEnableTiles.checked = enableTiles;
+  if (setEnableGma) setEnableGma.checked = enableGma;
   setEnableCluster.checked = enableCluster;
   setEnableCwSpots.checked = enableCwSpots;
   setEnableRbn.checked = enableRbn;
@@ -12299,7 +12464,7 @@ document.querySelector('.spots-dropdown-panel').addEventListener('change', async
 
   // Save and let main process handle connect/disconnect
   await window.api.saveSettings({
-    enablePota, enableSota, enableWwff, enableLlota, enableWwbota, enableTiles,
+    enablePota, enableSota, enableWwff, enableLlota, enableWwbota, enableTiles, enableGma,
     enableCluster, enableCwSpots, enableRbn, enablePskr, enableDxe,
     enableDxeSources: { ...enableDxeSources },
     hideWorked, hideWorkedParks, hideWorkedCallRef, prioritizeNewParks, strictAtno, hideOutOfBand,
@@ -13092,6 +13257,7 @@ async function openSettingsDialog(tab) {
   setEnableLlota.checked = s.enableLlota === true;
   if (setEnableWwbota) setEnableWwbota.checked = s.enableWwbota !== false;
   if (setEnableTiles) setEnableTiles.checked = s.enableTiles !== false;
+  if (setEnableGma) setEnableGma.checked = s.enableGma === true;
   setEnableQrz.checked = s.enableQrz === true;
   setQrzUsername.value = s.qrzUsername || '';
   setQrzPassword.value = s.qrzPassword || '';
@@ -13366,6 +13532,9 @@ async function openSettingsDialog(tab) {
   setRemoteStun.checked = s.remoteStun !== false; // default ON (needed for cloud/WebRTC audio)
   if (setAudioSource) {
     setAudioSource.value = ['smartsdr', 'icom-network'].includes(s.audioSource) ? s.audioSource : 'dax';
+  }
+  if (setFlexOnboardSpeaker) {
+    setFlexOnboardSpeaker.checked = !!s.flexOnboardSpeaker;
   }
   // TX EQ — load saved state into the Settings dialog. Live updates go
   // through window.api.setTxEq() so toggling the checkbox / dropdown
@@ -13699,6 +13868,7 @@ settingsSave.addEventListener('click', async () => {
   const llotaEnabled = setEnableLlota.checked;
   const wwbotaEnabled = setEnableWwbota ? setEnableWwbota.checked : enableWwbota;
   const tilesEnabled = setEnableTiles ? setEnableTiles.checked : enableTiles;
+  const gmaEnabled = setEnableGma ? setEnableGma.checked : enableGma;
   const qrzEnabled = setEnableQrz.checked;
   const qrzUsername = setQrzUsername.value.trim().toUpperCase();
   const qrzPassword = setQrzPassword.value;
@@ -13834,6 +14004,7 @@ settingsSave.addEventListener('click', async () => {
   const remoteCwEnabledVal = setRemoteCwEnabled.checked;
   const remoteStunVal = setRemoteStun.checked;
   const audioSourceVal = setAudioSource ? setAudioSource.value : 'dax';
+  const flexOnboardSpeakerVal = setFlexOnboardSpeaker ? setFlexOnboardSpeaker.checked : false;
   const cwKeyPortVal = setCwKeyPort.value || '';
   const launcherEnabled = setEnableLauncher ? setEnableLauncher.checked : false;
   // Audio comes from the active rig (resolved after selectedRig below)
@@ -13904,6 +14075,7 @@ settingsSave.addEventListener('click', async () => {
     enableLlota: llotaEnabled,
     enableWwbota: wwbotaEnabled,
     enableTiles: tilesEnabled,
+    enableGma: gmaEnabled,
     enableQrz: qrzEnabled,
     qrzUsername: qrzUsername,
     qrzPassword: qrzPassword,
@@ -14059,6 +14231,7 @@ settingsSave.addEventListener('click', async () => {
     remoteCwEnabled: remoteCwEnabledVal,
     remoteStun: remoteStunVal,
     audioSource: audioSourceVal,
+    flexOnboardSpeaker: flexOnboardSpeakerVal,
     cwKeyPort: cwKeyPortVal,
     enableLauncher: launcherEnabled,
     remoteAudioInput: selectedRig ? (selectedRig.remoteAudioInput || '') : '',
@@ -14093,6 +14266,7 @@ settingsSave.addEventListener('click', async () => {
   enableWwff = wwffEnabled;
   enableLlota = llotaEnabled;
   enableTiles = tilesEnabled;
+  enableGma = gmaEnabled;
   enableCluster = clusterEnabled;
   enableRbn = rbnEnabled;
   enablePskr = pskrEnabled;
@@ -17431,9 +17605,40 @@ let voiceMacroBoxVisible = localStorage.getItem('voiceMacroBoxVisible') === 'tru
     }));
   });
 })();
-const VOICE_MACRO_COUNT = 5;
+// Voice macros: up to VOICE_MACRO_MAX slots. The editor shows a number of
+// rows the user controls with a "+ Add macro" button (default ~8 — most
+// users never need more); the bar only renders slots that have a label or
+// recording, so it's independent of how many editor rows are visible.
+const VOICE_MACRO_MAX = 25;
+const VOICE_MACRO_DEFAULT_SLOTS = 8;
+const VOICE_MACRO_SLOTS_KEY = 'pota-cat-voice-macro-slots';
 const VOICE_MAX_DURATION = 30;
-let voiceMacroLabels = ['CQ', 'ID', '73', '', ''];
+let voiceMacroLabels = ['CQ', 'ID', '73'];
+
+function loadVoiceMacroSlots() {
+  var n = parseInt(localStorage.getItem(VOICE_MACRO_SLOTS_KEY), 10);
+  if (!Number.isFinite(n)) n = VOICE_MACRO_DEFAULT_SLOTS;
+  return Math.min(VOICE_MACRO_MAX, Math.max(1, n));
+}
+function saveVoiceMacroSlots(n) {
+  n = Math.min(VOICE_MACRO_MAX, Math.max(1, n));
+  try { localStorage.setItem(VOICE_MACRO_SLOTS_KEY, String(n)); } catch {}
+  return n;
+}
+// How many editor rows to show: at least the saved visible count (clamped to
+// 1..max), but never fewer than needed to reveal the highest slot that already
+// has a recording or a label — otherwise growing past the default and then
+// shrinking could hide content. Pure; unit-tested in test/voice-macros-test.js.
+function effectiveVoiceMacroSlots(savedSlots, filled, labels, max) {
+  var slots = Math.min(max, Math.max(1, savedSlots || 0));
+  for (var h = max - 1; h >= 0; h--) {
+    if ((filled && filled.indexOf(h) >= 0) || (labels && labels[h] && labels[h].length)) {
+      if (h + 1 > slots) slots = h + 1;
+      break;
+    }
+  }
+  return slots;
+}
 let voicePlayingIdx = -1;
 let voicePlaybackSource = null;
 let voicePlaybackCtx = null;
@@ -17448,7 +17653,11 @@ let voicePreviewCtx = null;
 // Load labels from settings
 (async () => {
   var s = await window.api.getSettings();
-  if (s.voiceMacroLabels) voiceMacroLabels = s.voiceMacroLabels;
+  if (s.voiceMacroLabels) voiceMacroLabels = s.voiceMacroLabels.slice();
+  // Pad to MAX so per-index writes never create sparse-array holes (which
+  // JSON.stringify turns into nulls).
+  while (voiceMacroLabels.length < VOICE_MACRO_MAX) voiceMacroLabels.push('');
+  updateVoiceMacroBar();
 })();
 
 async function updateVoiceMacroBar() {
@@ -17458,7 +17667,7 @@ async function updateVoiceMacroBar() {
   if (!voiceMacroBoxVisible) return;
   var filled = await window.api.voiceMacroList();
   voiceMacroBtns.innerHTML = '';
-  for (var i = 0; i < VOICE_MACRO_COUNT; i++) {
+  for (var i = 0; i < VOICE_MACRO_MAX; i++) {
     if (!voiceMacroLabels[i] && filled.indexOf(i) === -1) continue;
     (function(idx) {
       var btn = document.createElement('button');
@@ -17695,7 +17904,12 @@ async function renderVoiceMacroEditor() {
     try { localStorage.setItem(VOICE_MACRO_DEVICE_KEY, deviceSelect.value); } catch {}
   });
 
-  for (var i = 0; i < VOICE_MACRO_COUNT; i++) {
+  // How many slot rows to show. The user grows this with "+ Add macro"
+  // (default ~8). Never hide a slot that already has a recording or label,
+  // even if it sits past the saved visible count.
+  var slots = effectiveVoiceMacroSlots(loadVoiceMacroSlots(), filled, voiceMacroLabels, VOICE_MACRO_MAX);
+
+  for (var i = 0; i < slots; i++) {
     (function(idx) {
       var row = document.createElement('div');
       row.style.cssText = 'display:flex;gap:4px;align-items:center;';
@@ -17762,6 +17976,48 @@ async function renderVoiceMacroEditor() {
       voiceMacroEditor.appendChild(row);
     })(i);
   }
+
+  // Footer: grow / shrink the visible slot count. "+ Add macro" reveals one
+  // more empty row (up to VOICE_MACRO_MAX). "− Remove last" hides a trailing
+  // row only when it's empty and unlabeled, so we never let a click discard a
+  // recording. A small "N / MAX" counter sits between them.
+  var footer = document.createElement('div');
+  footer.style.cssText = 'display:flex;gap:6px;align-items:center;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);';
+
+  if (slots < VOICE_MACRO_MAX) {
+    var addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.textContent = '+ Add macro';
+    addBtn.title = 'Add another voice macro slot (up to ' + VOICE_MACRO_MAX + ')';
+    addBtn.style.cssText = 'font-size:11px;padding:3px 10px;cursor:pointer;';
+    addBtn.addEventListener('click', function() {
+      saveVoiceMacroSlots(slots + 1);
+      renderVoiceMacroEditor();
+    });
+    footer.appendChild(addBtn);
+  }
+
+  var lastEmpty = filled.indexOf(slots - 1) === -1
+    && !(voiceMacroLabels[slots - 1] && voiceMacroLabels[slots - 1].length);
+  if (slots > 1 && lastEmpty) {
+    var remBtn = document.createElement('button');
+    remBtn.type = 'button';
+    remBtn.textContent = '− Remove last';
+    remBtn.title = 'Hide the last (empty) macro slot';
+    remBtn.style.cssText = 'font-size:11px;padding:3px 10px;cursor:pointer;';
+    remBtn.addEventListener('click', function() {
+      saveVoiceMacroSlots(slots - 1);
+      renderVoiceMacroEditor();
+    });
+    footer.appendChild(remBtn);
+  }
+
+  var counter = document.createElement('span');
+  counter.style.cssText = 'font-size:10px;color:var(--text-tertiary);margin-left:auto;';
+  counter.textContent = slots + ' / ' + VOICE_MACRO_MAX;
+  footer.appendChild(counter);
+
+  voiceMacroEditor.appendChild(footer);
 }
 
 // localStorage key for the user-chosen recording mic. Empty / unset =
@@ -17829,10 +18085,10 @@ if (voiceMacroRecBtn) {
       voiceMacroRecBtn.style.color = '';
       return;
     }
-    // Record into first empty or first slot
-    voiceCheckSlots(function(filled) {
+    // Record into first empty slot (or slot 0 if all full).
+    window.api.voiceMacroList().then(function(filled) {
       var idx = 0;
-      for (var i = 0; i < VOICE_MACRO_COUNT; i++) { if (filled.indexOf(i) === -1) { idx = i; break; } }
+      for (var i = 0; i < VOICE_MACRO_MAX; i++) { if (filled.indexOf(i) === -1) { idx = i; break; } }
       startVoiceRecording(idx, voiceMacroRecBtn, { textContent: '', style: {} });
       voiceMacroRecBtn.textContent = 'STOP';
       voiceMacroRecBtn.style.color = '#e94560';
@@ -19592,6 +19848,16 @@ document.getElementById('welcome-start').addEventListener('click', async () => {
       saveData.rigs = [...existingRigs, welcomeRig];
     }
     saveData.activeRigId = welcomeRig.id;
+    // New Flex setup → default to SmartSDR Direct so FT8/SSTV audio streams
+    // straight to the radio with no DAX program and no device config — the
+    // "Local/DAX" default was the #1 "PTT keys but no audio" setup trap
+    // (Casey 2026-06-17 hit it himself). Welcome-only + guarded on unset, so
+    // no existing user's audio source is ever changed.
+    const ct = welcomeRig.catTarget;
+    const isFlex = ct && ct.type === 'tcp' && [5002, 5003, 5004, 5005].includes(ct.port);
+    if (isFlex && currentSettings.audioSource == null) {
+      saveData.audioSource = 'smartsdr';
+    }
   }
 
   await window.api.saveSettings(saveData);
@@ -20562,19 +20828,26 @@ function renderActivatorLog() {
   activatorLogBody.innerHTML = '';
   // Pre-compute the filter for the PREV badge: a call counts as "worked
   // before" only if it has at least one QSO entry that ISN'T from this
-  // activation (today, this park ref). Without this filter, every call
-  // logged in the current session shows PREV the moment it's saved
+  // activation (today, at one of this activation's park refs). Without this,
+  // every call logged in the current session shows PREV the moment it's saved
   // — the freshly-written QSO is already in workedQsos before we render
-  // (Casey: "every call has PREV by it. I know I've not worked every
-  // call previously.").
+  // (Casey: "every call has PREV by it. I know I've not worked every call
+  // previously.").
+  //
+  // CANONICAL logic lives in lib/adif.js → isPriorActivationWork() and is unit
+  // tested in test/activation-log-test.js. It is mirrored inline here because
+  // the renderer cannot require() Node modules — keep the two in sync. Match on
+  // myRef (MY_SIG_INFO — the park I was activating), NOT ref (SIG_INFO, the
+  // other station's park, which is empty for ordinary activation QSOs); the old
+  // code compared ref, so sameRef was never true and every contact showed PREV.
   const todayUtc = new Date().toISOString().slice(0, 10).replace(/-/g, '');
   const currentRefs = activatorParkRefs.map(p => (p.ref || '').toUpperCase());
   function isPriorWork(call) {
     const entries = workedQsos.get(call) || [];
+    if (!entries.length) return false;
     return entries.some((e) => {
-      // Skip entries from today at any of this activation's park refs.
       const sameDay = e.date === todayUtc;
-      const sameRef = currentRefs.includes((e.ref || '').toUpperCase());
+      const sameRef = currentRefs.includes((e.myRef || '').toUpperCase());
       return !(sameDay && sameRef);
     });
   }
@@ -21509,11 +21782,20 @@ async function activatorLogContact() {
 
   // Log each callsign as a separate QSO with identical fields
   for (const callsign of callsigns) {
-    // Pull the operator name from the QRZ cache so it lands in the ADIF
-    // <NAME> field and shows in the in-memory activator log row. The top-bar
-    // display is a span (no value to read), but qrzData has the source
-    // record from when the lookup ran.
-    const qrzInfo = qrzData.get(callsign.split('/')[0].toUpperCase());
+    // Pull the operator name so it lands in the ADIF <NAME> field and the
+    // in-memory log row. The name shown during entry comes from a QRZ lookup
+    // (Tab handler / debounce) that does NOT always populate qrzData, so a
+    // bare cache read here races the on-screen display and frequently misses
+    // — writing an empty NAME to the ADIF even though the operator saw the
+    // name (Casey 2026-06-16: "ADIF NAME column blank"). Read the cache
+    // first, then fall back to an awaited lookup so the name is reliably
+    // resolved before we build the QSO record, and seed the cache for reuse.
+    const bareCall = callsign.split('/')[0].toUpperCase();
+    let qrzInfo = qrzData.get(bareCall);
+    if (!qrzInfo) {
+      try { qrzInfo = await window.api.qrzLookup(callsign); } catch {}
+      if (qrzInfo) qrzData.set(bareCall, qrzInfo);
+    }
     const opName = qrzInfo ? qrzDisplayName(qrzInfo) : '';
     const baseFields = {
       callsign,
@@ -21599,7 +21881,7 @@ async function activatorLogContact() {
       rstSent,
       rstRcvd,
       state: stateVal,
-      name: '',
+      name: opName,
       myParks: [...myParks.map(p => p.ref), ...activatorCrossRefs.map(xr => xr.ref)],
       theirParks: hunterParkRefs.map(p => p.ref),
       qsoData: allQsoData[0], // backward compat
@@ -23105,10 +23387,22 @@ jtcatRxFreqInput.addEventListener('change', function() {
 // start, so a flip here takes effect immediately for a running engine
 // and survives a stop/start cycle.
 const jtcatHoldTxFreqEl = document.getElementById('jtcat-hold-tx-freq');
+const jtcatLateStartTxEl = document.getElementById('jtcat-late-start-tx');
+const jtcatApDecodeEl = document.getElementById('jtcat-ap-decode');
 const jtcatAudioLatencyMsEl = document.getElementById('jtcat-audio-latency-ms');
 if (jtcatHoldTxFreqEl) {
   jtcatHoldTxFreqEl.addEventListener('change', function() {
     window.api.jtcatSetHoldTxFreq(jtcatHoldTxFreqEl.checked);
+  });
+}
+if (jtcatLateStartTxEl) {
+  jtcatLateStartTxEl.addEventListener('change', function() {
+    window.api.jtcatSetLateStartTx(jtcatLateStartTxEl.checked);
+  });
+}
+if (jtcatApDecodeEl) {
+  jtcatApDecodeEl.addEventListener('change', function() {
+    window.api.jtcatSetApDecode(jtcatApDecodeEl.checked);
   });
 }
 const jtcatAudioLatencyAutoBtn = document.getElementById('jtcat-audio-latency-auto');
@@ -23155,6 +23449,8 @@ if (jtcatFt8brCommentEl) {
 // Hydrate from settings on load
 window.api.getSettings().then(function(s) {
   if (jtcatHoldTxFreqEl) jtcatHoldTxFreqEl.checked = !!s.jtcatHoldTxFreq;
+  if (jtcatLateStartTxEl) jtcatLateStartTxEl.checked = s.jtcatLateStartTx !== false;
+  if (jtcatApDecodeEl) jtcatApDecodeEl.checked = s.jtcatApDecode !== false;
   if (jtcatAudioLatencyMsEl) {
     jtcatAudioLatencyMsEl.value = String(s.jtcatAudioLatencyMs || 0);
     if (!s.jtcatAudioLatencyManual) jtcatAudioLatencyMsEl.classList.add('jtcat-auto');
@@ -24189,19 +24485,24 @@ window.api.onJtcatDecode(function(data) {
   jtcatDecodes = data.results || [];
   // Accumulate into the log
   if (jtcatDecodes.length > 0) {
-    var now = new Date();
-    var timeStr = String(now.getUTCHours()).padStart(2, '0') + ':' +
-                  String(now.getUTCMinutes()).padStart(2, '0') + ':' +
-                  String(now.getUTCSeconds()).padStart(2, '0');
+    // Stamp the FT8/FT4 PERIOD START (:00/:15/:30/:45 for FT8), not the
+    // wall-clock moment the decode rendered (~800 ms before the boundary, which
+    // showed :44/:14). Floor to the cycle for the current mode. K3SBP 2026-06-15.
+    var _cycleMs = (data.mode === 'FT2' ? 3800 : data.mode === 'FT4' ? 7500 : 15000);
+    var _b = new Date(Math.floor(Date.now() / _cycleMs) * _cycleMs);
+    var timeStr = String(_b.getUTCHours()).padStart(2, '0') + ':' +
+                  String(_b.getUTCMinutes()).padStart(2, '0') + ':' +
+                  String(_b.getUTCSeconds()).padStart(2, '0');
     jtcatDecodeLog.push({
       cycle: data.cycle,
       time: timeStr,
       mode: data.mode,
       results: jtcatDecodes,
     });
-    // Cap at 10 cycles (~2.5 min). renderJtcatDecodes() rebuilds the entire DOM
-    // from this array on every decode event, so unbounded growth causes both
-    // heap and DOM to expand steadily — the primary source of the memory leak.
+    // Cap at 10 cycles. renderJtcatDecodes() rebuilds the whole DOM from this
+    // array every decode, so unbounded growth leaked heap + DOM indefinitely —
+    // even though this in-window panel is never shown, the handler still runs.
+    // (78hawkeye, PR #54.)
     if (jtcatDecodeLog.length > 10) jtcatDecodeLog.shift();
   }
   // NOTE: sync status is NOT set here. Decodes arriving says nothing about the
@@ -24410,6 +24711,11 @@ async function playJtcatTxAudio(data) {
     // 365ms of symbols (containing the start-of-message Costas array)
     // were missing. Padding instead keeps the envelope intact and gives
     // the rig PTT relay time to fully settle before audio starts.
+    //
+    // Late-start TX (offsetMs past the pad window) is handled UPSTREAM in
+    // main.js: it slices the leading symbols off the buffer and rewrites
+    // offsetMs to a small PTT-settle lead, so by the time the samples reach
+    // here they're already truncated and this pad path just adds the settle.
     var SLOT_AUDIO_START_MS = 500; // WSJT-X convention
     var leadingDelaySec = Math.max(0, (SLOT_AUDIO_START_MS - offsetMs) / 1000);
     var startTime = jtcatTxAudioCtx.currentTime + leadingDelaySec;

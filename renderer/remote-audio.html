@@ -99,8 +99,13 @@ window.api.onStartAudio(async (config) => {
       localStream = await navigator.mediaDevices.getUserMedia({ audio: baseAudio });
     }
 
-    // STUN enables NAT traversal for audio without VPN; empty = local/VPN only
-    const iceServers = config.useStun ? [{ urls: 'stun:stun.l.google.com:19302' }] : [];
+    // ICE servers: prefer the Cloudflare TURN relay creds the desktop minted
+    // (config.iceServers) so a CGNAT phone gets a relayed path; else fall back
+    // to plain STUN (config.useStun), else local/VPN-only. ICE still prefers a
+    // direct candidate when one exists, so TURN never needlessly relays on LAN.
+    const iceServers = (Array.isArray(config.iceServers) && config.iceServers.length)
+      ? config.iceServers
+      : (config.useStun ? [{ urls: 'stun:stun.l.google.com:19302' }] : []);
     pc = new RTCPeerConnection({ iceServers });
 
     // Apply FreeDV mute state to new stream (if engine was already active)
@@ -131,6 +136,30 @@ window.api.onStartAudio(async (config) => {
         });
         // Health monitor follows the sender, not localStream.
         try { startHealthMonitor(kiwiStream); } catch {}
+      }
+    }
+    // SmartSDR-direct mirror of the Kiwi immediate-swap. On a RECONNECT the
+    // bridge rebuilds the peer (startRemoteAudio → remote-audio-start on the
+    // existing window), giving us a fresh sender on the silent DAX-RX
+    // capture (localStream). The per-frame swap in onSmartSdrAudioFrame is
+    // gated on !smartActive, which is stale-true after the first session, so
+    // without re-arming here the new sender never moves onto the live
+    // VITA-49 stream and the iOS user hears NOTHING until they manually tap
+    // "Reconnect audio bridge". Move the new sender onto the existing
+    // synthetic stream right away and reset smartActive so the next frame
+    // re-asserts the swap if the graph still needs (re)building. On a fresh
+    // first connect smartActive is false, so this is a no-op and the
+    // per-frame path behaves exactly as before. K3SBP 2026-06-14.
+    if (smartActive && audioSender) {
+      const smartTrack = ensureSmartTrack();
+      smartActive = false; // re-arm; success below (or the next frame) re-sets it
+      if (smartTrack) {
+        audioSender.replaceTrack(smartTrack)
+          .then(() => { smartActive = true; })
+          .catch((e) => {
+            window.api.sendAudioStatus({ error: 'SmartSDR re-swap on reconnect failed: ' + e.message });
+          });
+        try { startHealthMonitor(smartStream); } catch {}
       }
     }
 
@@ -211,6 +240,34 @@ window.api.onStartAudio(async (config) => {
     pc.onconnectionstatechange = () => {
       const state = pc ? pc.connectionState : 'closed';
       window.api.sendAudioStatus({ connectionState: state });
+    };
+
+    // Report which ICE candidate types won, so the [CAT] log proves whether a
+    // CGNAT session actually relayed through TURN (relay) or found a direct
+    // path (host/srflx). Fires once per session.
+    let _pairReported = false;
+    pc.oniceconnectionstatechange = async () => {
+      if (!pc) return;
+      const st = pc.iceConnectionState;
+      window.api.sendAudioStatus({ iceConnectionState: st });
+      if ((st === 'connected' || st === 'completed') && !_pairReported && pc.getStats) {
+        _pairReported = true;
+        try {
+          const stats = await pc.getStats();
+          let selId = null; const pairs = {}, cands = {};
+          stats.forEach((r) => {
+            if (r.type === 'transport' && r.selectedCandidatePairId) selId = r.selectedCandidatePairId;
+            else if (r.type === 'candidate-pair') pairs[r.id] = r;
+            else if (r.type === 'local-candidate' || r.type === 'remote-candidate') cands[r.id] = r;
+          });
+          let pair = selId && pairs[selId];
+          if (!pair) { for (const id in pairs) { if (pairs[id].nominated && pairs[id].state === 'succeeded') { pair = pairs[id]; break; } } }
+          if (pair) {
+            const lc = cands[pair.localCandidateId] || {}, rc = cands[pair.remoteCandidateId] || {};
+            window.api.sendAudioStatus({ selectedPair: { local: lc.candidateType || '?', remote: rc.candidateType || '?', protocol: lc.protocol || '?' } });
+          }
+        } catch (e) { /* getStats best-effort */ }
+      }
     };
 
     // Create offer (we initiate)

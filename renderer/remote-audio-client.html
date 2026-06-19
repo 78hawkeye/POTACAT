@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Remote Shack Audio</title></head>
+<body>
+<!-- Hidden window: the desktop-as-client WebRTC ANSWERER. Plays the remote
+     shack's rig RX audio and captures the mic for PTT TX. All WebRTC lives in
+     the pure, tested remote-audio-answerer.js module; this shell is just the
+     IPC <-> module wiring + the <audio> sink. See main.js startRemoteClientAudio. -->
+<audio id="rig-audio" autoplay></audio>
+<script src="remote-audio-answerer.js"></script>
+<script>
+'use strict';
+let answerer = null;
+
+function ensureAnswerer() {
+  if (answerer) return answerer;
+  const audioEl = document.getElementById('rig-audio');
+  answerer = new RemoteAudioAnswerer({
+    // Outbound WebRTC (SDP answer / ICE / start-audio) → main → RemoteClient → shack.
+    onSignal: (data) => window.api.outSignal(data),
+    // Rig RX audio → speakers.
+    onTrack: (stream) => { audioEl.srcObject = stream; audioEl.play().catch(() => {}); },
+    onState: (s) => window.api.state(s),
+  });
+  return answerer;
+}
+
+// stun-config can arrive before or after start; ensureAnswerer() handles both.
+window.api.onStunConfig((cfg) => { ensureAnswerer().setIceConfig(cfg); });
+window.api.onStart(() => { ensureAnswerer().start(); });
+window.api.onSignal((data) => { ensureAnswerer().handleSignal(data); });
+window.api.onPtt((on) => { if (answerer) answerer.setMicEnabled(on); });
+window.api.onStop(() => {
+  if (answerer) { answerer.stop(); answerer = null; }
+  const el = document.getElementById('rig-audio');
+  if (el) el.srcObject = null;
+});
+</script>
+</body>
+</html>

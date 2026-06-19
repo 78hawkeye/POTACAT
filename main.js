@@ -276,16 +276,21 @@ const { PskrClient } = require('./lib/pskreporter');
 const { Ft8Engine } = require('./lib/ft8-engine');
 const { checkClockOffset, syncSystemClock } = require('./lib/ntp');
 const JtcatParser = require('./renderer/jtcat-parser'); // shared FT8 message classifier (also a browser global in the renderers)
+const CqTarget = require('./renderer/cq-target'); // shared CQ "chase target" tags + decode-match (also a browser global)
 const { RemoteServer } = require('./lib/remote-server');
-const { RemoteClient } = require('./lib/remote-client');
+const { buildDiagnosticSnapshot } = require('./lib/diagnostic-snapshot');
+const { RemoteClient, tsWssUrl } = require('./lib/remote-client');
 // Linux-only ALSA bridge. On non-Linux, alsa.isAvailable() returns false
 // and every other call is a stable no-op — safe to require unconditionally.
 const alsa = require('./lib/alsa');
 const { fetchSpots: fetchWwffSpots } = require('./lib/wwff');
 const { fetchSpots: fetchTilesSpots, parseFreqKhz: parseTilesFreqKhz, TilesRateLimitError } = require('./lib/tiles');
 const { fetchSpots: fetchLlotaSpots } = require('./lib/llota');
-const { fetchSpots: fetchWwbotaSpots, postSpot: postWwbotaSpot } = require('./lib/wwbota');
+const { fetchSpots: fetchWwbotaSpots, postSpot: postWwbotaSpot, disconnect: wwbotaDisconnect, setLogger: wwbotaSetLogger } = require('./lib/wwbota');
+wwbotaSetLogger(sendCatLog); // surface WWBOTA SSE reconnects/errors in the CAT log (sendCatLog is hoisted)
 const { postWwffRespot } = require('./lib/wwff-respot');
+const { fetchSpots: fetchGmaSpots, postGmaRespot, setLogger: gmaSetLogger } = require('./lib/gma');
+gmaSetLogger(sendCatLog); // surface GMA fetch errors in the CAT log (sendCatLog is hoisted)
 const { fetchNets: fetchDirectoryNets, fetchSwl: fetchDirectorySwl } = require('./lib/directory');
 const { QrzClient } = require('./lib/qrz');
 const { callsignToProgram, fetchParksForProgram, loadParksCache, saveParksCache, isCacheStale, searchParks: searchParksDb, getPark: getParkDb, buildParksMap } = require('./lib/pota-parks-db');
@@ -771,9 +776,13 @@ let _sstvFeedPaused = false;
 // consumer is acceptable; OOM is not.
 // =====================================================================
 const _audioBus = new Map(); // wcId+':'+channel -> { sent, acked, dropped, lastDropLogMs }
-const AUDIO_MAX_BACKLOG = 40; // frames; ~210 ms at 190 fps — survives a
-                              // GC pause without garbling, well below
-                              // the multi-second backlog that leaks.
+const AUDIO_MAX_BACKLOG = 120; // frames; ~640 ms at 190 fps. Bumped from 40
+                              // (2026-06-14): under the added JTCAT-FT8 load
+                              // the old ~210 ms window pinned at the cap and
+                              // dropped ~every frame to the iOS bridge (K3SBP,
+                              // "1875 frames dropped"), starving rig audio.
+                              // 640 ms gives load spikes room while staying
+                              // well below the multi-second backlog that leaks.
 const _jtcatIpAudioReady = new Set();
 
 function audioSafeSend(wc, channel, payload) {
@@ -790,8 +799,9 @@ function audioSafeSend(wc, channel, payload) {
     if (now - info.lastDropLogMs >= 10_000) {
       try {
         // Single CAT log line every 10 s when a consumer is sustaining
-        // a backlog — enough signal to diagnose, no flood.
-        sendCatLog(`[Audio] Backpressure on ${channel}: ${info.dropped} frames dropped (renderer not keeping up)`);
+        // a backlog — enough signal to diagnose, no flood. Name the
+        // renderer (wcId) so we can tell WHICH consumer is behind.
+        sendCatLog(`[Audio] Backpressure on ${channel} (wc#${wc.id}): ${info.dropped} frames dropped, backlog=${info.sent - info.acked} (renderer not keeping up)`);
         if (channel === 'jtcat-vita49-audio' || channel === 'sstv-vita49-audio' || channel === 'smartsdr-audio-frame') {
           appendDiagnosticLog('rsba1-rx-diagnostics.log', `BACKPRESSURE channel=${channel} wc=${wc.id} dropped=${info.dropped} backlog=${info.sent - info.acked}`);
         }
@@ -904,6 +914,7 @@ let spotTimer = null;
 let solarTimer = null;
 let rigctldProc = null;
 let cluster = null; // legacy — replaced by clusterClients Map
+let desktopScanning = false; // mirror of the renderer scan engine's on/off, for ECHOCAT scan-state sync (scan-state-sync-desktop)
 let clusterSpots = []; // streaming DX cluster spots (FIFO, max 500)
 // Non-deduped spot histories so the "spot history" popover can show prior
 // spots of the same callsign (clusterSpots itself is deduped per call+band so
@@ -1242,7 +1253,7 @@ function notifyWatchlistSpot({ callsign, frequency, mode, source, reference, loc
   const freqMHz = (parseFloat(frequency) / 1000).toFixed(3);
   let body = `${freqMHz} MHz`;
   if (mode) body += ` ${mode}`;
-  const sourceLabels = { pota: 'POTA', sota: 'SOTA', wwff: 'WWFF', llota: 'LLOTA', dxc: 'DX Cluster', rbn: 'RBN', pskr: 'FreeDV' };
+  const sourceLabels = { pota: 'POTA', sota: 'SOTA', wwff: 'WWFF', llota: 'LLOTA', gma: 'GMA', dxc: 'DX Cluster', rbn: 'RBN', pskr: 'FreeDV' };
   const label = sourceLabels[source] || source;
   if (reference) {
     body += ` \u2014 ${label} ${reference}`;
@@ -1659,9 +1670,22 @@ function broadcastRigState() {
   broadcastRemoteRadioStatus();
 }
 
+// In-process rolling buffer of the most recent CAT/ECHOCAT log lines. There
+// is no in-memory log today (sendCatLog writes straight through to the
+// renderer over IPC), so the diagnostic-snapshot gatherer had nothing to read
+// — this gives it the last ~200 lines for the bug report's logLines section.
+const _catLogRing = [];
+const CAT_LOG_RING_CAP = 200;
+function getRecentSendCatLog(n) {
+  const count = Math.max(1, Math.min(n || 50, _catLogRing.length));
+  return _catLogRing.slice(-count);
+}
+
 function sendCatLog(msg) {
   const ts = new Date().toISOString().slice(11, 23);
   const line = `[CAT ${ts}] ${msg}`;
+  _catLogRing.push(line);
+  if (_catLogRing.length > CAT_LOG_RING_CAP) _catLogRing.shift();
   try { console.log(line); } catch { /* EPIPE if stdout closed */ }
   if (win && !win.isDestroyed()) win.webContents.send('cat-log', line);
 }
@@ -1686,7 +1710,6 @@ function appendDiagnosticLog(fileName, msg) {
 async function _flushDiagLog() {
   _diagFlushPending = false;
   if (!_diagQueue.length) return;
-  // Drain the full queue into per-file buckets.
   const byFile = new Map();
   while (_diagQueue.length > 0) {
     const { fileName, msg, ts } = _diagQueue.shift();
@@ -1710,6 +1733,106 @@ async function _flushDiagLog() {
       try { console.log(`[diagnostic-log] ${fileName}: ${err.message || err}`); } catch {}
     }
   }
+}
+
+function deriveAudioBridge() {
+  try {
+    const activeRig = (settings.rigs || []).find(r => r && r.id === settings.activeRigId) || null;
+    const isFlex = activeRig && /flex/i.test(activeRig.model || activeRig.name || '');
+    if (isFlex && settings.smartSdrHost) {
+      return 'SmartSDR ' + (settings.smartSdrAudioMode || '').toString().trim() || 'SmartSDR';
+    }
+    if (isFlex) return 'Flex Direct';
+    if (settings.remoteAudioInput || settings.remoteAudioOutput) {
+      return 'WebRTC bridge: ' + (settings.remoteAudioInput || settings.remoteAudioOutput);
+    }
+  } catch {}
+  return null;
+}
+
+function gatherDesktopRawDiagnostic() {
+  const activeRig = (() => { try { return (settings.rigs || []).find(r => r && r.id === settings.activeRigId) || null; } catch { return null; } })();
+  const catTarget = (cat && cat._target) || (settings && settings.catTarget) || null;
+  const catTransport = (() => {
+    if (!catTarget) return null;
+    if (catTarget.host) return `${(catTarget.type || 'tcp').toUpperCase()} ${catTarget.host}${catTarget.port ? ':' + catTarget.port : ''}`;
+    if (catTarget.path) return `${(catTarget.type || 'serial')} ${catTarget.path}`;
+    return null;
+  })();
+  const catConnected = !!(cat && cat.connected);
+
+  let tunnel = null;
+  try { tunnel = cloudTunnel ? cloudTunnel.getState() : null; } catch {}
+  let ts = null;
+  try { const { tailscaleStatus } = require('./lib/remote-server'); ts = tailscaleStatus(); } catch {}
+  let conn = null;
+  try { conn = remoteServer && typeof remoteServer.activeClientContext === 'function' ? remoteServer.activeClientContext() : null; } catch {}
+  let paired = [];
+  try { paired = remoteServer && typeof remoteServer.listPairedDevices === 'function' ? remoteServer.listPairedDevices() : []; } catch {}
+
+  return {
+    account: {
+      signedIn: !!(settings && settings.cloudAccessToken),
+      callsign: settings && settings.myCallsign ? String(settings.myCallsign).toUpperCase() : null,
+      email: settings && settings.cloudEmail ? String(settings.cloudEmail) : '',
+      subscriptionStatus: (settings && settings.cloudSubscriptionStatus) || 'none',
+      subscriptionSource: (settings && settings.cloudSubscriptionSource) || null,
+      subscriptionExpiresAt: (settings && settings.cloudSubscriptionExpiresAt) || null,
+    },
+    connection: {
+      role: 'host',
+      pathTried: [],
+      pathActive: null,
+      remoteAddress: null,
+      latencyMs: null,
+      reconnectsLastHour: 0,
+      passSession: !!(conn && conn.passSession),
+    },
+    pairedDevices: (paired || []).map(d => ({
+      id: d.id, name: d.name, platform: d.platform, lastSeenAt: d.lastSeen || null,
+    })),
+    rig: {
+      configured: !!activeRig,
+      profile: activeRig ? (activeRig.name || activeRig.model || null) : null,
+      catTransport,
+      catStatus: !catTarget ? 'not_configured' : (catConnected ? 'connected' : 'disconnected'),
+      catLastPollAgeMs: null,
+      vfo: _currentMode ? `${(_currentFreqHz / 1000).toFixed(1)} kHz ${_currentMode}` : null,
+      audioBridge: deriveAudioBridge(),
+    },
+    tailscale: {
+      installed: !!(ts && ts.installed),
+      connected: !!(ts && ts.loggedIn),
+      hostname: (ts && ts.hostname) || null,
+      peerCount: null,
+    },
+    cloudTunnel: {
+      enabled: !!(tunnel && tunnel.enabled),
+      status: (tunnel && tunnel.status) || 'off',
+      cloudHost: (tunnel && tunnel.cloudHost) || null,
+      lastHealthCheckAt: (tunnel && tunnel.lastCheckAt) || null,
+    },
+    logLines: getRecentSendCatLog(50),
+  };
+}
+
+function gatherDesktopDiagnostic(requestId, redact) {
+  const platform = {
+    os: process.platform,
+    osVersion: (() => { try { return require('os').release(); } catch { return ''; } })(),
+    deviceModel: null,
+  };
+  return buildDiagnosticSnapshot(
+    {
+      requestId: requestId || '',
+      source: 'desktop',
+      appVersion: (() => { try { return app.getVersion(); } catch { return ''; } })(),
+      platform,
+      timestamp: new Date().toISOString(),
+    },
+    gatherDesktopRawDiagnostic(),
+    { redact: !!redact },
+  );
 }
 
 function appendIcomNetworkDiagnostic(msg) {
@@ -2272,6 +2395,17 @@ function ensureRemoteClient() {
     return;
   }
   tearDownRemoteClient();
+  // Entering remote-client mode: the rig lives on the shack, so stop the local
+  // CAT controller. Otherwise its serial/TCP auto-reconnect loop keeps hammering
+  // a port that isn't ours to drive — Richard KE4WLE saw endless "Opening COM3:
+  // File not found" every 2s after switching to a remote shack. connectCat()
+  // already early-returns in remote mode, but an ALREADY-running `cat` was never
+  // torn down. The user re-selects a local rig (→ connectCat) to come back.
+  if (cat) {
+    try { cat.removeAllListeners(); cat.disconnect(); } catch {}
+    cat = null;
+  }
+  killRigctld();
   remoteClient = new RemoteClient(target, {
     clientVersion: app.getVersion() || '',
     clientPlatform: 'desktop-' + process.platform,
@@ -2305,6 +2439,9 @@ function ensureRemoteClient() {
       win.webContents.send('remote-client-status', { state: 'disconnected', wasAuthed });
       if (wasAuthed) win.webContents.send('cat-status', { connected: false });
     }
+    // Tear the answerer down with the link — its peer is dead and the creds
+    // are tied to this session. A fresh connect re-starts audio explicitly.
+    stopRemoteClientAudio();
   });
   remoteClient.on('kicked', (info) => {
     if (win && !win.isDestroyed()) {
@@ -2345,6 +2482,12 @@ function ensureRemoteClient() {
   remoteClient.on('tune-blocked', ({ reason }) => {
     if (win && !win.isDestroyed()) win.webContents.send('tune-blocked', reason);
   });
+  // Phase 2 audio leg: relay the shack's WebRTC offer/ICE + TURN iceServers
+  // to the hidden answerer window (remote-audio-client.html), which builds
+  // the peer, answers, and plays the rig audio. No-op until the user starts
+  // remote-client audio. See startRemoteClientAudio().
+  remoteClient.on('signal', (data) => { _racSend('rac-signal', data); });
+  remoteClient.on('stun-config', (cfg) => { _racSend('rac-stun-config', cfg); });
   remoteClient.on('alt-hosts', ({ tsHost, cloudHost }) => {
     // Persist refreshed alt hosts on the target row so reconnect
     // attempts use the freshest values after a network change.
@@ -3232,7 +3375,12 @@ function connectCluster() {
     client.connect({
       host: node.host,
       port: node.port,
-      callsign: settings.myCallsign,
+      // Per-node login callsign override. Cluster nodes allow only ONE
+      // connection per callsign, so an op who already feeds a node from their
+      // primary logger under their base call needs POTACAT to log in under a
+      // distinct SSID (e.g. WG9I-2) to run both at once. Blank = base call.
+      // (WG9I 2026-06-13.)
+      callsign: (node.loginCall && node.loginCall.trim()) || settings.myCallsign,
     });
 
     clusterClients.set(node.id, { client, nodeConfig: node });
@@ -4168,7 +4316,7 @@ async function saveQsoRecord(qsoData, opts) {
   // Update worked QSOs map and notify renderer
   if (qsoData.callsign) {
     const call = qsoData.callsign.toUpperCase();
-    const entry = { date: qsoData.qsoDate || '', ref: (qsoData.sigInfo || '').toUpperCase(), band: (qsoData.band || '').toUpperCase(), mode: (qsoData.mode || '').toUpperCase() };
+    const entry = { date: qsoData.qsoDate || '', ref: (qsoData.sigInfo || '').toUpperCase(), myRef: (qsoData.mySigInfo || qsoData.myPotaRef || '').toUpperCase(), band: (qsoData.band || '').toUpperCase(), mode: (qsoData.mode || '').toUpperCase() };
     if (!workedQsos.has(call)) workedQsos.set(call, []);
     workedQsos.get(call).push(entry);
     // Mirror into the richer ragchew-logger index so a freshly-saved QSO
@@ -4411,6 +4559,27 @@ async function saveQsoRecord(qsoData, opts) {
     }
   }
 
+  // Re-spot on GMA if requested. GMA references span many schemes (summit
+  // codes like DL/EW-017, WWFF-style KFF-2112, etc.), so we only sanity-check
+  // that a reference is present and post it as a DX line to the GMA cluster
+  // (cqgma.org:7300), the same way WWFF Spotline re-spots work.
+  if (qsoData.gmaRespot && qsoData.gmaReference && settings.myCallsign) {
+    try {
+      await postGmaRespot({
+        activator: qsoData.callsign,
+        spotter: settings.myCallsign.toUpperCase(),
+        frequency: qsoData.frequency,
+        reference: qsoData.gmaReference,
+        mode: qsoData.mode,
+        comments: qsoData.respotComment || '',
+      });
+      trackRespot('gma');
+    } catch (respotErr) {
+      console.error('GMA re-spot failed:', respotErr.message);
+      return { success: true, gmaRespotError: respotErr.message };
+    }
+  }
+
   // Spot on DX Cluster if requested
   if (qsoData.dxcRespot) {
     try {
@@ -4635,7 +4804,7 @@ function connectWsjtx() {
         String(now.getUTCMonth() + 1).padStart(2, '0') +
         String(now.getUTCDate()).padStart(2, '0');
       // Update workedQsos (callsign tracking)
-      const entry = { date: qsoDate, ref: spot ? (spot.reference || '').toUpperCase() : '', band, mode };
+      const entry = { date: qsoDate, ref: spot ? (spot.reference || '').toUpperCase() : '', myRef: '', band, mode };
       if (!workedQsos.has(call)) workedQsos.set(call, []);
       workedQsos.get(call).push(entry);
       if (win && !win.isDestroyed()) win.webContents.send('worked-qsos', [...workedQsos.entries()]);
@@ -4786,6 +4955,19 @@ function parseCqMessage(text) {
   return JtcatParser.parseCq(text);
 }
 
+// HH:MM:SS UTC of the current FT8/FT4 PERIOD START (:00/:15/:30/:45 for FT8's
+// 15 s, :00/:07.5/… for FT4's 7.5 s). Decodes are produced ~800 ms before the
+// next boundary, so stamping wall-clock showed :44/:14 instead of the period
+// start; floor to the cycle so phone/desktop time columns read like WSJT-X.
+// K3SBP 2026-06-15.
+function jtcatPeriodUtc(mode) {
+  const cycleMs = mode === 'FT2' ? 3800 : mode === 'FT4' ? 7500 : 15000;
+  const d = new Date(Math.floor(Date.now() / cycleMs) * cycleMs);
+  return String(d.getUTCHours()).padStart(2, '0') + ':' +
+         String(d.getUTCMinutes()).padStart(2, '0') + ':' +
+         String(d.getUTCSeconds()).padStart(2, '0');
+}
+
 function broadcastAutoCqState() {
   const state = { mode: jtcatAutoCqMode, workedCount: jtcatAutoCqWorkedSession.size };
   if (jtcatPopoutWin && !jtcatPopoutWin.isDestroyed()) {
@@ -4794,6 +4976,57 @@ function broadcastAutoCqState() {
   if (remoteServer && remoteServer.hasClient()) {
     remoteServer.broadcastJtcatAutoCqState(state);
   }
+}
+
+// ─── Chase Target ───────────────────────────────────────────────────────────
+// One shared preference (settings.jtcatChaseTarget, '' = none) that drives both
+// the outgoing CQ tag and the incoming decode highlight, in BOTH the JTCAT
+// popout and the ECHOCAT phone. Last-writer-wins; the central setter persists
+// and rebroadcasts so the surfaces stay in sync. See renderer/cq-target.js.
+
+// Push the current chase target to popout + phone (mirrors broadcastAutoCqState).
+function broadcastChaseTarget() {
+  const state = { tag: settings.jtcatChaseTarget || '' };
+  if (jtcatPopoutWin && !jtcatPopoutWin.isDestroyed()) {
+    jtcatPopoutWin.webContents.send('jtcat-chase-target', state);
+  }
+  if (remoteServer && remoteServer.hasClient()) {
+    remoteServer.broadcastJtcatChaseTarget(state);
+  }
+}
+
+// Central setter — validates, persists, syncs the other surfaces. Called from
+// the popout IPC and the phone WS handler.
+function applyChaseTarget(rawTag) {
+  const v = CqTarget.validateTag(rawTag);
+  if (!v.ok) { sendCatLog('[JTCAT] Chase target rejected: ' + (v.reason || rawTag)); return false; }
+  if ((settings.jtcatChaseTarget || '') === v.tag) { broadcastChaseTarget(); return true; }
+  settings.jtcatChaseTarget = v.tag;
+  saveSettings(settings);
+  updateRemoteSettings();
+  broadcastChaseTarget();
+  sendCatLog('[JTCAT] Chase target set: ' + (v.tag || '(none)'));
+  return true;
+}
+
+// Build the per-cycle chase context: the current target plus the cty-backed
+// helpers matchesDecode needs. Resolve the target prefix → entity ONCE here, not
+// per decode. Returns null when there's no target (caller skips flagging).
+function buildChaseContext() {
+  const target = settings.jtcatChaseTarget || '';
+  if (!target) return null;
+  let homeContinent = '';
+  let targetEntityName = null;
+  if (ctyDb) {
+    const me = settings.myCallsign ? resolveCallsign(settings.myCallsign, ctyDb) : null;
+    if (me) homeContinent = me.continent || '';
+    const cls = CqTarget.classifyTarget(target);
+    if (cls.kind === 'dxcc') {
+      const e = resolveCallsign(cls.tag, ctyDb);
+      targetEntityName = e ? e.name : null;
+    }
+  }
+  return { target, helpers: { homeContinent, targetEntityName } };
 }
 
 // ─── Full Auto CQ (ULTRACAT) ────────────────────────────────────────────────
@@ -4823,6 +5056,11 @@ function broadcastFullAutoCqState() {
   }
 }
 
+// CQ TX message builder — delegates to the shared module (renderer/cq-target.js)
+// so the popout CQ button, the phone CQ button, and Full Auto CQ re-arm all
+// produce the same protocol-legal string.
+const buildCqTxMsg = CqTarget.buildCqTxMsg;
+
 // Build a fresh CQ QSO object and start transmitting. Returns the QSO or null
 // if callsign/grid/engine aren't ready. Shared by re-arm; mirrors the manual
 // CQ button's message build.
@@ -4830,8 +5068,7 @@ function jtcatBuildCqQso(modifier) {
   const myCall = (settings.myCallsign || '').toUpperCase();
   const myGrid = (settings.grid || '').toUpperCase().substring(0, 4);
   if (!myCall || !myGrid || !ft8Engine) return null;
-  const mod = (modifier || '').toUpperCase().replace(/[^A-Z]/g, '').substring(0, 4);
-  const txMsg = mod ? 'CQ ' + mod + ' ' + myCall + ' ' + myGrid : 'CQ ' + myCall + ' ' + myGrid;
+  const txMsg = buildCqTxMsg(myCall, myGrid, modifier);
   const nextSlot = ft8Engine._lastRxSlot === 'even' ? 'odd' : 'even';
   ft8Engine.setTxSlot(nextSlot);
   const qso = { mode: 'cq', call: null, grid: null, phase: 'cq', txMsg,
@@ -5177,10 +5414,37 @@ function startJtcat(mode) {
         ft8Engine.setAudioLatencyMs(settings.jtcatAudioLatencyMs);
       } else {
         ft8Engine.setAudioLatencyAuto(true);
+        // Seed the auto loop from the last persisted value so a restart
+        // (band/mode change, QSY — each builds a fresh engine) starts warm
+        // instead of re-converging from zero. This is what the persist
+        // handler below always intended ("apply it immediately") but the
+        // apply only ever ran for manual pins. K3SBP 2026-06-14.
+        if (typeof ft8Engine.seedAudioLatencyMs === 'function' &&
+            typeof settings.jtcatAudioLatencyMs === 'number') {
+          ft8Engine.seedAudioLatencyMs(settings.jtcatAudioLatencyMs);
+        }
       }
     }
     if (typeof ft8Engine.setHoldTxFreq === 'function') {
       ft8Engine.setHoldTxFreq(!!settings.jtcatHoldTxFreq);
+    }
+    // Late-start TX (WSJT-X waveform-truncation parity). Default ON — it's
+    // standards-compliant and only helps (a reply that would otherwise miss
+    // the cycle still goes out, decodable via the receiver's middle/end
+    // Costas + AP). Explicit false disables for strict slot-boundary parity.
+    if (typeof ft8Engine.setLateStartTx === 'function') {
+      ft8Engine.setLateStartTx(settings.jtcatLateStartTx !== false);
+    }
+    // AP (a priori) decode — RX mirror of late-start TX. Default ON. myCall is
+    // authoritative here; the engine auto-derives the QSO partner (dxCall) from
+    // its TX message. Recovers marginal/late replies addressed to us.
+    if (typeof ft8Engine.setApContext === 'function') {
+      const apOn = settings.jtcatApDecode !== false;
+      const apCall = (settings.myCallsign || '').toUpperCase();
+      ft8Engine.setApContext({ enabled: apOn, myCall: apCall });
+      sendCatLog(apOn && apCall
+        ? `[JTCAT] AP decode armed for ${apCall} (recovers weak/late replies addressed to you)`
+        : `[JTCAT] AP decode off${apOn && !apCall ? ' — set your callsign to enable it' : ''}`);
     }
   }
 
@@ -5220,10 +5484,18 @@ function startJtcat(mode) {
   ft8Engine.on('decode', async (data) => {
     // Enrich decodes with "needed" flags for call roster
     if (data.results) {
+      // Surface AP (a priori) recoveries — decodes the plain pass missed,
+      // pulled in by hypothesizing our call. These are the marginal/late
+      // replies the receive-side parity feature exists to catch.
+      const apDecodes = data.results.filter(r => r && r.ap);
+      if (apDecodes.length) {
+        sendCatLog(`[JTCAT] AP recovered ${apDecodes.length} decode${apDecodes.length > 1 ? 's' : ''} the plain decoder missed: ${apDecodes.map(r => `"${(r.text || '').trim()}"`).join(', ')}`);
+      }
       const currentBand = _currentFreqHz ? freqToBand(_currentFreqHz / 1e6) : null;
       // Parse watchlist for matching
       const wlStr = (settings.watchlist || '').toUpperCase();
       const wlCalls = wlStr ? wlStr.split(',').map(s => s.trim().split(':')[0]).filter(Boolean) : [];
+      const chaseCtx = buildChaseContext();
       for (const r of data.results) {
         const { dxCall } = extractCallsigns(r.text || '');
         if (!dxCall) continue;
@@ -5246,6 +5518,8 @@ function startJtcat(mode) {
           r.grid = gm[1].toUpperCase();
           r.newGrid = !rosterWorkedGrids.has(r.grid);
         }
+        // Chase target highlight (renderer/cq-target.js). One rule for popout + phone.
+        if (chaseCtx) r.chaseMatch = CqTarget.matchesDecode(chaseCtx.target, r, chaseCtx.helpers);
       }
     }
 
@@ -5263,10 +5537,7 @@ function startJtcat(mode) {
     }
     // Broadcast to phone + advance remote QSO state machine
     if (remoteServer && remoteServer.hasClient()) {
-      const now = new Date();
-      const timeStr = String(now.getUTCHours()).padStart(2, '0') + ':' +
-                      String(now.getUTCMinutes()).padStart(2, '0') + ':' +
-                      String(now.getUTCSeconds()).padStart(2, '0');
+      const timeStr = jtcatPeriodUtc(data.mode);
       const sliceBand = jtcatManager ? jtcatManager.getDialFreq('default').band : '';
       remoteServer.broadcastJtcatDecode({ ...data, time: timeStr, sliceId: 'default', band: sliceBand });
     }
@@ -5487,6 +5758,25 @@ function startJtcat(mode) {
     const catState = cat ? `connected=${cat.connected}` : 'cat=null';
     console.log(`[JTCAT] TX start requested — message: ${data.message}, ${catState}`);
     logIcomNetworkAudio(`FT8 TX: ${data.message} freq=${data.freq}Hz slot=${data.slot} ${catState}`);
+
+    // Late-start TX (WSJT-X waveform truncation). When the engine fires past
+    // the 500ms pad window it attaches data.lateStart. We can't pad the
+    // envelope back to slot+500ms (that moment is gone), so slice the leading
+    // symbols off the pre-rendered buffer HERE — once, at the dispatch choke
+    // point — and rewrite offsetMs to a small PTT-settle lead. Every audio
+    // route below (SmartSDR direct, Icom network, renderer DAX, failsafe)
+    // then plays the already-truncated buffer with its existing leading-
+    // silence math, prepending only the settle. The buffer TAIL is untouched,
+    // so PTT-off still lands at slot+13.14s and never trails into the
+    // responder's next slot — the distinction from the reverted 2026-05-08
+    // pad-and-play-full-buffer-late path. The leading Costas array is
+    // sacrificed; the receiver re-syncs on the middle/end Costas arrays.
+    if (data.lateStart && data.samples && data.samples.length) {
+      const before = data.samples.length;
+      data.samples = Ft8Engine.sliceLateStartBuffer(data.samples, data.lateStart, 12000);
+      data.offsetMs = Math.round(500 - data.lateStart.leadingDelaySec * 1000);
+      sendCatLog(`[JTCAT] Late-start TX: truncated waveform ${before}→${data.samples.length} samples (skipped ${data.lateStart.playOffsetSec.toFixed(2)}s of leading symbols), tail preserved so PTT-off stays on time; routes prepend ${500 - data.offsetMs}ms PTT settle`);
+    }
     const smartSdrDirectTxOk = settings.audioSource === 'smartsdr' &&
                                smartSdrAudio &&
                                smartSdrAudio.connected &&
@@ -5728,6 +6018,48 @@ function broadcastJtcatTuneState() {
   }
 }
 
+// True when TX audio must go straight to the radio as VITA-49 dax_tx (Flex
+// SmartSDR-Direct / DAX-free), bypassing any Windows audio device. Same gate
+// the FT8 TX path uses (ft8Engine 'tx-audio' handler).
+function jtcatDirectTxActive() {
+  return settings.audioSource === 'smartsdr' &&
+         smartSdrAudio && smartSdrAudio.connected && smartSdrAudio.txReady;
+}
+
+// Direct-dax_tx Tune tone. The renderer's startJtcatTuneAudio() plays a 1500 Hz
+// tone to a Windows OUTPUT DEVICE (settings.remoteAudioOutput) — the legacy DAX
+// program route. On the DAX-free SmartSDR-Direct path there is NO such device in
+// the loop (FT8 TX already bypasses it via smartSdrAudio.sendTxAudio), so the
+// renderer tone goes nowhere and the carrier never reaches the Flex even though
+// PTT keys. K3SBP 2026-06-15: "Flex + POTACAT doesn't send any audio on PTT."
+// Fix: stream the tone straight to dax_tx, mirroring the FT8 path.
+let _jtcatTuneTxTimer = null;
+let _jtcatTunePhase = 0;
+const JTCAT_TUNE_FREQ_HZ = 1500;   // matches WSJT-X tune tone + the renderer path
+const JTCAT_TUNE_AMP = 0.5;        // moderate steady level; operator sets drive on the rig
+function _startDirectTuneTone() {
+  if (_jtcatTuneTxTimer) return;
+  const RATE = 24000, CHUNK_MS = 20;
+  const n = Math.round(RATE * CHUNK_MS / 1000); // 480 mono samples / chunk
+  const dPhase = 2 * Math.PI * JTCAT_TUNE_FREQ_HZ / RATE;
+  _jtcatTunePhase = 0;
+  _jtcatTuneTxTimer = setInterval(() => {
+    if (!smartSdrAudio || !smartSdrAudio.txReady) return;
+    const buf = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      buf[i] = JTCAT_TUNE_AMP * Math.sin(_jtcatTunePhase);
+      _jtcatTunePhase += dPhase;
+      if (_jtcatTunePhase > 2 * Math.PI) _jtcatTunePhase -= 2 * Math.PI;
+    }
+    try { smartSdrAudio.pushTxAudioChunk(buf); } catch {}
+  }, CHUNK_MS);
+}
+function _stopDirectTuneTone() {
+  if (_jtcatTuneTxTimer) { clearInterval(_jtcatTuneTxTimer); _jtcatTuneTxTimer = null; }
+  _jtcatTunePhase = 0;
+  if (smartSdrAudio && smartSdrAudio.resetTxStream) { try { smartSdrAudio.resetTxStream(); } catch {} }
+}
+
 function startJtcatTune() {
   if (jtcatTuneState.active) return;
   const directIcomReady = settings.audioSource === 'icom-network' &&
@@ -5746,7 +6078,13 @@ function startJtcatTune() {
   // SSB-over-DATA where appropriate (USB -> DIGU mute the rig mic during
   // the tone). The 90s timer auto-releases.
   handleRemotePtt(true, { audio: true });
-  if (jtcatTuneState.directIcom) {
+  // Route the tone the same way FT8 TX is routed: straight to dax_tx on the
+  // SmartSDR-Direct path, then the Icom RS-BA1 network path, else the
+  // renderer's Windows-DAX device path.
+  if (jtcatDirectTxActive()) {
+    _startDirectTuneTone();
+    sendCatLog('[JTCAT] Tune tone → DAX TX direct (VITA-49)');
+  } else if (jtcatTuneState.directIcom) {
     const networkTxGain = getIcomNetworkTxGain();
     const tunePeak = getIcomNetworkTunePeak();
     const tone = makeSineToneSamples(1500, JTCAT_TUNE_DURATION_S, ICOM_NETWORK_TX_SAMPLE_RATE, tunePeak);
@@ -5781,6 +6119,7 @@ function stopJtcatTune() {
   jtcatTuneState.active = false;
   if (jtcatTuneState.endTimer) { clearTimeout(jtcatTuneState.endTimer); jtcatTuneState.endTimer = null; }
   if (jtcatTuneState.tickTimer) { clearInterval(jtcatTuneState.tickTimer); jtcatTuneState.tickTimer = null; }
+  _stopDirectTuneTone(); // no-op unless the Flex SmartSDR-Direct path was used
   const wasDirectIcom = jtcatTuneState.directIcom;
   jtcatTuneState.directIcom = false;
   if (wasDirectIcom && _icomNetworkTransport) {
@@ -5981,6 +6320,13 @@ function connectSmartSdr() {
       // routes to the dedicated audio connection (no SmartSDR to do it).
       const ch = parseInt(settings.audioDaxChannel, 10) || 1;
       smartSdr.setSliceDax(index, ch);
+      // As the GUI head, an 8000-series Flex plays this slice on its
+      // built-in speaker. Hunters don't want that — mute the onboard
+      // monitor audio unless the operator opted in (flexOnboardSpeaker).
+      // DAX is upstream-independent, so RX audio for JTCAT/SSTV is unaffected.
+      const onboard = !!settings.flexOnboardSpeaker;
+      smartSdr.setOnboardAudioMute(index, !onboard);
+      sendCatLog(`Flex Direct: radio speaker ${onboard ? 'ON' : 'muted'} (slice ${index} audio_mute=${onboard ? 0 : 1})`);
     } else {
       // Bound mode: the host GUI client (SmartSDR-Win / AetherSDR) already
       // configured DAX; we're just following its active slice. The UI's CAT
@@ -6185,6 +6531,21 @@ function startSmartSdrAudio() {
   }
   sendCatLog(`[SmartSDR-Audio] Starting audio client → ${sdrHost}:4992 (DAX RX ${daxChannel}, bind ${guiClientId})`);
   smartSdrAudio.start(sdrHost, daxChannel, guiClientId);
+  // Bind the RX slice to our DAX channel so the dax_rx stream actually carries
+  // audio. In Flex Direct (self) the slice-ready handler already does this; in
+  // BOUND mode POTACAT used to ASSUME the host GUI client (SmartSDR / AetherSDR)
+  // had configured DAX — but if its active slice isn't on our channel, dax_rx
+  // arrives silent and JTCAT/SSTV decode nothing (K3SBP 2026-06-18: SmartSDR
+  // open + bound, Slice A had no DAX channel → feedAudio all zeros, 0 decodes,
+  // and the stall-restart loop couldn't recover because it never set DAX).
+  // Owning this binding is the whole point of SmartSDR Direct, so set it
+  // ourselves. Use the followed slice if known, else slice 0 (single-slice
+  // default). This also makes the dax_rx stall→re-subscribe path self-heal.
+  if (smartSdr && smartSdr.mode === 'bound' && typeof smartSdr.setSliceDax === 'function') {
+    const sliceIdx = smartSdr.ourSliceIndex != null ? smartSdr.ourSliceIndex : 0;
+    smartSdr.setSliceDax(sliceIdx, daxChannel);
+    sendCatLog(`[SmartSDR-Audio] Bound slice ${sliceIdx} → DAX channel ${daxChannel} for RX audio (no longer assuming the host set it)`);
+  }
 }
 
 function stopSmartSdrAudio() {
@@ -6480,10 +6841,6 @@ function resetIcomNetworkRxDiagnostics(reason = 'reset') {
     sampleRates: new Map(),
     stalled: false,
     stallStartMs: 0,
-    // Per-second throttle state for noisy per-packet log entries:
-    _seqLogLastMs: 0,
-    _seqLogCount: 0,
-    _skipLogLastMs: 0,
   };
   appendDiagnosticLog('rsba1-rx-diagnostics.log', `--- ${reason}; activeProfile=${settings && settings.activeProfile || ''}; audioSource=${settings && settings.audioSource || ''}; catTarget=${settings && settings.catTarget && settings.catTarget.type || ''} ---`);
 }
@@ -6729,24 +7086,10 @@ function noteIcomNetworkRxDiagnostics(frame, pcm, sampleRate, peak) {
     if (track.missingRecovered) d.missingRecovered++;
     if (track.duplicate) d.duplicates++;
     if (track.largeGap) d.largeGaps++;
-    // Throttle per-packet RX-SEQ entries to at most one log line per second.
-    // During a recovery burst, hundreds of consecutive packets all have
-    // missingAdded/recovered flags — logging each one individually was
-    // triggering ~200 appendFileSync calls/second that stalled the event loop
-    // and prevented UDP processing, creating a feedback loop that crashed the app.
-    // The counters above (seqGapEvents, missingAdded, etc.) accumulate correctly
-    // regardless; the RX-SUMMARY every 10s provides the aggregated view.
     if (track.missingAdded || track.missingRecovered || track.largeGap) {
-      d._seqLogCount = (d._seqLogCount || 0) + 1;
-      const logThis = track.largeGap || !d._seqLogLastMs || now - d._seqLogLastMs >= 1000;
-      if (logThis) {
-        const skipped = d._seqLogCount - 1;
-        const msg = `RX-SEQ frame=${_icomNetworkAudioFrameCount} seq=${frame.packetSeq ?? '-'} audioSeq=${frame.audioSeq ?? '-'} missingAdded=${track.missingAdded || 0} pending=${track.pendingMissing || 0} recovered=${track.missingRecovered ? 1 : 0} duplicate=${track.duplicate ? 1 : 0} largeGap=${track.largeGap ? 1 : 0} payload=${frame.payloadBytes ?? '-'} peak=${(peak || 0).toFixed(4)}${skipped > 0 ? ` [+${skipped} similar suppressed]` : ''}`;
-        appendDiagnosticLog('rsba1-rx-diagnostics.log', msg);
-        if (track.missingAdded || track.largeGap) sendCatLog(`[Icom-Network-Audio] ${msg}`);
-        d._seqLogLastMs = now;
-        d._seqLogCount = 0;
-      }
+      const msg = `RX-SEQ frame=${_icomNetworkAudioFrameCount} seq=${frame.packetSeq ?? '-'} audioSeq=${frame.audioSeq ?? '-'} missingAdded=${track.missingAdded || 0} pending=${track.pendingMissing || 0} recovered=${track.missingRecovered ? 1 : 0} duplicate=${track.duplicate ? 1 : 0} largeGap=${track.largeGap ? 1 : 0} payload=${frame.payloadBytes ?? '-'} peak=${(peak || 0).toFixed(4)}`;
+      appendDiagnosticLog('rsba1-rx-diagnostics.log', msg);
+      if (track.missingAdded || track.largeGap) sendCatLog(`[Icom-Network-Audio] ${msg}`);
     }
   }
 
@@ -6773,13 +7116,7 @@ function handleIcomNetworkAudioFrame(frame) {
   const track = frame.rxTrack || {};
 
   if (track.duplicate || track.missingRecovered) {
-    // Throttled — see RX-SEQ note above. One log line per second max.
-    const d = _icomNetworkRxDiag;
-    const now = Date.now();
-    if (d && (!d._skipLogLastMs || now - d._skipLogLastMs >= 1000)) {
-      appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-SKIP-LATE frame=${_icomNetworkAudioFrameCount} seq=${frame.packetSeq ?? '-'} recovered=${track.missingRecovered ? 1 : 0} duplicate=${track.duplicate ? 1 : 0} payload=${frame.payloadBytes ?? '-'}`);
-      d._skipLogLastMs = now;
-    }
+    appendDiagnosticLog('rsba1-rx-diagnostics.log', `RX-SKIP-LATE frame=${_icomNetworkAudioFrameCount} seq=${frame.packetSeq ?? '-'} recovered=${track.missingRecovered ? 1 : 0} duplicate=${track.duplicate ? 1 : 0} payload=${frame.payloadBytes ?? '-'}`);
     return;
   }
   if (track.largeGap) {
@@ -7073,6 +7410,7 @@ function panadapterWantsSource(source) {
     case 'rbn':     return settings.panadapterRbn === true;
     case 'cwspots': return settings.panadapterCwSpots === true;
     case 'pskr':    return settings.panadapterPskr === true;
+    case 'gma':     return settings.panadapterGma === true;
     default:        return false;
   }
 }
@@ -7338,6 +7676,10 @@ function updateRemoteSettings() {
     // retry ceiling so the phone's matching control shows the same value.
     ultracat: !!settings.ultracat,
     jtcatMaxQsoAttempts: jtcatMaxQsoRetries(),
+    // Chase target — the entity/tag the operator is chasing. Rides the auth-ok
+    // blob so a (re)connecting phone seeds its picker; live changes come via the
+    // jtcat-chase-target S2C message.
+    jtcatChaseTarget: settings.jtcatChaseTarget || '',
     enableAtu: !!settings.enableAtu,
     tuneClick: !!settings.tuneClick,
     enableRotor: !!settings.enableRotor,
@@ -8398,7 +8740,7 @@ function connectRemote() {
   // Surface our package version in the v1 protocol `hello` so connected
   // clients can show "POTACAT desktop 1.5.13" and decide whether to
   // suggest an update.
-  try { remoteServer._serverVersion = String(app.getVersion() || ''); } catch {}
+  try { remoteServer._serverVersion = String(getAppDisplayVersion() || ''); } catch {}
   // Active rig model surfaced in the v1 server `hello` so POTACAT
   // desktop clients (Remote Radios panel) can distinguish multiple
   // paired shacks. Empty when no rig configured — falls back to
@@ -8561,6 +8903,19 @@ function connectRemote() {
     handleRemotePtt(state);
   });
 
+  // Scan on/off sync (scan-state-sync-desktop). The scan engine lives in the
+  // renderer, so these inbound peer messages are forwarded over IPC.
+  remoteServer.on('scan-control', ({ action }) => {
+    // Mobile asks us to start/stop the desktop scan. The renderer acts and
+    // then emits scan-state-changed, which broadcasts the new state back.
+    if (win && !win.isDestroyed()) win.webContents.send('remote-scan-control', { action });
+  });
+  remoteServer.on('peer-scan-state', ({ scanning }) => {
+    // Mobile's engine changed. Forward for mutual exclusion (one rig: if the
+    // phone started scanning, the desktop stops its own) + button reflection.
+    if (win && !win.isDestroyed()) win.webContents.send('remote-peer-scan-state', { scanning });
+  });
+
   remoteServer.on('client-connected', ({ deviceId, profileCallsign } = {}) => {
     // Cancel any pending teardown — the phone came back inside the
     // grace window, so the engine kept running and we're whole.
@@ -8570,6 +8925,9 @@ function connectRemote() {
       sendCatLog('[Echo CAT] Phone reconnected during grace window — engine survived.');
     }
     broadcastRemoteRadioStatus();
+    // Seed the (re)connecting phone with the desktop's current scan state so a
+    // mid-scan reconnect shows the in-progress scan (scan-state-sync-desktop).
+    remoteServer.sendToClient({ type: 'scan-state', scanning: desktopScanning });
     // Send current source toggles to phone
     remoteServer.sendSourcesToClient({
       pota: settings.enablePota !== false,
@@ -8632,7 +8990,7 @@ function connectRemote() {
     // Sync voice macros to phone
     ensureVoiceMacroDir();
     const vmLabels = settings.voiceMacroLabels || [];
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < VOICE_MACRO_MAX; i++) {
       const p = voiceMacroPath(i);
       if (fs.existsSync(p)) {
         const audio = fs.readFileSync(p).toString('base64');
@@ -8708,6 +9066,9 @@ function connectRemote() {
   remoteServer.on('client-disconnected', () => {
     if (win && !win.isDestroyed()) {
       win.webContents.send('remote-status', { connected: false });
+      // Phone gone — clear any mirrored "phone is scanning" state so the
+      // desktop Scan button doesn't stay stuck showing the peer's scan.
+      win.webContents.send('remote-peer-scan-state', { scanning: false });
     }
     // Stop the in-process spectrum loop — only mobile would have
     // subscribed it, and mobile re-subscribes on reconnect via the
@@ -9719,6 +10080,23 @@ function connectRemote() {
     }
   });
 
+  // Unified Bug Report: the mobile app requests a desktop snapshot to fill
+  // the DESKTOP section of a shared report (see work/.../desktop-request-
+  // diagnostic-responder.md). Guest gating already happened in the server;
+  // here we gather live state and reply. ALWAYS reply (even on error) so the
+  // phone doesn't strand on its 5s timeout.
+  remoteServer.on('request-diagnostic', ({ requestId, redact }) => {
+    try {
+      remoteServer.sendDiagnosticSnapshot(gatherDesktopDiagnostic(requestId, redact));
+    } catch (err) {
+      try { appendDiagnosticLog('diagnostic.log', `[diag] gather failed: ${err.message || err}`); } catch {}
+      remoteServer.sendDiagnosticSnapshot({
+        type: 'diagnostic-snapshot', requestId: requestId || '', source: 'desktop',
+        error: String((err && err.message) || err),
+      });
+    }
+  });
+
   remoteServer.on('get-activation-map-data', ({ parkRef, date, contacts }) => {
     try {
       // Look up park coordinates
@@ -10107,7 +10485,7 @@ function connectRemote() {
     else stopInProcessSpectrum();
   });
 
-  remoteServer.on('jtcat-call-cq', async () => {
+  remoteServer.on('jtcat-call-cq', async ({ modifier } = {}) => {
     if (!ft8Engine) return;
     const myCall = remoteJtcatMyCall();
     const myGrid = remoteJtcatMyGrid();
@@ -10121,7 +10499,10 @@ function connectRemote() {
     }
     // Auto-place TX on quiet frequency from FFT analysis
     ft8Engine.setTxFreq(jtcatQuietFreq);
-    const txMsg = 'CQ ' + myCall + ' ' + myGrid;
+    // Honor the phone's chase tag (the bare-CQ gap fix). Falls back to the
+    // shared chase target if the phone didn't send one. Same builder as the
+    // popout + Full Auto CQ so all three agree and clamp identically.
+    const txMsg = buildCqTxMsg(myCall, myGrid, modifier != null ? modifier : (settings.jtcatChaseTarget || ''));
     // TX on next available slot
     const nextSlot = ft8Engine._lastRxSlot === 'even' ? 'odd' : (ft8Engine._lastRxSlot === 'odd' ? 'even' : 'even');
     ft8Engine.setTxSlot(nextSlot);
@@ -10249,6 +10630,11 @@ function connectRemote() {
     if (mode === 'off') jtcatAutoCqWorkedSession.clear();
     broadcastAutoCqState();
     console.log('[JTCAT Remote] Auto-CQ mode:', mode);
+  });
+
+  // Chase target from the phone — shared, last-writer-wins (see applyChaseTarget).
+  remoteServer.on('jtcat-set-chase-target', ({ tag } = {}) => {
+    applyChaseTarget(tag);
   });
 
   remoteServer.on('jtcat-halt-tx', () => {
@@ -10498,7 +10884,7 @@ function connectRemote() {
     ensureVoiceMacroDir();
     if (audio) fs.writeFileSync(voiceMacroPath(idx), Buffer.from(audio, 'base64'));
     if (label != null) {
-      if (!settings.voiceMacroLabels) settings.voiceMacroLabels = ['', '', '', '', ''];
+      if (!settings.voiceMacroLabels) settings.voiceMacroLabels = new Array(VOICE_MACRO_MAX).fill('');
       settings.voiceMacroLabels[idx] = label;
       saveSettings(settings);
     }
@@ -10637,9 +11023,21 @@ function connectRemote() {
       // working direct connection. NOTE: STUN alone still won't traverse
       // CGNAT/symmetric NAT (e.g. cellular) — that needs a TURN relay
       // (see the cloud-audio-turn-relay work item).
-      remoteServer.sendToClient({ type: 'stun-config', useStun: settings.remoteStun !== false });
-      // Phone requested audio — create or restart hidden audio window
-      startRemoteAudio();
+      // Send the STUN config immediately so the client can begin negotiating
+      // right away — and so audio still works if the relay mint is slow or
+      // unavailable. Then mint a Cloudflare TURN relay (Cloud path only) and
+      // re-send stun-config carrying the iceServers; the client adopts them
+      // (setConfiguration) before its ICE gather, and our own audio bridge
+      // picks them up from _buildAudioBridgeConfig() once the mint resolves.
+      // _mintTurnCredentials() is a fast no-op off the Cloud path, so LAN /
+      // Tailscale sessions keep starting audio with zero added latency.
+      // K3SBP 2026-06-14 (cloud-audio-turn-relay, Model A).
+      _sendStunConfig(); // immediate: useStun (+ iceServers if already fresh)
+      (async () => {
+        const ice = await _mintTurnCredentials();
+        if (ice) _sendStunConfig(); // follow-up: now carries the relay creds
+        startRemoteAudio();         // bridge OFFERER builds its PC with them
+      })();
       return;
     }
     if (remoteAudioWin && !remoteAudioWin.isDestroyed()) {
@@ -11002,6 +11400,205 @@ function broadcastRemoteRadioStatus() {
   remoteServer.broadcastRadioStatus(status);
 }
 
+// --- Cloud TURN relay credentials (cloud-audio-turn-relay) ----------------
+// CGNAT / symmetric-NAT clients (cellular, WISP) can't reach the rig audio
+// via STUN hole-punching — WebRTC media needs a TURN relay. The cloud mints
+// short-lived Cloudflare TURN ICE servers at GET /v1/turn/credentials
+// (auth-only). Per the handoff's "Model A", the DESKTOP fetches once per
+// audio session and hands the iceServers to the phone over the existing WS
+// stun-config message AND uses them in our own audio bridge — both peers use
+// the same creds (CF TURN creds authorize *use* of the relay, not a peer),
+// which keeps Guest-Pass phones (no cloud login) working. Only minted when
+// Cloud is the active path; on LAN/Tailscale we skip it. ICE still prefers a
+// direct pair when one exists, so this never needlessly relays (or bills).
+let _turnIceServers = null;   // last minted iceServers array (null = none)
+let _turnExpiresAt = 0;       // ms epoch the current grant expires
+let _turnRemintTimer = null;  // setTimeout handle for the pre-expiry re-mint
+
+function _turnCloudActive() {
+  return !!(
+    settings.remoteTurn !== false &&               // opt-out hook (default on)
+    settings.cloudAccessToken &&                    // signed in to Cloud
+    cloudTunnel && cloudTunnel.getState().enabled   // Cloud Tunnel is the path
+  );
+}
+
+// Fetch + cache TURN creds. Resolves to the iceServers array on success,
+// null on any failure (caller falls back to STUN-only). Never throws.
+async function _mintTurnCredentials() {
+  if (!_turnCloudActive()) return null;
+  const sync = cloudIpc && cloudIpc.getCloudSync();
+  if (!sync) return null;
+  try {
+    // Bound the fetch so a slow/hung cloud call can't stall audio start.
+    const resp = await Promise.race([
+      sync._authedRequest('GET', '/v1/turn/credentials'),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000)),
+    ]);
+    if (!resp || !Array.isArray(resp.iceServers) || !resp.iceServers.length) {
+      sendCatLog('[TURN] mint returned no iceServers — audio stays STUN-only');
+      return null;
+    }
+    _turnIceServers = resp.iceServers;
+    // Use the ACTUAL expiry, never a hardcoded hour: a cached grant can have
+    // only minutes left (server serves cached until ~10 min before expiry).
+    _turnExpiresAt = Number(resp.expiresAt) ||
+      (Date.now() + (Number(resp.ttl) || 3600) * 1000);
+    const remainMin = Math.max(0, Math.round((_turnExpiresAt - Date.now()) / 60000));
+    sendCatLog(`[TURN] relay creds minted${resp.cached ? ' (cached)' : ''} — ${resp.iceServers.length} ICE servers, ~${remainMin} min left` +
+      (typeof resp.dailyRemainingMb === 'number' ? `, ${resp.dailyRemainingMb} MB/day left` : ''));
+    _scheduleTurnRemint();
+    return _turnIceServers;
+  } catch (err) {
+    const m = (err && err.message) || String(err);
+    if (/turn_daily_limit/.test(m)) {
+      sendCatLog('[TURN] daily relay limit reached — audio falls back to STUN-only');
+    } else {
+      sendCatLog(`[TURN] relay unavailable (${m}) — audio falls back to STUN-only`);
+    }
+    _turnIceServers = null;
+    _turnExpiresAt = 0;
+    return null;
+  }
+}
+
+// Re-mint shortly before the grant expires so a >1h session keeps a fresh
+// relay ready for the next (re)connect. We do NOT renegotiate a healthy live
+// PC — fresh creds matter only at the next ICE gather — so this just refreshes
+// the stored creds and re-pushes stun-config. The server caches per user, so
+// repeat mints are cheap.
+function _scheduleTurnRemint() {
+  _stopTurnRemint();
+  if (!_turnExpiresAt) return;
+  const fireInMs = _turnExpiresAt - Date.now() - 5 * 60 * 1000; // 5 min early
+  if (fireInMs <= 0) return; // already inside the margin; next start re-mints
+  _turnRemintTimer = setTimeout(async () => {
+    _turnRemintTimer = null;
+    if (!remoteAudioWin || remoteAudioWin.isDestroyed()) return; // no live audio
+    const ice = await _mintTurnCredentials();
+    if (ice) _sendStunConfig();
+  }, fireInMs);
+}
+
+function _stopTurnRemint() {
+  if (_turnRemintTimer) { clearTimeout(_turnRemintTimer); _turnRemintTimer = null; }
+}
+
+// Tell the client how to build its ICE config. Carries the legacy useStun
+// bool (old clients) PLUS the full iceServers array + remaining TTL when a
+// relay is minted. iceTtlMs is computed from the real expiry, not assumed.
+function _sendStunConfig() {
+  const msg = { type: 'stun-config', useStun: settings.remoteStun !== false };
+  if (_turnIceServers && _turnExpiresAt > Date.now()) {
+    msg.iceServers = _turnIceServers;
+    msg.iceTtlMs = Math.max(0, _turnExpiresAt - Date.now());
+  }
+  remoteServer.sendToClient(msg);
+}
+
+// --- Remote-client audio (desktop-as-client answerer; remote-desktop Phase 2) ---
+// When this desktop is operating ANOTHER shack (RemoteClient active), this
+// hidden window runs the WebRTC ANSWERER: it plays the remote shack's rig
+// audio and sends our mic for PTT. The shack is the offerer and treats us
+// like any client; TURN relay creds arrive via stun-config (Model A), so
+// CGNAT-on-both-ends audio relays automatically. Signaling is relayed through
+// RemoteClient (the 'signal'/'stun-config' forwarders in ensureRemoteClient).
+let remoteAudioClientWin = null;
+// The answerer window loads async. The shack only sends stun-config/offer in
+// response to our start-audio (sent post-load), so in practice they arrive
+// after the window is ready — but a dropped stun-config means STUN-only and a
+// dead double-CGNAT session, so we make it bulletproof: queue rac-* until
+// did-finish-load, then flush in order. _racReady gates the queue.
+let _racReady = false;
+let _racQueue = [];
+function _racSend(channel, payload) {
+  if (!remoteAudioClientWin || remoteAudioClientWin.isDestroyed()) return;
+  if (!_racReady) { _racQueue.push([channel, payload]); return; }
+  remoteAudioClientWin.webContents.send(channel, payload);
+}
+
+async function startRemoteClientAudio() {
+  if (!remoteClient) { sendCatLog('[remote-client-audio] no active remote shack to listen to'); return; }
+  if (process.platform === 'darwin') {
+    const { systemPreferences } = require('electron');
+    if (systemPreferences.getMediaAccessStatus('microphone') !== 'granted') {
+      try { await systemPreferences.askForMediaAccess('microphone'); } catch {}
+    }
+  }
+  if (remoteAudioClientWin && !remoteAudioClientWin.isDestroyed()) {
+    remoteAudioClientWin.webContents.send('rac-start'); // re-arm an existing window
+    return;
+  }
+  _racReady = false;
+  _racQueue = [];
+  remoteAudioClientWin = new BrowserWindow({
+    width: 320, height: 200, show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload-remote-audio-client.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      autoplayPolicy: 'no-user-gesture-required',
+      backgroundThrottling: false,
+    },
+  });
+  remoteAudioClientWin.webContents.session.setPermissionRequestHandler((_wc, _perm, cb) => cb(true));
+  // Chromium can mute getUserMedia in a never-shown window — show off-screen.
+  remoteAudioClientWin.setPosition(-9999, -9999);
+  remoteAudioClientWin.showInactive();
+  remoteAudioClientWin.loadFile(path.join(__dirname, 'renderer', 'remote-audio-client.html'));
+  remoteAudioClientWin.webContents.on('did-finish-load', () => {
+    if (!remoteAudioClientWin || remoteAudioClientWin.isDestroyed()) return;
+    remoteAudioClientWin.webContents.send('rac-start');
+    // Window is live — flush any rac-* that raced ahead of the load.
+    _racReady = true;
+    const q = _racQueue; _racQueue = [];
+    for (const [ch, payload] of q) {
+      try { remoteAudioClientWin.webContents.send(ch, payload); } catch {}
+    }
+  });
+  remoteAudioClientWin.on('closed', () => { remoteAudioClientWin = null; _racReady = false; _racQueue = []; });
+  sendCatLog('[remote-client-audio] answerer started');
+}
+
+function stopRemoteClientAudio() {
+  if (remoteAudioClientWin && !remoteAudioClientWin.isDestroyed()) {
+    try { remoteAudioClientWin.webContents.send('rac-stop'); } catch {}
+    try { remoteAudioClientWin.close(); } catch {}
+  }
+  remoteAudioClientWin = null;
+  _racReady = false;
+  _racQueue = [];
+}
+
+// IPC (registered once at load). app.js starts/stops listening + PTT; the
+// answerer window relays its outbound WebRTC signaling back to the shack.
+ipcMain.on('rac-out-signal', (_e, data) => { if (remoteClient && data) remoteClient.sendSignal(data); });
+ipcMain.on('rac-state', (_e, s) => {
+  if (!s) return;
+  if (s.error) sendCatLog('[remote-client-audio] ' + s.error);
+  // Relay diagnostics — make the double-CGNAT verification self-evident in the
+  // [CAT] log instead of "no audio, no idea why".
+  if (s.adopted) {
+    sendCatLog(`[remote-client-audio] adopted ${s.adopted.servers} ICE servers (${s.adopted.relay} relay/TURN)` +
+      (s.adopted.relay === 0 ? ' — STUN-only, double-CGNAT will NOT connect' : ''));
+  }
+  if (s.selectedPair) {
+    const p = s.selectedPair;
+    const relayed = (p.local === 'relay' || p.remote === 'relay');
+    sendCatLog(`[remote-client-audio] ICE connected via ${p.local}/${p.remote} (${p.protocol})` +
+      (relayed ? ' — RELAY (double-CGNAT path working)' : ' — direct'));
+  }
+  if (s.iceConnectionState === 'failed') {
+    sendCatLog('[remote-client-audio] ICE FAILED — no working path (check TURN/relay; both ends behind CGNAT need relay creds)');
+  }
+});
+ipcMain.handle('remote-client-audio-start', () => { startRemoteClientAudio(); return { ok: true }; });
+ipcMain.handle('remote-client-audio-stop', () => { stopRemoteClientAudio(); return { ok: true }; });
+ipcMain.on('remote-client-audio-ptt', (_e, on) => {
+  if (remoteAudioClientWin && !remoteAudioClientWin.isDestroyed()) remoteAudioClientWin.webContents.send('rac-ptt', !!on);
+  if (remoteClient) remoteClient.sendPtt(!!on);
+});
+
 // --- Remote Audio (hidden BrowserWindow for WebRTC) ---
 // Single source of truth for the config payload sent to the audio bridge
 // renderer on every (re)start. Both the "window already open" hot path
@@ -11017,6 +11614,10 @@ function _buildAudioBridgeConfig() {
     inputDeviceId:  settings.remoteAudioInput  || '',
     outputDeviceId: settings.remoteAudioOutput || '',
     useStun:        settings.remoteStun !== false, // default ON — see stun-config note above
+    // Cloud TURN relay creds (when minted) so the desktop audio bridge — the
+    // WebRTC OFFERER — gathers a relay candidate too, not just the phone.
+    // Stale/expired creds are withheld so the bridge falls back to STUN.
+    iceServers:     (_turnIceServers && _turnExpiresAt > Date.now()) ? _turnIceServers : undefined,
     audioSource:    settings.audioSource || 'dax',
     daxTxDirect,
     // TX EQ + compressor — applied in the bridge renderer to mic audio
@@ -11114,6 +11715,9 @@ async function startRemoteAudio() {
 }
 
 function destroyRemoteAudioWindow() {
+  // No live audio → stop chasing TURN re-mints (and let stale creds lapse so
+  // the next session mints fresh). The cache means a quick reconnect is cheap.
+  _stopTurnRemint();
   if (remoteAudioWin && !remoteAudioWin.isDestroyed()) {
     try { remoteAudioWin.webContents.send('remote-audio-stop'); } catch { /* may be destroyed */ }
     try { remoteAudioWin.close(); } catch { /* ignore */ }
@@ -11707,6 +12311,62 @@ function processWwffSpots(raw) {
   return [...seen.values()];
 }
 
+// GMA (Global Mountain Activity). lib/gma.js normalizes the cqgma.org feed
+// into the same WWFF-style records this consumes, so the mapping mirrors
+// processWwffSpots. GMA re-publishes WWFF/other spots alongside its own
+// references; cross-source dedupe (gma in _DEDUPE_PRIORITY + PROGRAM_PRIORITY)
+// collapses overlaps with the dedicated WWFF/SOTA sources. (Luk 2026-06-13.)
+function processGmaSpots(raw) {
+  const myPos = gridToLatLon(settings.grid);
+  const all = raw.map((s) => {
+    const freqKhz = s.frequency_khz;
+    const freqMHz = freqKhz / 1000;
+    const callsign = s.activator || '';
+    const lat = s.latitude != null ? parseFloat(s.latitude) : null;
+    const lon = s.longitude != null ? parseFloat(s.longitude) : null;
+    const haveLatLon = lat != null && lon != null && !isNaN(lat) && !isNaN(lon);
+
+    let distance = null, spotBearing = null;
+    if (myPos && haveLatLon) {
+      distance = Math.round(haversineDistanceMiles(myPos.lat, myPos.lon, lat, lon));
+      spotBearing = Math.round(bearing(myPos.lat, myPos.lon, lat, lon));
+    }
+
+    let continent = '', gmaLocationDesc = '';
+    if (ctyDb && callsign) {
+      const entity = resolveCallsign(callsign, ctyDb);
+      if (entity) {
+        continent = entity.continent || '';
+        gmaLocationDesc = entity.name || '';
+      }
+    }
+
+    const spotTime = s.spot_time ? new Date(s.spot_time * 1000).toISOString() : '';
+
+    return {
+      source: 'gma',
+      callsign,
+      frequency: String(freqKhz),
+      freqMHz,
+      mode: (s.mode || '').toUpperCase(),
+      reference: s.reference || '',
+      parkName: s.reference_name || '',
+      locationDesc: gmaLocationDesc,
+      distance,
+      bearing: spotBearing,
+      lat: haveLatLon ? lat : null,
+      lon: haveLatLon ? lon : null,
+      band: freqToBand(freqMHz),
+      spotTime,
+      continent,
+    };
+  });
+  // Dedupe: keep latest spot per callsign+band (allows multi-band activations)
+  const seen = new Map();
+  for (const s of all) { seen.set(s.callsign + '_' + s.band, s); }
+  return [...seen.values()];
+}
+
 // Tiles polling has its own cadence, decoupled from the user's spot-
 // refresh interval — the tilesontheair.com operator foots the Supabase
 // Edge Function bill, and aggregate POTACAT polling drove a quota
@@ -12051,7 +12711,10 @@ function getActiveNetSpots() {
 // `sources` array listing every source that reported it. Sources outside this
 // map (rbn / pskr / freedv / net) pass through untouched — they're per-skimmer
 // reception reports, not "the same spot from another spotter".
-const _DEDUPE_PRIORITY = { pota: 0, sota: 1, llota: 2, wwff: 3, cwspots: 4, dxc: 5 };
+// gma sits just below wwff: it re-publishes WWFF/other spots, so when the same
+// call+freq comes from both the dedicated WWFF/SOTA source and GMA, the native
+// source stays primary and GMA is folded in as an additional `sources` entry.
+const _DEDUPE_PRIORITY = { pota: 0, sota: 1, llota: 2, wwff: 3, gma: 4, cwspots: 5, dxc: 6 };
 
 function dedupeCrossSource(spots) {
   const groups = new Map();
@@ -12190,6 +12853,8 @@ async function refreshSpots() {
     // care about bunker spots can untick in Settings → Spots.
     const enableWwbota = settings.enableWwbota !== false || panadapterWantsSource('wwbota');
     const enableTiles = settings.enableTiles !== false || panadapterWantsSource('tiles');
+    // GMA defaults OFF — opt-in, niche (mountain/summit) program. (Luk 2026-06-13.)
+    const enableGma = settings.enableGma === true || panadapterWantsSource('gma');
 
     const fetches = [];
     if (enablePota) fetches.push(fetchPotaSpots().then(processPotaSpots));
@@ -12197,6 +12862,8 @@ async function refreshSpots() {
     if (enableWwff) fetches.push(fetchWwffSpots().then(processWwffSpots));
     if (enableLlota) fetches.push(fetchLlotaSpots().then(processLlotaSpots));
     if (enableWwbota) fetches.push(fetchWwbotaSpots().then(processWwbotaSpots));
+    else wwbotaDisconnect(); // close the SSE stream when WWBOTA is off (idempotent)
+    if (enableGma) fetches.push(fetchGmaSpots().then(processGmaSpots));
     if (enableTiles) {
       // Tiles fetch with operator-friendly cadence + since-incremental
       // polling + 429 backoff. See TILES_POLL_MS comment block above
@@ -12275,7 +12942,11 @@ async function refreshSpots() {
     // Priority order is "what the operator most likely cares about
     // logging first": POTA > SOTA > WWFF > LLOTA > Tiles. Adjust here
     // if community usage shifts. (Casey 2026-05-04.)
-    const PROGRAM_PRIORITY = ['pota', 'sota', 'wwff', 'llota', 'wwbota', 'tiles'];
+    // gma is last — as an aggregator it's the least-authoritative source for a
+    // ref also reported by POTA/SOTA/WWFF, so a native program wins the primary
+    // slot and GMA decorates as gmaReference. A GMA-only ref is still primary
+    // (it's the only member of its group). (Luk 2026-06-13.)
+    const PROGRAM_PRIORITY = ['pota', 'sota', 'wwff', 'llota', 'wwbota', 'tiles', 'gma'];
     const SECONDARY_FIELDS = {
       pota: { ref: 'potaReference', name: 'potaParkName' },
       sota: { ref: 'sotaReference', name: 'sotaParkName' },
@@ -12283,6 +12954,7 @@ async function refreshSpots() {
       llota: { ref: 'llotaReference', name: 'llotaParkName' },
       wwbota: { ref: 'wwbotaReference', name: 'wwbotaParkName' },
       tiles: { ref: 'tilesReference', name: 'tilesParkName' },
+      gma: { ref: 'gmaReference', name: 'gmaParkName' },
     };
     const programSpots = allSpots.filter(s => PROGRAM_PRIORITY.includes(s.source));
     const otherSpots = allSpots.filter(s => !PROGRAM_PRIORITY.includes(s.source));
@@ -12600,6 +13272,8 @@ function isCallWorkedToday(callUc) {
 const WORKED_PARKS_LOCAL_PATH = path.join(app.getPath('userData'), 'worked-parks-local.json');
 
 // Voice macro file storage (shared between desktop and ECHOCAT)
+// Up to VOICE_MACRO_MAX slots (0..MAX-1); most users use the first ~8.
+const VOICE_MACRO_MAX = 25;
 const VOICE_MACRO_DIR = path.join(app.getPath('userData'), 'voice-macros');
 function ensureVoiceMacroDir() { if (!fs.existsSync(VOICE_MACRO_DIR)) fs.mkdirSync(VOICE_MACRO_DIR, { recursive: true }); }
 function voiceMacroPath(idx) { return path.join(VOICE_MACRO_DIR, `macro-${idx}.webm`); }
@@ -15209,7 +15883,7 @@ async function redeemPairLinkUrl(rawUrl) {
   // because cloud-only carries the most latency).
   const candidates = [];
   if (lanHost) candidates.push({ leg: 'lan', wssUrl: lanHost, pin: fingerprint });
-  if (tsHost) candidates.push({ leg: 'tailscale', wssUrl: `wss://${tsHost}:7300`, pin: fingerprint });
+  if (tsHost) candidates.push({ leg: 'tailscale', wssUrl: tsWssUrl(tsHost), pin: fingerprint });
   if (cloudHost) candidates.push({ leg: 'cloud', wssUrl: `wss://${cloudHost}`, pin: '' }); // CA-signed CF edge
   if (candidates.length === 0) throw new Error('pair link has no host fields');
 
@@ -18321,8 +18995,7 @@ app.whenReady().then(() => {
       sendCatLog(`[JTCAT] CQ aborted — ${!myCall ? 'callsign not set' : 'grid not set'} in Settings`);
       return;
     }
-    const mod = (modifier || '').toUpperCase().replace(/[^A-Z]/g, '').substring(0, 4);
-    const txMsg = mod ? 'CQ ' + mod + ' ' + myCall + ' ' + myGrid : 'CQ ' + myCall + ' ' + myGrid;
+    const txMsg = buildCqTxMsg(myCall, myGrid, modifier != null ? modifier : (settings.jtcatChaseTarget || ''));
     // TX on opposite slot from last decode; default to 'even' if no decodes yet
     const nextSlot = ft8Engine._lastRxSlot === 'even' ? 'odd' : 'even';
     ft8Engine.setTxSlot(nextSlot);
@@ -18346,6 +19019,11 @@ app.whenReady().then(() => {
     if (mode === 'off') jtcatAutoCqWorkedSession.clear();
     broadcastAutoCqState();
     console.log('[JTCAT Popout] Auto-CQ mode:', mode);
+  });
+
+  // Chase target from the popout — shared, last-writer-wins (see applyChaseTarget).
+  ipcMain.on('jtcat-popout-set-chase-target', (_e, tag) => {
+    applyChaseTarget(tag);
   });
 
   // ULTRACAT unlock state from the main window — forward to the popout so its
@@ -18566,6 +19244,23 @@ app.whenReady().then(() => {
       if (!ok) return;
       require('electron').shell.openExternal(url);
     } catch { /* silent — invalid URL or load failure */ }
+  });
+
+  // Scan engine (renderer) transitions → mirror + broadcast scan-state to the
+  // ECHOCAT client. The renderer only fires this on an actual on↔off change,
+  // so there's no feedback loop with the mutual-exclusion stop. (scan-state-sync-desktop)
+  ipcMain.on('scan-state-changed', (_e, scanning) => {
+    desktopScanning = !!scanning;
+    if (remoteServer && remoteServer.running) {
+      remoteServer.sendToClient({ type: 'scan-state', scanning: desktopScanning });
+    }
+  });
+  // Desktop Scan button pressed while only the PHONE is scanning → ask the
+  // phone to stop (full symmetry; mobile mirrors this for the desktop).
+  ipcMain.on('scan-control-send', (_e, action) => {
+    if (remoteServer && remoteServer.running) {
+      remoteServer.sendToClient({ type: 'scan-control', action: String(action || '') });
+    }
   });
 
   ipcMain.on('rotate-to', (_e, azimuth) => {
@@ -19965,7 +20660,7 @@ app.whenReady().then(() => {
     const shack = authz.shack;
     const candidates = [];
     if (shack.lanHost) candidates.push({ leg: 'lan', wssUrl: shack.lanHost, pin: shack.fingerprint });
-    if (shack.tsHost) candidates.push({ leg: 'tailscale', wssUrl: `wss://${shack.tsHost}:7300`, pin: shack.fingerprint });
+    if (shack.tsHost) candidates.push({ leg: 'tailscale', wssUrl: tsWssUrl(shack.tsHost), pin: shack.fingerprint });
     if (shack.cloudHost) candidates.push({ leg: 'cloud', wssUrl: `wss://${shack.cloudHost}`, pin: '' });
     if (candidates.length === 0) {
       return { error: 'Shack has no reachable hosts on file. Ask it to come online once so it can update its hosts.' };
@@ -20376,6 +21071,17 @@ app.whenReady().then(() => {
     if (status.connectionState && remoteServer) {
       remoteServer.broadcastRadioStatus({ audioState: status.connectionState });
     }
+    // Relay diagnostics for the [CAT] log — the offerer (shack) side of the
+    // double-CGNAT proof. Mirrors the answerer's rac-state logging.
+    if (status.selectedPair) {
+      const p = status.selectedPair;
+      const relayed = (p.local === 'relay' || p.remote === 'relay');
+      sendCatLog(`[Echo CAT Audio] ICE connected via ${p.local}/${p.remote} (${p.protocol})` +
+        (relayed ? ' — RELAY (CGNAT path working)' : ' — direct'));
+    }
+    if (status.iceConnectionState === 'failed') {
+      sendCatLog('[Echo CAT Audio] ICE FAILED — no working path (CGNAT clients need TURN relay creds)');
+    }
     if (status.error) {
       console.error('[Echo CAT Audio] Error:', status.error);
     }
@@ -20549,6 +21255,8 @@ app.whenReady().then(() => {
       (has('smartSdrHost') && newSettings.smartSdrHost !== settings.smartSdrHost);
 
     const audioSourceChanged = has('audioSource') && newSettings.audioSource !== settings.audioSource;
+
+    const flexOnboardSpeakerChanged = has('flexOnboardSpeaker') && newSettings.flexOnboardSpeaker !== settings.flexOnboardSpeaker;
 
     const tciChanged = (has('tciSpots') && newSettings.tciSpots !== settings.tciSpots) ||
       (has('tciHost') && newSettings.tciHost !== settings.tciHost) ||
@@ -20737,6 +21445,14 @@ app.whenReady().then(() => {
     // — desktop rig editor left smartSdr disconnected, tunes ignored.
     if (smartSdrChanged || wsjtxChanged || cwKeyerChanged || remoteChanged || activeRigChanged) {
       connectSmartSdr(); // needsSmartSdr() decides whether to actually connect
+    }
+
+    // Live toggle of the Flex onboard speaker (Flex Direct only). Apply to
+    // the slice POTACAT owns without a reconnect; bound mode leaves the
+    // host GUI client's audio routing alone.
+    if (flexOnboardSpeakerChanged && smartSdr && smartSdr.mode === 'self' && smartSdr.ourSliceIndex != null) {
+      smartSdr.setOnboardAudioMute(smartSdr.ourSliceIndex, !settings.flexOnboardSpeaker);
+      sendCatLog(`Flex Direct: radio speaker ${settings.flexOnboardSpeaker ? 'ON' : 'muted'} (live)`);
     }
 
     // DAX-free audio path: start / stop the dedicated non-GUI audio
@@ -21811,6 +22527,20 @@ app.whenReady().then(() => {
       remoteServer.sendToClient({ type: 'jtcat-hold-tx-state', enabled: settings.jtcatHoldTxFreq });
     }
   });
+  ipcMain.on('jtcat-set-late-start-tx', (_e, enabled) => {
+    settings.jtcatLateStartTx = !!enabled;
+    saveSettings(settings);
+    if (ft8Engine && typeof ft8Engine.setLateStartTx === 'function') {
+      ft8Engine.setLateStartTx(settings.jtcatLateStartTx);
+    }
+  });
+  ipcMain.on('jtcat-set-ap-decode', (_e, enabled) => {
+    settings.jtcatApDecode = !!enabled;
+    saveSettings(settings);
+    if (ft8Engine && typeof ft8Engine.setApContext === 'function') {
+      ft8Engine.setApContext({ enabled: settings.jtcatApDecode, myCall: settings.myCallsign || '' });
+    }
+  });
   ipcMain.on('jtcat-enable-tx', (_e, enabled) => { if (ft8Engine) ft8Engine._txEnabled = enabled; });
   ipcMain.on('jtcat-halt-tx', () => {
     if (jtcatFullAutoCq) stopFullAutoCq('Halt TX');
@@ -22073,6 +22803,7 @@ app.whenReady().then(() => {
           const currentBand = s.freqKhz ? freqToBand(s.freqKhz / 1000) : null;
           const wlStr = (settings.watchlist || '').toUpperCase();
           const wlCalls = wlStr ? wlStr.split(',').map(w => w.trim().split(':')[0]).filter(Boolean) : [];
+          const chaseCtx = buildChaseContext();
           for (const r of data.results) {
             r.sliceId = s.sliceId;
             r.band = currentBand || s.band || '';
@@ -22094,6 +22825,7 @@ app.whenReady().then(() => {
               r.grid = gm[1].toUpperCase();
               r.newGrid = !rosterWorkedGrids.has(r.grid);
             }
+            if (chaseCtx) r.chaseMatch = CqTarget.matchesDecode(chaseCtx.target, r, chaseCtx.helpers);
           }
         }
         // Forward to popout
@@ -22101,10 +22833,7 @@ app.whenReady().then(() => {
           jtcatPopoutWin.webContents.send('jtcat-decode', { ...data, sliceId: s.sliceId, band: s.band });
         }
         if (remoteServer && remoteServer.hasClient()) {
-          const now = new Date();
-          const timeStr = String(now.getUTCHours()).padStart(2, '0') + ':' +
-                          String(now.getUTCMinutes()).padStart(2, '0') + ':' +
-                          String(now.getUTCSeconds()).padStart(2, '0');
+          const timeStr = jtcatPeriodUtc(data.mode);
           remoteServer.broadcastJtcatDecode({ ...data, sliceId: s.sliceId, band: s.band, time: timeStr });
         }
         // Advance QSO state machine from this slice's decodes
@@ -22938,7 +23667,7 @@ app.whenReady().then(() => {
   ipcMain.handle('voice-macro-list', () => {
     ensureVoiceMacroDir();
     const filled = [];
-    for (let i = 0; i < 5; i++) { if (fs.existsSync(voiceMacroPath(i))) filled.push(i); }
+    for (let i = 0; i < VOICE_MACRO_MAX; i++) { if (fs.existsSync(voiceMacroPath(i))) filled.push(i); }
     return filled;
   });
 
@@ -23051,6 +23780,7 @@ function gracefulCleanup() {
   try { ft8brBridge.stop(); } catch {}
   try { if (potaSync) potaSync.stop(); } catch {}
   try { if (cloudTunnel) cloudTunnel.shutdown(); } catch {}
+  try { wwbotaDisconnect(); } catch {}
   killRigctld();
 }
 

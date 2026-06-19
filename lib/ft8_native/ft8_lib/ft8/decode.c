@@ -326,6 +326,11 @@ static void ftx_normalize_logl(float* log174)
 
 bool ftx_decode_candidate(const ftx_waterfall_t* wf, const ftx_candidate_t* cand, int max_iterations, ftx_message_t* message, ftx_decode_status_t* status)
 {
+    return ftx_decode_candidate_ap(wf, cand, max_iterations, NULL, NULL, message, status);
+}
+
+bool ftx_decode_candidate_ap(const ftx_waterfall_t* wf, const ftx_candidate_t* cand, int max_iterations, const uint8_t* ap_mask, const uint8_t* ap_bits, ftx_message_t* message, ftx_decode_status_t* status)
+{
     float log174[FTX_LDPC_N]; // message bits encoded as likelihood
     if (wf->protocol == FTX_PROTOCOL_FT4)
     {
@@ -337,6 +342,26 @@ bool ftx_decode_candidate(const ftx_waterfall_t* wf, const ftx_candidate_t* cand
     }
 
     ftx_normalize_logl(log174);
+
+    // A priori injection: after normalization (so it isn't washed out by the
+    // variance rescale), clamp the likelihood of known bits. bp_decode() takes
+    // a hard decision of (log174[n] > 0) -> bit 1, so a strong positive value
+    // forces bit 1 and a strong negative value forces bit 0. The magnitude
+    // (40) dominates the ~sqrt(24) normalized scale without overflowing the
+    // tanh/atanh message passing. AP shrinks the unknown-bit count; the CRC
+    // gate below still has to pass, so a wrong hypothesis simply fails to
+    // decode rather than producing a bogus message.
+    if (ap_mask != NULL)
+    {
+        const float kApLogl = 40.0f;
+        for (int i = 0; i < FTX_LDPC_N; ++i)
+        {
+            if (ap_mask[i])
+            {
+                log174[i] = ap_bits[i] ? kApLogl : -kApLogl;
+            }
+        }
+    }
 
     uint8_t plain174[FTX_LDPC_N]; // message bits (0/1)
     bp_decode(log174, max_iterations, plain174, &status->ldpc_errors);

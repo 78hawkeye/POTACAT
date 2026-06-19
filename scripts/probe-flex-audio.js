@@ -119,6 +119,17 @@ async function probeMixer() {
   // silent, then UN-mute and pause 2 s so audio resumes audibly before
   // the next test. The console prints the test letter before firing.
   const tests = [
+    // Round 6: the per-slice monitor mute. This sits UPSTREAM of all three
+    // onboard outputs (speaker + headphone + lineout) and the remote-audio
+    // stream, and is independent of the DAX tap — the SmartSDR "MUT" button.
+    // If this silences the 8600 front-panel speaker, it confirms the
+    // setOnboardAudioMute() fix in lib/smartsdr.js. Tests slice 0 (index A),
+    // the slice Flex Direct restores; change the index if yours differs.
+    {
+      label: 'M: slice set 0 audio_mute=1   (vs   audio_mute=0)  <-- the fix',
+      mute:    'slice set 0 audio_mute=1',
+      unmute:  'slice set 0 audio_mute=0',
+    },
     {
       label: 'A: mixer headphone mute 1   (vs   mixer headphone mute 0)',
       mute:    'mixer headphone mute 1',

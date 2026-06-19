@@ -157,6 +157,8 @@
   let gainNode = null;   // GainNode for RX volume
   let txGainNode = null; // GainNode for TX mic level
   let rxAnalyser = null; // AnalyserNode for RX metering
+  let rxSource = null;   // MediaStreamAudioSourceNode tapping the remote track
+  let rxDestConnected = false; // is rxAnalyser → audioCtx.destination wired?
   let txAnalyser = null; // AnalyserNode for TX metering
   let meterAnimFrame = null; // requestAnimationFrame ID for meter rendering
   let volBoostLevel = 0; // 0=1x, 1=2x, 2=3x
@@ -579,6 +581,8 @@
   let ft8UserScrolled = false; // true when user has scrolled up in decode log
   let ft8CqFilter = false;     // CQ-only filter
   let ft8WantedFilter = false; // Wanted-only filter (new DXCC/grid/call)
+  let ft8ChaseFilter = false;  // Chase-only filter (matches the chase target)
+  let ft8ChaseTarget = '';     // chase tag ('' = none); shared with the desktop
   let ft8SortSignal = false;   // Sort decodes by signal strength
   let ft8SearchFilter = '';    // Text search filter
   let ft8TxFreqHz = 1500;      // TX frequency in Hz (for waterfall marker)
@@ -1123,6 +1127,8 @@
           echoSettings = msg.settings;
           myCallsign = msg.settings.myCallsign || '';
           phoneGrid = msg.settings.grid || phoneGrid;
+          // Seed the chase-target picker from the desktop's current value.
+          if (typeof window.__ft8ReflectChase === 'function') window.__ft8ReflectChase(msg.settings.jtcatChaseTarget || '');
           clusterConnected = !!msg.settings.clusterConnected;
           respotDefault = msg.settings.respotDefault !== false;
           if (msg.settings.respotTemplate) respotTemplate = msg.settings.respotTemplate;
@@ -1573,6 +1579,16 @@
         break;
       case 'stun-config':
         _useStun = !!msg.useStun;
+        // Cloud TURN relay creds (Model A: minted by the desktop, handed to
+        // us here). Adopt them for the next ICE gather. A useStun-only message
+        // must NOT wipe a TURN list we already hold (re-mint sends the full
+        // list; an interim useStun ping shouldn't downgrade us).
+        if (Array.isArray(msg.iceServers) && msg.iceServers.length) {
+          _turnIceServers = msg.iceServers;
+          // If audio is already live, apply before the next gather. On a
+          // healthy PC this is harmless; it takes effect on reconnect/re-gather.
+          if (pc) { try { pc.setConfiguration({ iceServers: _turnIceServers }); } catch (e) {} }
+        }
         break;
 
       case 'all-qsos':
@@ -1677,6 +1693,11 @@
           ft8AutoCqSelect.value = msg.mode || 'off';
           ft8AutoCqSelect.style.borderColor = msg.mode !== 'off' ? 'var(--pota)' : '';
         }
+        break;
+
+      case 'jtcat-chase-target':
+        // Desktop (or another client) changed the shared chase target.
+        if (typeof window.__ft8ReflectChase === 'function') window.__ft8ReflectChase(msg.tag || '');
         break;
 
       // Cloud Sync messages
@@ -3955,6 +3976,10 @@
     var pct = parseInt(rcRxGain.value, 10);
     rcRxGainVal.textContent = pct + '%';
     if (gainNode) gainNode.gain.value = pct / 100;
+    // Re-pick element vs Web-Audio output for the new gain (and keep
+    // volBoostLevel roughly in sync so the boost button stays meaningful).
+    volBoostLevel = pct > 100 ? 1 : 0;
+    applyRxOutput();
   });
   rcTxGain.addEventListener('input', function() {
     var pct = parseInt(rcTxGain.value, 10);
@@ -4094,8 +4119,36 @@
 
   function setAudioStatus(text) { audioBtn.textContent = text; }
 
+  // Decide which path actually drives the speakers, based on the current
+  // RX gain (gainNode, 0–3x). At <=100% the <video> element plays directly
+  // (element.volume caps at 1.0) — the robust path that survives a suspended
+  // AudioContext and Chromium's remote-MediaStream-through-Web-Audio silence.
+  // Above 100% we need real amplification, so we route the gain node to the
+  // Web Audio destination and mute the element to avoid double audio. Either
+  // way the analyser keeps tapping the gain node for the RX meter.
+  function applyRxOutput() {
+    if (!remoteAudio) return;
+    var g = gainNode ? gainNode.gain.value : 1;
+    var boosting = g > 1.0001;
+    if (audioCtx && rxAnalyser) {
+      if (boosting && !rxDestConnected) {
+        try { rxAnalyser.connect(audioCtx.destination); rxDestConnected = true; } catch (e) {}
+      } else if (!boosting && rxDestConnected) {
+        try { rxAnalyser.disconnect(audioCtx.destination); } catch (e) {}
+        rxDestConnected = false;
+      }
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+    remoteAudio.muted = boosting;
+    // When boosting, the element is muted and Web Audio carries the audio;
+    // otherwise the element plays at the requested attenuation (0–100%).
+    remoteAudio.volume = boosting ? 0 : Math.max(0, Math.min(1, g));
+    remoteAudio.play().catch(() => {});
+  }
+
   let micReady = false;
   var _useStun = false;
+  var _turnIceServers = null; // Cloudflare TURN relay creds from stun-config (Model A)
 
   async function startAudio() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -4112,13 +4165,25 @@
         // Create AudioContext during user gesture so iOS Safari doesn't block it
         try {
           audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-          // RX chain: source -> gainNode -> rxAnalyser -> destination
+          // Chrome can hand back a SUSPENDED context even when created inside
+          // a gesture if the gesture went stale across the await getUserMedia
+          // above — a suspended context means the Web Audio destination is
+          // silent, which is exactly "connected peer, frames flowing, no
+          // sound" (K3SBP 2026-06-14, LAN web client). Resume eagerly.
+          if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+          // RX chain: source -> gainNode -> rxAnalyser (-> destination only
+          // when boosting >100%; see applyRxOutput). At <=100% we let the
+          // media element play the audio directly, which is immune to a
+          // suspended AudioContext AND to the long-standing Chromium bug
+          // where a remote WebRTC MediaStream routed through Web Audio is
+          // silent. The analyser still taps the gain node for the RX meter
+          // regardless of whether its output is connected.
           gainNode = audioCtx.createGain();
           gainNode.gain.value = VOL_STEPS[volBoostLevel];
           rxAnalyser = audioCtx.createAnalyser();
           rxAnalyser.fftSize = 256;
           gainNode.connect(rxAnalyser);
-          rxAnalyser.connect(audioCtx.destination);
+          rxDestConnected = false;
           // TX chain: mic -> txGainNode -> txAnalyser (metering only, audio sent via WebRTC track)
           txGainNode = audioCtx.createGain();
           txGainNode.gain.value = 1.0;
@@ -4148,36 +4213,34 @@
     }
     try {
       setAudioStatus('Wait...');
-      var iceServers = _useStun ? [{ urls: 'stun:stun.l.google.com:19302' }] : [];
+      // Prefer the Cloudflare TURN relay creds (so a CGNAT path gets a relay
+      // candidate); else plain STUN; else local/VPN-only. ICE still picks a
+      // direct pair when one exists, so TURN never needlessly relays on LAN.
+      var iceServers = (_turnIceServers && _turnIceServers.length)
+        ? _turnIceServers
+        : (_useStun ? [{ urls: 'stun:stun.l.google.com:19302' }] : []);
       pc = new RTCPeerConnection({ iceServers: iceServers });
       for (const track of localAudioStream.getTracks()) {
         pc.addTrack(track, localAudioStream);
       }
       pc.ontrack = (event) => {
         setAudioStatus('Live');
-        // Route through pre-created GainNode for volume boost
+        // The media element is the reliable audible output (immune to a
+        // suspended AudioContext / the Chromium remote-stream-through-Web-
+        // Audio silence bug). The Web Audio graph taps the same stream for
+        // the RX meter and supplies the >100% boost. applyRxOutput() picks
+        // which one actually reaches the speakers based on the gain.
+        remoteAudio.srcObject = event.streams[0];
         if (audioCtx && gainNode) {
           try {
-            var source = audioCtx.createMediaStreamSource(event.streams[0]);
-            source.connect(gainNode);
-            // Keep video element playing (muted) as iOS keep-alive
-            remoteAudio.srcObject = event.streams[0];
-            remoteAudio.volume = 0;
-            remoteAudio.play().catch(() => {});
+            if (rxSource) { try { rxSource.disconnect(); } catch (e) {} }
+            rxSource = audioCtx.createMediaStreamSource(event.streams[0]);
+            rxSource.connect(gainNode);
           } catch (e) {
-            console.warn('GainNode wiring failed, using direct playback:', e.message);
-            remoteAudio.srcObject = event.streams[0];
-            remoteAudio.volume = 1.0;
-            remoteAudio.muted = false;
-            remoteAudio.play().catch(() => {});
+            console.warn('RX Web Audio tap failed, element-only playback:', e.message);
           }
-        } else {
-          // Fallback: no Web Audio, play through element directly
-          remoteAudio.srcObject = event.streams[0];
-          remoteAudio.volume = 1.0;
-          remoteAudio.muted = false;
-          remoteAudio.play().catch(() => {});
         }
+        applyRxOutput();
         if (typeof smConnected !== 'undefined' && smConnected) smSetupRxBridge(event.streams[0]);
       };
       pc.onicecandidate = (event) => {
@@ -4217,6 +4280,8 @@
     if (localAudioStream) { localAudioStream.getTracks().forEach(t => t.stop()); localAudioStream = null; }
     if (remoteAudio) { remoteAudio.srcObject = null; }
     stopMeterRendering();
+    if (rxSource) { try { rxSource.disconnect(); } catch (e) {} rxSource = null; }
+    rxDestConnected = false;
     if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; gainNode = null; txGainNode = null; rxAnalyser = null; txAnalyser = null; }
     stopSessionKeepAlive();
     audioEnabled = false;
@@ -4270,6 +4335,8 @@
     // Sync RX gain slider
     rcRxGain.value = Math.round(gain * 100);
     rcRxGainVal.textContent = Math.round(gain * 100) + '%';
+    // Switch the audible path (element ↔ Web Audio) for the new gain.
+    applyRxOutput();
   });
 
   // --- Scan ---
@@ -5954,10 +6021,12 @@
         // Apply CQ filter — always show CQ, 73, directed-at-me, hunted, and QSO partner
         if (ft8CqFilter && !isCq && !is73 && !isDirected && !isHunt && !isQsoPartner) return;
         if (ft8WantedFilter && !isWanted && !isDirected && !is73 && !isHunt && !isQsoPartner) return;
+        if (ft8ChaseFilter && !d.chaseMatch && !isDirected && !is73 && !isHunt && !isQsoPartner) return;
         if (ft8SearchFilter && upper.indexOf(ft8SearchFilter) === -1) return;
 
         // Build needed badges + entity
         let badges = '';
+        if (d.chaseMatch) badges += '<span class="ft8-badge ft8-badge-chase" title="Chase target: ' + esc(ft8ChaseTarget) + '">◎</span>';
         if (d.newDxcc) badges += '<span class="ft8-badge ft8-badge-dxcc" title="New DXCC: ' + esc(d.entity || '') + '">D</span>';
         if (d.newGrid) badges += '<span class="ft8-badge ft8-badge-grid" title="New grid: ' + esc(d.grid || '') + '">G</span>';
         if (d.newCall) badges += '<span class="ft8-badge ft8-badge-call" title="New call: ' + esc(d.call || '') + '">C</span>';
@@ -5967,7 +6036,7 @@
         const entityStr = d.entity ? '<span class="ft8-entity">' + esc(d.entity) + '</span>' : '';
 
         const row = document.createElement('div');
-        row.className = 'ft8-row' + (isCq ? ' ft8-cq' : '') + (isDirected ? ' ft8-directed' : '') + (isHunt ? ' ft8-hunt' : '') + (isWanted ? ' ft8-wanted' : '') + (d.watched ? ' ft8-watched' : '');
+        row.className = 'ft8-row' + (isCq ? ' ft8-cq' : '') + (isDirected ? ' ft8-directed' : '') + (isHunt ? ' ft8-hunt' : '') + (isWanted ? ' ft8-wanted' : '') + (d.chaseMatch ? ' ft8-chase' : '') + (d.watched ? ' ft8-watched' : '');
         row.innerHTML =
           '<span class="ft8-db">' + (d.db >= 0 ? '+' : '') + d.db + '</span>' +
           '<span class="ft8-dt">' + (d.dt != null ? (d.dt >= 0 ? '+' : '') + d.dt.toFixed(1) : '') + '</span>' +
@@ -6257,10 +6326,10 @@
       // Cancel current QSO
       ft8Send({ type: 'jtcat-cancel-qso' });
     } else {
-      // Call CQ
+      // Call CQ directed at the current chase target (CQ <tag> <call> <grid>).
       ft8TxEnabled = true;
       ft8TxBtn.classList.add('active');
-      ft8Send({ type: 'jtcat-call-cq' });
+      ft8Send({ type: 'jtcat-call-cq', modifier: ft8ChaseTarget });
     }
   });
 
@@ -6311,6 +6380,76 @@
       ft8SortSignalBtn.classList.toggle('active', ft8SortSignal);
     });
   }
+
+  // --- Chase target (shared CqTarget module, synced with the desktop) ---
+  var ft8ChaseFilterBtn = document.getElementById('ft8-chase-filter');
+  var ft8ChaseSelect = document.getElementById('ft8-chase');
+  var ft8ChaseCustom = document.getElementById('ft8-chase-custom');
+  var ft8ChaseQuick = (window.CqTarget && window.CqTarget.QUICK_PICKS) || [];
+  var ft8ChaseQuickSet = {};
+  ft8ChaseQuick.forEach(function(p) { ft8ChaseQuickSet[p.tag] = true; });
+
+  (function buildFt8ChasePicker() {
+    if (!ft8ChaseSelect) return;
+    var html = '<option value="">Chase: --</option>';
+    var lastCat = '';
+    ft8ChaseQuick.forEach(function(p) {
+      if (p.category !== lastCat) {
+        if (lastCat) html += '</optgroup>';
+        html += '<optgroup label="' + esc(p.category) + '">';
+        lastCat = p.category;
+      }
+      html += '<option value="' + esc(p.tag) + '">' + esc(p.tag) + '</option>';
+    });
+    if (lastCat) html += '</optgroup>';
+    html += '<option value="__custom">Custom…</option>';
+    ft8ChaseSelect.innerHTML = html;
+  })();
+
+  function reflectFt8ChaseTarget(tag) {
+    if (!ft8ChaseSelect) return;
+    tag = tag || '';
+    if (!tag) { ft8ChaseSelect.value = ''; if (ft8ChaseCustom) ft8ChaseCustom.style.display = 'none'; return; }
+    if (ft8ChaseQuickSet[tag]) {
+      ft8ChaseSelect.value = tag;
+      if (ft8ChaseCustom) ft8ChaseCustom.style.display = 'none';
+    } else {
+      ft8ChaseSelect.value = '__custom';
+      if (ft8ChaseCustom) { ft8ChaseCustom.style.display = ''; ft8ChaseCustom.value = tag; }
+    }
+  }
+
+  function applyFt8ChaseTarget(rawTag) {
+    var v = window.CqTarget ? window.CqTarget.validateTag(rawTag) : { ok: true, tag: (rawTag || '').toUpperCase() };
+    if (!v.ok) { reflectFt8ChaseTarget(ft8ChaseTarget); return; } // revert on invalid
+    ft8ChaseTarget = v.tag;
+    reflectFt8ChaseTarget(ft8ChaseTarget);
+    ft8Send({ type: 'jtcat-set-chase-target', tag: ft8ChaseTarget });
+  }
+
+  if (ft8ChaseSelect) {
+    ft8ChaseSelect.addEventListener('change', function() {
+      if (ft8ChaseSelect.value === '__custom') {
+        if (ft8ChaseCustom) { ft8ChaseCustom.style.display = ''; ft8ChaseCustom.focus(); }
+        return;
+      }
+      applyFt8ChaseTarget(ft8ChaseSelect.value);
+    });
+  }
+  if (ft8ChaseCustom) {
+    var commitFt8Custom = function() { applyFt8ChaseTarget(ft8ChaseCustom.value); };
+    ft8ChaseCustom.addEventListener('change', commitFt8Custom);
+    ft8ChaseCustom.addEventListener('blur', commitFt8Custom);
+    ft8ChaseCustom.addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); commitFt8Custom(); ft8ChaseCustom.blur(); } });
+  }
+  if (ft8ChaseFilterBtn) {
+    ft8ChaseFilterBtn.addEventListener('click', function() {
+      ft8ChaseFilter = !ft8ChaseFilter;
+      ft8ChaseFilterBtn.classList.toggle('active', ft8ChaseFilter);
+    });
+  }
+  // Expose for the settings-blob seed + the jtcat-chase-target dispatcher.
+  window.__ft8ReflectChase = function(tag) { ft8ChaseTarget = tag || ''; reflectFt8ChaseTarget(ft8ChaseTarget); };
 
   // Search filter
   var ft8SearchInput = document.getElementById('ft8-search');
@@ -7478,7 +7617,11 @@
   }
 
   // --- SSB Voice Macros ---
-  var SSB_MACRO_COUNT = 5;
+  // Desktop now authors up to 25 macros and syncs them here. The bar renders
+  // every synced slot that has a label or recording; the inline editor below
+  // only edits the first few (its rows are static HTML — so-ssb-1.. in the
+  // page), which is fine: the phone is a remote, the desktop is the author.
+  var SSB_MACRO_COUNT = 25;
   var SSB_MAX_DURATION = 30; // seconds
   var ssbMacroLabels = JSON.parse(localStorage.getItem('echocat-ssb-labels') || 'null') || ['CQ', 'ID', '73', '', ''];
   var ssbPanel = document.getElementById('ssb-panel');

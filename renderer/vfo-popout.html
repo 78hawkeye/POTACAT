@@ -2,6 +2,7 @@
 <html>
 <head>
   <meta charset="UTF-8">
+  <script src="popout-theme-boot.js"></script>
   <title>VFO</title>
   <style>
     :root {
@@ -2094,7 +2095,9 @@ async function loadVoiceMacros() {
   const outputDeviceId = s.remoteAudioOutput || '';
   const row = document.getElementById('voice-macro-row');
   row.innerHTML = '';
-  for (let i = 0; i < 5; i++) {
+  // Up to 25 macros; the bar only renders slots that have a label or
+  // recording, so empties never clutter the popout.
+  for (let i = 0; i < 25; i++) {
     if (!labels[i] && filled.indexOf(i) === -1) continue;
     const btn = document.createElement('button');
     const hasFill = filled.indexOf(i) >= 0;
@@ -2379,8 +2382,14 @@ window.api.onSmartSdrAudio((d) => {
 })();
 
 // --- Theme ---
-window.api.onTheme((theme) => {
-  document.documentElement.setAttribute('data-theme', theme);
+// Live theme toggle + the did-finish-load push. The payload is
+// { theme, variant } — route it through the shared applier so the object
+// shape is handled and data-dark-variant tracks too. The old
+// setAttribute('data-theme', payload) stringified the object to
+// "[object Object]", which is why this popout opened dark in light mode.
+window.api.onTheme((p) => {
+  if (typeof window.applyPopoutTheme === 'function') window.applyPopoutTheme(p);
+  else document.documentElement.setAttribute('data-theme', (p && p.theme) || p);
 });
 
 // --- Operator info (tuned spot) ---

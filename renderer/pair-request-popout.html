@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <script src="popout-theme-boot.js"></script>
   <title>POTACAT — Approve Pair Request</title>
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'">
   <style>
@@ -15,6 +16,20 @@
       --ok: #4ecca3;
       --bad: #e94560;
       --warn: #f0a500;
+    }
+    /* Light theme: popout-theme-boot.js sets data-theme on <html> from the
+       loadFile ?theme= query before first paint. This popout is self-styled
+       (no styles.css), so override its vars for light mode. */
+    [data-theme="light"] {
+      --bg: #eef2f7;
+      --bg-card: #ffffff;
+      --border: #c9d4e3;
+      --text: #14233f;
+      --text-dim: #5b6a86;
+      --accent: #1f7fb8;
+      --ok: #1b9e74;
+      --bad: #d12f49;
+      --warn: #b9760a;
     }
     html, body {
       margin: 0; padding: 0; height: 100%;

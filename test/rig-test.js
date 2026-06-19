@@ -627,6 +627,29 @@ test('FTdx3000 ATU -> single AC002;', () => {
 });
 
 // =========================================================================
+console.log('\n=== FT-710 ATU (AC003) ===');
+
+test('FT-710 ATU -> single AC003; (no AC001 first), button enabled', () => {
+  const { RIG_MODELS } = require('../lib/rig-models');
+  const m = RIG_MODELS['FT-710'];
+  assert.strictEqual(m.caps.atu, true, 'FT-710 ATU button must be enabled');
+  assert.strictEqual(m.atuCmd, 'ac003');
+  const { codec } = captureWrites(KenwoodCodec, m);
+  const seq = codec.getAtuStartSequence();
+  assert.strictEqual(seq.length, 1, 'AC003 is a single command, no AC001 first');
+  assert.strictEqual(seq[0].cmd, 'AC003;');
+  assert.strictEqual(codec.getAtuStopCmd(), 'AC000;');
+});
+
+test('FT-710 ATU via rigctld -> w AC003;', () => {
+  const { RIG_MODELS } = require('../lib/rig-models');
+  const { codec } = captureWrites(RigctldCodec, RIG_MODELS['FT-710']);
+  const seq = codec.getAtuStartSequence();
+  assert.strictEqual(seq.length, 1);
+  assert.strictEqual(seq[0].cmd, 'w AC003;\n');
+});
+
+// =========================================================================
 console.log('\n=== Extended Controls (FT-891) ===');
 
 const FT891_EXT = {

@@ -89,6 +89,16 @@ int ftx_find_candidates(const ftx_waterfall_t* power, int num_candidates, ftx_ca
 /// @return True if the decoding was successful, false otherwise (check status for details)
 bool ftx_decode_candidate(const ftx_waterfall_t* power, const ftx_candidate_t* cand, int max_iterations, ftx_message_t* message, ftx_decode_status_t* status);
 
+/// Like ftx_decode_candidate(), but with optional a priori (AP) information.
+/// ap_mask/ap_bits are FTX_LDPC_N-length arrays over the codeword bit positions
+/// (payload bits are indices 0..76). Where ap_mask[i] != 0, the bit likelihood
+/// is forced to a strong value for ap_bits[i] (0/1) before LDPC decoding,
+/// shrinking the unknown-bit search space so marginal/partial waveforms can
+/// still converge to a CRC-valid codeword. Pass ap_mask = NULL for no AP
+/// (identical to ftx_decode_candidate). The CRC gate is unchanged — AP only
+/// biases the decoder; it never bypasses validation.
+bool ftx_decode_candidate_ap(const ftx_waterfall_t* power, const ftx_candidate_t* cand, int max_iterations, const uint8_t* ap_mask, const uint8_t* ap_bits, ftx_message_t* message, ftx_decode_status_t* status);
+
 #ifdef __cplusplus
 }
 #endif

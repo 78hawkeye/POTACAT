@@ -92,6 +92,7 @@
               <label class="spots-toggle"><input type="checkbox" id="spots-llota"> <span style="color:#42a5f5">LLOTA</span></label>
               <label class="spots-toggle"><input type="checkbox" id="spots-wwbota"> <span style="color:#78909c">WWBOTA</span></label>
               <label class="spots-toggle"><input type="checkbox" id="spots-tiles"> <span style="color:#ab47bc">Tiles</span></label>
+              <label class="spots-toggle"><input type="checkbox" id="spots-gma"> <span style="color:#a98467">GMA</span></label>
               <label class="spots-toggle"><input type="checkbox" id="spots-cluster"> <span style="color:#e040fb">DX Cluster</span></label>
               <label class="spots-toggle"><input type="checkbox" id="spots-cwspots"> <span style="color:#ffd740">CW Spots</span></label>
               <label class="spots-toggle"><input type="checkbox" id="spots-rbn"> <span style="color:#00bcd4">RBN</span></label>
@@ -112,7 +113,7 @@
               <label class="spots-toggle" id="spots-hide-callref-label" title="Hide a spot only if you've already worked the same call AT THE SAME park today on the same band/mode. A roving activator at a new park stays visible."><input type="checkbox" id="spots-hide-callref"> Hide worked CALL+park combos</label>
               <label class="spots-toggle" id="spots-prioritize-new-label"><input type="checkbox" id="spots-prioritize-new"> Show NEW parks at top</label>
               <label class="spots-toggle" id="spots-strict-atno-label" title="Mark parks NEW unless they're in your imported POTA hunter CSV. Local-only QSOs that haven't reached pota.app won't suppress the NEW flag (K0OTC)."><input type="checkbox" id="spots-strict-atno"> Strict ATNO (POTA-credited only)</label>
-              <label class="spots-toggle"><input type="checkbox" id="spots-hide-oob"> Hide out-of-band</label>
+              <label class="spots-toggle" title="Hide spots your license class can't operate (and any truly out-of-band frequencies). Needs your License Class set in Settings → Operator — if it's None, nothing is hidden."><input type="checkbox" id="spots-hide-oob"> Hide out-of-privilege</label>
               <label class="spots-toggle"><input type="checkbox" id="spots-hide-qrt" checked> Hide QRT spots</label>
               <label class="spots-toggle"><input type="checkbox" id="spots-show-hidden"> Show hidden spots <span id="spots-hidden-count" class="spots-hidden-badge hidden">0</span></label>
             </div>
@@ -180,6 +181,11 @@
            is acting as a client to a paired shack. Click opens the
            Remote Radios dialog for quick disconnect / switch. -->
       <span id="remote-shack-status" class="status hidden" style="background:#4ecca3;color:#0a1a14;cursor:pointer;" title="Active remote shack — click to manage">REMOTE</span>
+      <!-- Voice PTT for remote-shack operation. Shown only while listening to
+           a remote rig (Phase 2 audio leg). Press-and-hold (mouse/touch) to
+           transmit voice — explicit, never a keyboard hijack, so there's no
+           accidental TX. Keys the remote rig + opens our mic for the session. -->
+      <button id="remote-ptt-btn" class="status hidden" style="background:#e94560;color:#fff;cursor:pointer;border:none;font-weight:600;" title="Hold to talk to the remote rig">🎙 HOLD TO TALK</button>
       <!-- Split-mode indicator. Hidden by default; shown when settings.enableSplit
            is true. Click to disable (asks for confirmation since some operators
            do use split legitimately). KQ4MHD report 2026-04-30. -->
@@ -763,6 +769,12 @@
           </label>
           <label class="jtcat-tx-label" title="When on, TX freq is pinned — auto-replies and the QSO state machine won't drag it to the responder's freq. RX still tracks them.">
             <input type="checkbox" id="jtcat-hold-tx-freq"> Hold TX
+          </label>
+          <label class="jtcat-tx-label" title="WSJT-X late-start parity. If you reply more than ~0.5s into the slot, send a truncated waveform (skip the leading symbols, keep the tail clock-aligned) instead of waiting for the next cycle — the receiver re-syncs on the middle/end Costas arrays. Off = strict slot-boundary TX.">
+            <input type="checkbox" id="jtcat-late-start-tx" checked> Late TX
+          </label>
+          <label class="jtcat-tx-label" title="A priori (AP) decode. Runs extra decode passes that hypothesize your callsign (and the station you're working) to recover weak or late replies addressed to you — the RX mirror of Late TX. Requires your callsign set. Off = standard decode only.">
+            <input type="checkbox" id="jtcat-ap-decode" checked> AP RX
           </label>
           <label class="jtcat-tx-label" id="jtcat-ft8br-comment-label" title="FT8 Battle Royale COMMENT field. Sent only on the FT8BR UDP packet — your normal logbook comment is unaffected. Use for /team, /score, etc. Hidden unless FT8BR is enabled in Settings → Logbook." style="display:none;">
             BR:
@@ -1464,6 +1476,18 @@
           </select>
         </label>
         <span class="help-text" style="display:block;margin-bottom:8px;">Choose Icom Network audio when the active rig is Icom Network / RS-BA1. POTACAT uses the radio's UDP audio stream for JTCAT/SSTV receive audio and can send JTCAT FT8/FT4 plus SSTV transmit audio directly over RS-BA1.</span>
+        <div id="rig-audio-devices" style="margin:4px 0 10px;">
+          <div style="font-size:13px;color:#4fc3f7;margin-bottom:4px;">Audio Devices</div>
+          <label>RX audio in (from radio):
+            <select id="rig-remote-audio-input" style="width:100%;margin-top:2px;"><option value="">-- system default --</option></select>
+          </label>
+          <label style="margin-top:4px;display:block;">TX audio out (to radio):
+            <select id="rig-remote-audio-output" style="width:100%;margin-top:2px;"><option value="">-- system default --</option></select>
+          </label>
+          <span class="help-text" id="rig-audio-devices-hint" style="margin-top:4px;display:block;">Soundcard devices for this rig &mdash; used for JTCAT FT8/FT4 receive &amp; transmit, SSTV, and ECHOCAT remote audio.<br>
+            <b>Only hearing audio in DIGU / DIGL (USB-Data / LSB-Data)?</b> Your rig is probably routing RX to a separate USB audio stream for DATA modes. Pick the <i>main</i> USB Audio codec (not the "data" variant), and/or change your rig's menu so RX flows to the main USB audio in voice modes too &mdash; Yaesu: <code>USB Audio Mode</code> = AUTO, Icom: <code>USB AF Output</code> = AF, Kenwood: <code>Menu 75</code>. See docs/radio-setup-guide.md.</span>
+          <span class="help-text" id="rig-audio-devices-bypass" style="display:none;margin-top:4px;">Not used for this audio source &mdash; POTACAT streams receive and transmit audio directly to/from the radio, so no soundcard device is needed.</span>
+        </div>
         <label class="radio-label"><input type="radio" name="radio-type" value="flex" checked> FlexRadio</label>
         <div id="flex-config" class="radio-sub hidden">
           <label>Radio IP:
@@ -1474,6 +1498,10 @@
           <span class="help-text" style="display:block;">Your FlexRadio's IP address. POTACAT connects straight to the radio (port 4992) and works whether or not SmartSDR / AetherSDR is running. Find it in SmartSDR's status bar or under Settings &rarr; Network.</span>
           <div id="flex-status" class="flex-status">&#9675; Not connected</div>
           <label class="checkbox-label" style="margin-top:10px;">
+            <input type="checkbox" id="set-flex-onboard-speaker"> Play RX audio on the radio's built-in speaker
+          </label>
+          <span class="help-text" style="display:block;margin-bottom:6px;">Off by default. When POTACAT runs the radio with no SmartSDR open (Flex Direct), an 8400/8600 plays the tuned slice on its onboard speaker. Leave this off to keep the radio silent while hunting &mdash; JTCAT/SSTV receive audio (DAX) is unaffected either way.</span>
+          <label class="checkbox-label" style="margin-top:6px;">
             <input type="checkbox" id="set-smartsdr-spots"> Show spots on the panadapter
           </label>
           <div id="smartsdr-config" class="radio-sub hidden">
@@ -1749,19 +1777,6 @@
             </div>
           </div>
         </details>
-        <details id="rig-audio-details" style="margin-top:8px;">
-          <summary style="cursor:pointer;font-size:13px;color:#4fc3f7;">ECHOCAT Audio (optional)</summary>
-          <div style="margin-top:6px;margin-left:4px;">
-            <label>Audio Input (radio RX &rarr; phone):
-              <select id="rig-remote-audio-input" style="width:100%;margin-top:2px;"><option value="">-- system default --</option></select>
-            </label>
-            <label style="margin-top:4px;display:block;">Audio Output (phone &rarr; radio TX):
-              <select id="rig-remote-audio-output" style="width:100%;margin-top:2px;"><option value="">-- system default --</option></select>
-            </label>
-            <span class="help-text" style="margin-top:4px;display:block;">Set per-rig audio devices for ECHOCAT remote operation.<br>
-              <b>Only hearing audio in DIGU / DIGL (USB-Data / LSB-Data)?</b> Your rig is probably routing RX to a separate USB audio stream for DATA modes. Pick the <i>main</i> USB Audio codec (not the "data" variant), and/or change your rig's menu so RX flows to the main USB audio in voice modes too — Yaesu: <code>USB Audio Mode</code> = AUTO, Icom: <code>USB AF Output</code> = AF, Kenwood: <code>Menu 75</code>. See docs/radio-setup-guide.md.</span>
-          </div>
-        </details>
         <div class="rig-editor-buttons">
           <button type="button" id="rig-save-btn">Save Rig</button>
           <button type="button" id="rig-cancel-btn">Cancel</button>
@@ -1793,6 +1808,7 @@
       <label class="checkbox-label"><input type="checkbox" id="set-enable-llota"> Enable LLOTA</label>
       <label class="checkbox-label"><input type="checkbox" id="set-enable-wwbota"> Enable WWBOTA <span class="help-text" style="margin-left:8px;font-weight:normal;">Worldwide Bunkers on the Air</span></label>
       <label class="checkbox-label"><input type="checkbox" id="set-enable-tiles"> Enable Tiles on the Air</label>
+      <label class="checkbox-label"><input type="checkbox" id="set-enable-gma"> Enable GMA <span class="help-text" style="margin-left:8px;font-weight:normal;">Global Mountain Activity &mdash; summits, huts, castles (cqgma.org)</span></label>
       <label class="checkbox-label"><input type="checkbox" id="set-enable-cluster"> Enable DX Cluster</label>
       <div id="cluster-config" class="radio-sub hidden">
         <div id="cluster-node-list"></div>
@@ -1807,7 +1823,7 @@
           <label>Host: <input type="text" id="set-cluster-custom-host" placeholder="host.example.com"></label>
           <label>Port: <input type="number" id="set-cluster-custom-port" value="7373" min="1" max="65535"></label>
         </div>
-        <span class="help-text" style="display:block;margin-top:6px;">Enable up to 3 nodes for simultaneous connections. Duplicate spots are automatically removed.</span>
+        <span class="help-text" style="display:block;margin-top:6px;">Enable up to 3 nodes for simultaneous connections. Duplicate spots are automatically removed. Use <strong>Login as</strong> to connect under a different callsign (e.g. an SSID like WG9I-2) when another app already feeds the same node under your base call &mdash; cluster nodes allow only one connection per callsign.</span>
         <label class="checkbox-label" style="margin-top:6px;"><input type="checkbox" id="set-show-beacons"> Show /B beacon stations</label>
         <label class="checkbox-label" style="margin-top:6px;"><input type="checkbox" id="set-show-dx-bar"> Show DX command bar below spot table</label>
         <label class="checkbox-label" style="margin-top:6px;"><input type="checkbox" id="set-enable-cluster-terminal"> Show DX Cluster Terminal button</label>
@@ -1932,7 +1948,8 @@
         <input type="number" id="set-max-dist" min="0" max="25000" step="50" value="0">
         <span class="help-text" id="set-max-dist-unit">miles</span>
       </label>
-      <label class="checkbox-label"><input type="checkbox" id="set-hide-out-of-band"> Hide out-of-band spots</label>
+      <label class="checkbox-label" title="Hide spots your license class can't operate, plus any truly out-of-band frequencies."><input type="checkbox" id="set-hide-out-of-band"> Hide spots outside my license privileges</label>
+      <span class="help-text" style="display:block;margin:-2px 0 6px;">Uses your <strong>License Class</strong> (Settings → Operator). If that's set to None, nothing is hidden.</span>
       <label class="checkbox-label"><input type="checkbox" id="set-hide-worked"> Hide already-worked stations</label>
       <label>Watchlist (comma-separated, optional band:mode filter):
         <input type="text" id="set-watchlist" placeholder="K3SBP, K4SWL:CW, K0BUF:20m, W1AW:40m:SSB">
@@ -3743,8 +3760,8 @@
         </select>
       </label>
     </div>
-    <label class="checkbox-label" style="margin-top:4px;margin-bottom:8px;">
-      <input type="checkbox" id="welcome-hide-oob"> Hide out-of-privilege spots
+    <label class="checkbox-label" style="margin-top:4px;margin-bottom:8px;" title="Hide spots your license class can't operate, plus any truly out-of-band frequencies. Uses the License Class above.">
+      <input type="checkbox" id="welcome-hide-oob"> Hide spots outside my license privileges
     </label>
 
     <div class="welcome-section-label">FT8 Battle Royale</div>
@@ -3963,6 +3980,7 @@
 
   <script src="../node_modules/leaflet/dist/leaflet.js"></script>
   <script src="jtcat-parser.js"></script>
+  <script src="remote-ptt.js"></script>
   <script src="app.js"></script>
   <script src="cloud-ui.js"></script>
   <script src="pota-sync-ui.js"></script>

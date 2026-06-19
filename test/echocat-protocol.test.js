@@ -95,6 +95,19 @@ test('validate accepts both-direction messages from either side', () => {
   assert.strictEqual(protocol.validate({ type: 'signal', data: {} }, protocol.Dir.C2S).ok, true);
 });
 
+test('scan-state / scan-control round-trip both directions (scan-state-sync-desktop)', () => {
+  // Both are Dir.BOTH — each side announces its own scan + can ask the peer.
+  for (const dir of [protocol.Dir.S2C, protocol.Dir.C2S]) {
+    assert.strictEqual(protocol.validate({ type: 'scan-state', scanning: true }, dir).ok, true);
+    assert.strictEqual(protocol.validate({ type: 'scan-control', action: 'stop' }, dir).ok, true);
+  }
+  // scanning must be boolean; action must be a string (the registry throws on mismatch)
+  assert.strictEqual(protocol.validate({ type: 'scan-state', scanning: 'yes' }).ok, false);
+  assert.strictEqual(protocol.validate({ type: 'scan-control', action: 5 }).ok, false);
+  // encode round-trips
+  assert.strictEqual(protocol.encode({ type: 'scan-state', scanning: false }), '{"type":"scan-state","scanning":false}');
+});
+
 test('validate type-checks: string vs number', () => {
   // tune.freqKhz must be a string (the wire format the server actually
   // parses — see Gap 5 in echocat-protocol-gaps.md).
